@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "ThumbnailGenerator.h"
@@ -22,6 +23,21 @@ namespace
 {
     constexpr UINT coverMaxWidth = 480;
     constexpr UINT coverMaxHeight = 270;
+
+    std::pair<UINT, UINT> thumbnail_size(UINT width, UINT height)
+    {
+        if (!width || !height || (width <= coverMaxWidth && height <= coverMaxHeight)) {
+            return { width, height };
+        }
+        if (static_cast<uint64_t>(width) * coverMaxHeight >=
+            static_cast<uint64_t>(height) * coverMaxWidth) {
+            return { coverMaxWidth, (std::max)(1u, static_cast<UINT>(
+                (static_cast<uint64_t>(height) * coverMaxWidth + width / 2) / width)) };
+        }
+        return { (std::max)(1u, static_cast<UINT>(
+            (static_cast<uint64_t>(width) * coverMaxHeight + height / 2) / height)),
+            coverMaxHeight };
+    }
 
     winrt::com_ptr<IWICImagingFactory> imaging_factory()
     {
@@ -57,17 +73,7 @@ namespace
         winrt::check_hresult(source->GetSize(&width, &height));
         if (!width || !height) throw winrt::hresult_error(E_INVALIDARG);
 
-        UINT targetWidth = width;
-        UINT targetHeight = height;
-        if (width > coverMaxWidth || height > coverMaxHeight) {
-            if (static_cast<uint64_t>(width) * coverMaxHeight >= static_cast<uint64_t>(height) * coverMaxWidth) {
-                targetWidth = coverMaxWidth;
-                targetHeight = (std::max)(1u, static_cast<UINT>((static_cast<uint64_t>(height) * coverMaxWidth + width / 2) / width));
-            } else {
-                targetHeight = coverMaxHeight;
-                targetWidth = (std::max)(1u, static_cast<UINT>((static_cast<uint64_t>(width) * coverMaxHeight + height / 2) / height));
-            }
-        }
+        auto [targetWidth, targetHeight] = thumbnail_size(width, height);
 
         auto imaging = imaging_factory();
         winrt::com_ptr<IWICBitmapSource> thumbnail;
@@ -100,6 +106,11 @@ namespace
         winrt::check_hresult(frame->WriteSource(thumbnail.get(), nullptr));
         winrt::check_hresult(frame->Commit());
         winrt::check_hresult(encoder->Commit());
+        // Some Windows WIC codecs retain the destination stream through the
+        // frame object even after Commit(). Release every encoder-side owner
+        // before the atomic rename, otherwise MoveFileEx can fail with
+        // ERROR_SHARING_VIOLATION (notably for the lightweight BMP test input).
+        frame = nullptr;
         stream = nullptr;
         encoder = nullptr;
         if (!MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -176,7 +187,7 @@ namespace motion::app
             auto imaging = imaging_factory();
             winrt::com_ptr<IWICBitmapDecoder> decoder;
             winrt::check_hresult(imaging->CreateDecoderFromFilename(source.c_str(), nullptr, GENERIC_READ,
-                WICDecodeMetadataCacheOnLoad, decoder.put()));
+                WICDecodeMetadataCacheOnDemand, decoder.put()));
             winrt::com_ptr<IWICBitmapFrameDecode> frame;
             winrt::check_hresult(decoder->GetFrame(0, frame.put()));
             write_thumbnail(frame.get(), destination);
@@ -211,10 +222,20 @@ namespace motion::app
             winrt::check_hresult(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE));
             winrt::check_hresult(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE));
 
+            winrt::com_ptr<IMFMediaType> native;
+            winrt::check_hresult(reader->GetNativeMediaType(
+                static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, native.put()));
+            UINT nativeWidth{}, nativeHeight{};
+            winrt::check_hresult(MFGetAttributeSize(
+                native.get(), MF_MT_FRAME_SIZE, &nativeWidth, &nativeHeight));
+            auto [requestedWidth, requestedHeight] = thumbnail_size(nativeWidth, nativeHeight);
+
             winrt::com_ptr<IMFMediaType> requested;
             winrt::check_hresult(MFCreateMediaType(requested.put()));
             winrt::check_hresult(requested->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
             winrt::check_hresult(requested->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32));
+            winrt::check_hresult(MFSetAttributeSize(
+                requested.get(), MF_MT_FRAME_SIZE, requestedWidth, requestedHeight));
             winrt::check_hresult(reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, requested.get()));
 
             winrt::com_ptr<IMFSample> sample;

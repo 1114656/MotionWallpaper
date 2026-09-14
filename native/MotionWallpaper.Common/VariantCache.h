@@ -3,15 +3,49 @@
 #include "UniqueHandle.h"
 
 #include <windows.h>
+#include <objbase.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace motion
 {
+    enum class VariantProgressState
+    {
+        none,
+        queued,
+        waitingForPower,
+        generating,
+        paused
+    };
+
+    struct VariantGenerationProgress
+    {
+        std::string mode;
+        std::string requestId;
+        VariantProgressState state{ VariantProgressState::none };
+        uint32_t percent{};
+        bool determinate{};
+    };
+
+    struct VariantGenerationRequest
+    {
+        std::string mode;
+        // Empty identifies a legacy, pre-token request marker. New requests
+        // always carry a GUID so a worker can distinguish a same-mode retry.
+        std::string requestId;
+
+        [[nodiscard]] explicit operator bool() const noexcept { return !mode.empty(); }
+        bool operator==(VariantGenerationRequest const&) const = default;
+    };
+
     struct VariantCacheFile
     {
         std::wstring fileName;
@@ -29,6 +63,9 @@ namespace motion
         bool cancelled{};
         bool failed{};
         std::string failedMode;
+        bool waitingForPower{};
+        uint32_t progressPercent{};
+        bool progressKnown{};
         bool balancedSuppressed{};
         bool powerSaverSuppressed{};
         uint64_t bytes{};
@@ -51,7 +88,7 @@ namespace motion
             if (entry.fileName.empty() || !entry.bytes) continue;
             if (!best || rank(entry) < rank(*best) ||
                 (rank(entry) == rank(*best) &&
-                    entry.fileName.ends_with(L"-v4.mp4") && !best->fileName.ends_with(L"-v4.mp4"))) {
+                    entry.fileName.ends_with(L"-v5.mp4") && !best->fileName.ends_with(L"-v5.mp4"))) {
                 best = &entry;
             }
         }
@@ -107,6 +144,11 @@ namespace motion
         return mediaDirectory / L".optimization-failed";
     }
 
+    inline std::filesystem::path variant_progress_path(std::filesystem::path const& mediaDirectory)
+    {
+        return mediaDirectory / L".optimization-progress";
+    }
+
     inline std::filesystem::path variant_suppressed_path(std::filesystem::path const& mediaDirectory,
         std::string const& mode)
     {
@@ -123,8 +165,11 @@ namespace motion
         return std::filesystem::is_regular_file(variant_suppressed_path(mediaDirectory, mode), error) && !error;
     }
 
+    using VariantRemovalCallback = std::function<bool(std::filesystem::path const&)>;
+
     inline bool retain_variant_profile(std::filesystem::path const& mediaDirectory,
-        std::string const& mode, std::wstring const& keepFileName) noexcept
+        std::string const& mode, std::wstring const& keepFileName,
+        VariantRemovalCallback const& removeCandidate = {}) noexcept
     {
         if ((mode != "balanced" && mode != "power-saver" && mode != "cpu-smooth") || keepFileName.empty()) return false;
         try {
@@ -149,7 +194,10 @@ namespace motion
                 auto name = entries->path().filename().wstring();
                 if (!name.starts_with(prefix) || name == keepFileName ||
                     name.ends_with(L".part.mp4") || entries->path().extension() != L".mp4") continue;
-                if (!std::filesystem::remove(entries->path(), itemError) || itemError) {
+                bool removed = removeCandidate
+                    ? removeCandidate(entries->path())
+                    : std::filesystem::remove(entries->path(), itemError);
+                if (!removed || itemError) {
                     retainedOnlyCurrent = false;
                 }
             }
@@ -163,7 +211,11 @@ namespace motion
     {
         try {
             auto temporary = destination;
-            temporary += L".tmp";
+            // UI and agent may update a task at the same time. A per-process,
+            // per-thread temporary name prevents one writer from deleting or
+            // replacing another writer's staging file before the atomic move.
+            temporary += L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                std::to_wstring(GetCurrentThreadId());
             unique_handle file(CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                 FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY, nullptr));
             if (!file || value.size() > MAXDWORD) return false;
@@ -188,36 +240,283 @@ namespace motion
         }
     }
 
-    inline std::string read_variant_request(std::filesystem::path const& mediaDirectory) noexcept
+    inline std::string read_small_file(std::filesystem::path const& source,
+        DWORD maximumBytes = 256) noexcept
     {
         try {
-            auto path = variant_request_path(mediaDirectory);
-            unique_handle file(CreateFileW(path.c_str(), GENERIC_READ,
+            unique_handle file(CreateFileW(source.c_str(), GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL, nullptr));
             if (!file) return {};
-            char value[32]{};
+            LARGE_INTEGER size{};
+            if (!GetFileSizeEx(file.get(), &size) || size.QuadPart < 0 ||
+                static_cast<uint64_t>(size.QuadPart) > maximumBytes) return {};
+            std::string value(static_cast<size_t>(size.QuadPart), '\0');
             DWORD read{};
-            if (!ReadFile(file.get(), value, sizeof(value) - 1, &read, nullptr)) return {};
-            std::string result(value, value + read);
-            return result == "balanced" || result == "power-saver" ? result : std::string{};
+            if (!value.empty() && (!ReadFile(file.get(), value.data(), static_cast<DWORD>(value.size()),
+                &read, nullptr) || read != value.size())) return {};
+            return value;
         } catch (...) {
             return {};
         }
     }
 
+    [[nodiscard]] inline bool valid_variant_request_mode(std::string_view mode) noexcept
+    {
+        return mode == "balanced" || mode == "power-saver";
+    }
+
+    [[nodiscard]] inline bool valid_variant_request_id(std::string_view requestId) noexcept
+    {
+        return requestId.size() == 36 && std::all_of(requestId.begin(), requestId.end(),
+            [](unsigned char character) {
+                return (character >= '0' && character <= '9') ||
+                    (character >= 'a' && character <= 'f') || character == '-';
+            });
+    }
+
+    [[nodiscard]] inline std::string new_variant_request_id() noexcept
+    {
+        GUID id{};
+        wchar_t text[40]{};
+        if (FAILED(CoCreateGuid(&id)) || StringFromGUID2(id, text, ARRAYSIZE(text)) != 39) return {};
+        std::string result;
+        result.reserve(36);
+        for (size_t index = 1; index != 37; ++index) {
+            wchar_t character = text[index];
+            if (character >= L'A' && character <= L'F') character += L'a' - L'A';
+            if (character > 0x7f) return {};
+            result.push_back(static_cast<char>(character));
+        }
+        return valid_variant_request_id(result) ? result : std::string{};
+    }
+
+    [[nodiscard]] inline std::string serialize_variant_request(
+        VariantGenerationRequest const& request) noexcept
+    {
+        if (!valid_variant_request_mode(request.mode)) return {};
+        if (request.requestId.empty()) return request.mode;
+        if (!valid_variant_request_id(request.requestId)) return {};
+        return request.mode + "|" + request.requestId;
+    }
+
+    [[nodiscard]] inline VariantGenerationRequest parse_variant_request(
+        std::string_view value) noexcept
+    {
+        auto separator = value.find('|');
+        if (separator == std::string_view::npos) {
+            return valid_variant_request_mode(value)
+                ? VariantGenerationRequest{ std::string(value), {} }
+                : VariantGenerationRequest{};
+        }
+        if (value.find('|', separator + 1) != std::string_view::npos) return {};
+        auto mode = value.substr(0, separator);
+        auto requestId = value.substr(separator + 1);
+        if (!valid_variant_request_mode(mode) || !valid_variant_request_id(requestId)) return {};
+        return { std::string(mode), std::string(requestId) };
+    }
+
+    [[nodiscard]] inline VariantGenerationRequest read_variant_generation_request(
+        std::filesystem::path const& mediaDirectory) noexcept
+    {
+        return parse_variant_request(read_small_file(variant_request_path(mediaDirectory)));
+    }
+
+    inline std::string read_small_file_handle(HANDLE file, DWORD maximumBytes = 256) noexcept
+    {
+        if (!file || file == INVALID_HANDLE_VALUE) return {};
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 ||
+            static_cast<uint64_t>(size.QuadPart) > maximumBytes) return {};
+        LARGE_INTEGER beginning{};
+        if (!SetFilePointerEx(file, beginning, nullptr, FILE_BEGIN)) return {};
+        std::string value(static_cast<size_t>(size.QuadPart), '\0');
+        DWORD read{};
+        if (!value.empty() && (!ReadFile(file, value.data(), static_cast<DWORD>(value.size()),
+            &read, nullptr) || read != value.size())) return {};
+        return value;
+    }
+
+    [[nodiscard]] inline unique_handle lock_variant_request(
+        std::filesystem::path const& mediaDirectory,
+        VariantGenerationRequest const& expected) noexcept
+    {
+        auto serialized = serialize_variant_request(expected);
+        if (serialized.empty()) return {};
+        unique_handle file(CreateFileW(variant_request_path(mediaDirectory).c_str(),
+            GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (!file || read_small_file_handle(file.get()) != serialized) return {};
+        return file;
+    }
+
+    inline bool mark_locked_request_for_deletion(HANDLE file) noexcept
+    {
+        FILE_DISPOSITION_INFO disposition{ TRUE };
+        return file && file != INVALID_HANDLE_VALUE &&
+            SetFileInformationByHandle(file, FileDispositionInfo, &disposition, sizeof(disposition));
+    }
+
+    inline std::string_view variant_progress_state_name(VariantProgressState state) noexcept
+    {
+        switch (state) {
+        case VariantProgressState::queued: return "queued";
+        case VariantProgressState::waitingForPower: return "waiting-power";
+        case VariantProgressState::generating: return "generating";
+        case VariantProgressState::paused: return "paused";
+        default: return "none";
+        }
+    }
+
+    inline VariantProgressState parse_variant_progress_state(std::string_view value) noexcept
+    {
+        if (value == "queued") return VariantProgressState::queued;
+        if (value == "waiting-power") return VariantProgressState::waitingForPower;
+        if (value == "generating") return VariantProgressState::generating;
+        if (value == "paused") return VariantProgressState::paused;
+        return VariantProgressState::none;
+    }
+
+    [[nodiscard]] inline std::optional<VariantGenerationProgress> parse_variant_progress(
+        std::string_view value) noexcept
+    {
+        // v1|<mode>|<state>|<0..100 or ?> (legacy request without token)
+        // v2|<mode>|<request-id>|<state>|<0..100 or ?>
+        auto view = value;
+        std::vector<std::string_view> fields;
+        while (fields.size() != 5) {
+            auto separator = view.find('|');
+            if (separator == std::string_view::npos) break;
+            fields.push_back(view.substr(0, separator));
+            view.remove_prefix(separator + 1);
+        }
+        fields.push_back(view);
+        bool legacy = fields.size() == 4 && fields[0] == "v1";
+        bool tokenized = fields.size() == 5 && fields[0] == "v2";
+        if ((!legacy && !tokenized) ||
+            (fields[1] != "balanced" && fields[1] != "power-saver" && fields[1] != "cpu-smooth")) {
+            return std::nullopt;
+        }
+        size_t stateIndex = tokenized ? 3 : 2;
+        size_t percentIndex = tokenized ? 4 : 3;
+        if (tokenized && !valid_variant_request_id(fields[2])) return std::nullopt;
+        auto state = parse_variant_progress_state(fields[stateIndex]);
+        if (state == VariantProgressState::none) return std::nullopt;
+        VariantGenerationProgress result;
+        result.mode.assign(fields[1]);
+        if (tokenized) result.requestId.assign(fields[2]);
+        result.state = state;
+        if (fields[percentIndex] != "?") {
+            uint32_t percent{};
+            auto parsed = std::from_chars(fields[percentIndex].data(),
+                fields[percentIndex].data() + fields[percentIndex].size(), percent);
+            if (parsed.ec != std::errc{} ||
+                parsed.ptr != fields[percentIndex].data() + fields[percentIndex].size() ||
+                percent > 100) return std::nullopt;
+            result.percent = percent;
+            result.determinate = true;
+        }
+        return result;
+    }
+
+    [[nodiscard]] inline std::optional<VariantGenerationProgress> read_variant_progress(
+        std::filesystem::path const& mediaDirectory) noexcept
+    {
+        return parse_variant_progress(read_small_file(variant_progress_path(mediaDirectory)));
+    }
+
+    inline bool write_variant_progress(std::filesystem::path const& mediaDirectory,
+        std::string const& mode, VariantProgressState state, uint32_t percent = 0,
+        bool determinate = false, std::string const& requestId = {}) noexcept
+    {
+        if ((mode != "balanced" && mode != "power-saver" && mode != "cpu-smooth") ||
+            state == VariantProgressState::none ||
+            (!requestId.empty() && !valid_variant_request_id(requestId))) return false;
+        percent = (std::min)(percent, 100u);
+        std::string value = requestId.empty()
+            ? "v1|" + mode + "|"
+            : "v2|" + mode + "|" + requestId + "|";
+        value += variant_progress_state_name(state);
+        value.push_back('|');
+        value += determinate ? std::to_string(percent) : std::string("?");
+        // Prepare() may revisit a durable request once per policy tick while it
+        // waits for AC power. Avoid a needless write-through/flush when the
+        // externally visible state has not changed.
+        if (read_small_file(variant_progress_path(mediaDirectory)) == value) return true;
+        return write_small_file(variant_progress_path(mediaDirectory), value);
+    }
+
+    inline bool write_variant_progress(std::filesystem::path const& mediaDirectory,
+        VariantGenerationRequest const& request, VariantProgressState state,
+        uint32_t percent = 0, bool determinate = false) noexcept
+    {
+        return write_variant_progress(mediaDirectory, request.mode, state, percent,
+            determinate, request.requestId);
+    }
+
+    inline bool write_variant_progress_if_current(std::filesystem::path const& mediaDirectory,
+        VariantGenerationRequest const& request, VariantProgressState state,
+        uint32_t percent = 0, bool determinate = false) noexcept
+    {
+        auto locked = lock_variant_request(mediaDirectory, request);
+        return locked && write_variant_progress(
+            mediaDirectory, request, state, percent, determinate);
+    }
+
+    inline void clear_variant_progress(std::filesystem::path const& mediaDirectory,
+        std::string const& expectedMode = {}) noexcept
+    {
+        try {
+            if (!expectedMode.empty()) {
+                auto current = read_variant_progress(mediaDirectory);
+                if (current && current->mode != expectedMode) return;
+            }
+            std::error_code ignored;
+            std::filesystem::remove(variant_progress_path(mediaDirectory), ignored);
+        } catch (...) {}
+    }
+
+    inline void clear_variant_progress(std::filesystem::path const& mediaDirectory,
+        VariantGenerationRequest const& expected) noexcept
+    {
+        try {
+            unique_handle file(CreateFileW(variant_progress_path(mediaDirectory).c_str(),
+                GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (!file) return;
+            auto current = parse_variant_progress(read_small_file_handle(file.get()));
+            if (current && (current->mode != expected.mode ||
+                current->requestId != expected.requestId)) return;
+            if (!current) return;
+            mark_locked_request_for_deletion(file.get());
+        } catch (...) {}
+    }
+
+    inline std::string read_variant_request(std::filesystem::path const& mediaDirectory) noexcept
+    {
+        return read_variant_generation_request(mediaDirectory).mode;
+    }
+
     inline bool request_variant_generation(std::filesystem::path const& mediaDirectory,
         std::string const& mode) noexcept
     {
-        if (mode != "balanced" && mode != "power-saver") return false;
+        if (!valid_variant_request_mode(mode)) return false;
         try {
+            VariantGenerationRequest request{ mode, new_variant_request_id() };
+            auto serialized = serialize_variant_request(request);
+            if (serialized.empty()) return false;
             std::filesystem::create_directories(mediaDirectory);
+            if (!write_small_file(variant_request_path(mediaDirectory), serialized)) return false;
             std::error_code ignored;
             std::filesystem::remove(variant_cancelled_path(mediaDirectory), ignored);
             std::filesystem::remove(variant_paused_path(mediaDirectory), ignored);
             std::filesystem::remove(variant_failed_path(mediaDirectory), ignored);
             std::filesystem::remove(variant_suppressed_path(mediaDirectory, mode), ignored);
-            return write_small_file(variant_request_path(mediaDirectory), mode);
+            // Failure to persist optional progress must not lose the durable
+            // request; the UI will simply use an indeterminate bar until the
+            // agent publishes its first sample.
+            write_variant_progress(mediaDirectory, request, VariantProgressState::queued);
+            return true;
         } catch (...) {
             return false;
         }
@@ -231,16 +530,33 @@ namespace motion
 
     inline bool pause_variant_generation(std::filesystem::path const& mediaDirectory) noexcept
     {
-        if (read_variant_request(mediaDirectory).empty()) return false;
-        return write_small_file(variant_paused_path(mediaDirectory), "paused");
+        auto request = read_variant_generation_request(mediaDirectory);
+        if (!request) return false;
+        auto locked = lock_variant_request(mediaDirectory, request);
+        if (!locked) return false;
+        if (!write_small_file(variant_paused_path(mediaDirectory), "paused")) return false;
+        auto progress = read_variant_progress(mediaDirectory);
+        bool matchingProgress = progress && progress->mode == request.mode &&
+            progress->requestId == request.requestId;
+        write_variant_progress(mediaDirectory, request, VariantProgressState::paused,
+            matchingProgress ? progress->percent : 0,
+            matchingProgress && progress->determinate);
+        return true;
     }
 
     inline bool resume_variant_generation(std::filesystem::path const& mediaDirectory) noexcept
     {
-        if (read_variant_request(mediaDirectory).empty()) return false;
+        auto request = read_variant_generation_request(mediaDirectory);
+        if (!request) return false;
+        auto locked = lock_variant_request(mediaDirectory, request);
+        if (!locked) return false;
         std::error_code error;
         std::filesystem::remove(variant_paused_path(mediaDirectory), error);
-        return !error;
+        if (error) return false;
+        // FFmpeg partials are not resumable, so a resumed job starts a fresh,
+        // honest attempt rather than retaining the previous attempt's percent.
+        write_variant_progress(mediaDirectory, request, VariantProgressState::queued);
+        return true;
     }
 
     inline void remove_variant_partials(std::filesystem::path const& mediaDirectory) noexcept
@@ -261,58 +577,110 @@ namespace motion
     inline bool suppress_variant_generation(std::filesystem::path const& mediaDirectory,
         std::string const& mode) noexcept
     {
-        if (mode != "balanced" && mode != "power-saver") return false;
+        if (!valid_variant_request_mode(mode)) return false;
         if (!write_small_file(variant_suppressed_path(mediaDirectory, mode), "suppressed")) return false;
-        if (read_variant_request(mediaDirectory) == mode) {
+        auto request = read_variant_generation_request(mediaDirectory);
+        if (request.mode == mode) {
+            auto locked = lock_variant_request(mediaDirectory, request);
+            if (!locked) return false;
+            if (!mark_locked_request_for_deletion(locked.get())) return false;
             std::error_code ignored;
-            std::filesystem::remove(variant_request_path(mediaDirectory), ignored);
             std::filesystem::remove(variant_paused_path(mediaDirectory), ignored);
             std::filesystem::remove(variant_failed_path(mediaDirectory), ignored);
+            clear_variant_progress(mediaDirectory, request);
         }
         return true;
+    }
+
+    inline void unsuppress_variant_generation(std::filesystem::path const& mediaDirectory,
+        std::string const& mode) noexcept
+    {
+        if (mode != "balanced" && mode != "power-saver") return;
+        try {
+            std::error_code ignored;
+            std::filesystem::remove(variant_suppressed_path(mediaDirectory, mode), ignored);
+        } catch (...) {}
     }
 
     inline bool cancel_variant_generation(std::filesystem::path const& mediaDirectory) noexcept
     {
+        auto request = read_variant_generation_request(mediaDirectory);
+        auto locked = request ? lock_variant_request(mediaDirectory, request) : unique_handle{};
+        if (request && !locked) return false;
         std::error_code ignored;
         if (!write_small_file(variant_cancelled_path(mediaDirectory), "cancelled")) return false;
-        std::filesystem::remove(variant_request_path(mediaDirectory), ignored);
+        if (locked && !mark_locked_request_for_deletion(locked.get())) return false;
         std::filesystem::remove(variant_paused_path(mediaDirectory), ignored);
         std::filesystem::remove(variant_failed_path(mediaDirectory), ignored);
         remove_variant_partials(mediaDirectory);
+        if (request) clear_variant_progress(mediaDirectory, request);
+        else clear_variant_progress(mediaDirectory);
         return true;
     }
 
-    inline void complete_variant_generation(std::filesystem::path const& mediaDirectory,
-        std::string const& expectedMode = {}) noexcept
+    inline bool complete_variant_generation(std::filesystem::path const& mediaDirectory,
+        VariantGenerationRequest const& expected) noexcept
     {
+        auto locked = lock_variant_request(mediaDirectory, expected);
+        if (!locked || !mark_locked_request_for_deletion(locked.get())) return false;
         std::error_code ignored;
-        if (!expectedMode.empty() && read_variant_request(mediaDirectory) != expectedMode) return;
-        std::filesystem::remove(variant_request_path(mediaDirectory), ignored);
         std::filesystem::remove(variant_paused_path(mediaDirectory), ignored);
         std::filesystem::remove(variant_failed_path(mediaDirectory), ignored);
+        clear_variant_progress(mediaDirectory, expected);
+        return true;
     }
 
-    inline void fail_variant_generation(std::filesystem::path const& mediaDirectory,
+    inline bool complete_variant_generation(std::filesystem::path const& mediaDirectory,
         std::string const& expectedMode = {}) noexcept
     {
-        std::error_code ignored;
-        if (!expectedMode.empty() && read_variant_request(mediaDirectory) != expectedMode) return;
-        auto failedMode = expectedMode.empty() ? read_variant_request(mediaDirectory) : expectedMode;
-        if (failedMode != "balanced" && failedMode != "power-saver") failedMode = "failed";
-        if (write_small_file(variant_failed_path(mediaDirectory), failedMode)) {
-            std::filesystem::remove(variant_request_path(mediaDirectory), ignored);
-            std::filesystem::remove(variant_paused_path(mediaDirectory), ignored);
+        auto current = read_variant_generation_request(mediaDirectory);
+        if (!current || (!expectedMode.empty() && current.mode != expectedMode)) return false;
+        return complete_variant_generation(mediaDirectory, current);
+    }
+
+    inline bool fail_variant_generation(std::filesystem::path const& mediaDirectory,
+        VariantGenerationRequest const& expected) noexcept
+    {
+        auto locked = lock_variant_request(mediaDirectory, expected);
+        if (!locked) return false;
+        if (!write_small_file(variant_failed_path(mediaDirectory), expected.mode)) return false;
+        if (!mark_locked_request_for_deletion(locked.get())) {
+            std::error_code ignored;
+            std::filesystem::remove(variant_failed_path(mediaDirectory), ignored);
+            return false;
         }
+        std::error_code ignored;
+        std::filesystem::remove(variant_paused_path(mediaDirectory), ignored);
+        clear_variant_progress(mediaDirectory, expected);
+        return true;
+    }
+
+    inline bool fail_variant_generation(std::filesystem::path const& mediaDirectory,
+        std::string const& expectedMode = {}) noexcept
+    {
+        auto current = read_variant_generation_request(mediaDirectory);
+        if (!current || (!expectedMode.empty() && current.mode != expectedMode)) return false;
+        return fail_variant_generation(mediaDirectory, current);
     }
 
     inline VariantCacheStatus inspect_variant_cache(std::filesystem::path const& mediaDirectory) noexcept
     {
         VariantCacheStatus result;
         try {
-            result.requestedMode = read_variant_request(mediaDirectory);
+            auto request = read_variant_generation_request(mediaDirectory);
+            result.requestedMode = request.mode;
             result.queued = !result.requestedMode.empty();
             result.paused = result.queued && variant_generation_paused(mediaDirectory);
+            auto progress = read_variant_progress(mediaDirectory);
+            if (result.queued && progress && progress->mode == result.requestedMode &&
+                progress->requestId == request.requestId) {
+                result.waitingForPower = !result.paused &&
+                    progress->state == VariantProgressState::waitingForPower;
+                result.progressPercent = progress->percent;
+                result.progressKnown = progress->determinate;
+                result.generating = !result.paused &&
+                    progress->state == VariantProgressState::generating;
+            }
             result.cancelled = std::filesystem::is_regular_file(variant_cancelled_path(mediaDirectory));
             result.failed = std::filesystem::is_regular_file(variant_failed_path(mediaDirectory));
             if (result.failed) {
@@ -335,7 +703,7 @@ namespace motion
                 std::error_code itemError;
                 if (!entries->is_regular_file(itemError) || itemError) continue;
                 auto name = entries->path().filename().wstring();
-                if (name.ends_with(L".part.mp4")) result.generating = true;
+                if (name.ends_with(L".part.mp4")) result.generating = !result.paused;
                 else if (entries->path().extension() == L".mp4") {
                     auto size = entries->file_size(itemError);
                     if (!itemError) {

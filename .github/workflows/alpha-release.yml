@@ -1,15 +1,15 @@
-name: Alpha Release
+name: Release
 
 on:
   push:
     tags:
-      - 'v*-alpha.*'
+      - 'v*'
 
 permissions:
   contents: write
 
 concurrency:
-  group: alpha-release-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
       - name: Build and test release payload
         shell: pwsh
         run: |
-          $logPath = Join-Path $env:RUNNER_TEMP 'alpha-release-build.log'
+          $logPath = Join-Path $env:RUNNER_TEMP 'release-build.log'
           try {
             & .\scripts\build-native.ps1 *>&1 | Tee-Object -FilePath $logPath
             if ($LASTEXITCODE -ne 0) {
@@ -48,9 +48,9 @@ jobs:
         if: failure()
         shell: pwsh
         run: |
-          $logPath = Join-Path $env:RUNNER_TEMP 'alpha-release-build.log'
+          $logPath = Join-Path $env:RUNNER_TEMP 'release-build.log'
           if (-not (Test-Path -LiteralPath $logPath)) {
-            Write-Host '::error title=Alpha Release 失败::发布构建未生成诊断日志。'
+            Write-Host '::error title=Release 失败::发布构建未生成诊断日志。'
             exit 0
           }
           $pattern = '(?i)(MotionWallpaper native tests failed|Native (restore|build|tests) failed|fatal error|:\s*error\s+(MSB|C|LNK|NU)\d+|exception|FFmpeg|退出码|生成失败|测试失败|throw)'
@@ -68,11 +68,11 @@ jobs:
             $message = $message.Substring($message.Length - 12000)
           }
           $message = $message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-          Write-Host "::error title=Alpha Release 诊断::$message"
+          Write-Host "::error title=Release 诊断::$message"
 
-      - name: Package and validate alpha archive
+      - name: Package and validate release archive
         shell: pwsh
-        run: .\scripts\package-alpha.ps1
+        run: .\scripts\package-release.ps1
 
       - name: Build and validate single EXE installer
         shell: pwsh
@@ -81,47 +81,63 @@ jobs:
           .\scripts\build-installer.ps1 -SkipBuild
           .\scripts\test-installer.ps1
 
-      - name: Create public prerelease
+      - name: Create public release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
-          $archive = "artifacts/MotionWallpaper-v$version-windows-x64.zip"
+          . .\scripts\release-metadata.ps1
+          $release = Get-MotionWallpaperReleaseMetadata (Get-Content -LiteralPath VERSION -Raw)
+          $version = $release.Version
+          $archive = "artifacts/$($release.ArchiveFileName)"
           $checksum = "$archive.sha256"
-          $installer = "artifacts/MotionWallpaper-v$version-setup-windows-x64.exe"
+          $installer = "artifacts/$($release.InstallerFileName)"
           $installerChecksum = "$installer.sha256"
           $notes = @'
-          MotionWallpaper 的公开 Alpha 测试版本，借鉴 macOS 动态屏保体验，面向 Windows 原生开发。
+          MotionWallpaper {{EDITION}}，面向 Windows 的原生动态壁纸与动态屏保应用。
 
           ### 主要内容
 
           - 支持动态壁纸、动态屏保和多显示器。
           - 支持原画、自动平衡和低功耗性能档位。
-          - 允许删除源视频，同时保留封面、名称和已有性能副本。
-          - 修复 NVIDIA 与物理 GPU 硬件解码判断，旧显卡可使用 CPU 解码与物理 GPU 合成。
-          - 无可用 GPU 时自动生成 H.264 CPU 友好副本，并按实际负载动态调节软件渲染帧率。
-          - 优化壁纸切换、桌面宿主复用和播放状态更新，降低 WARP 路径的内存与 CPU 占用。
-          - 提供可选择安装位置的中英文单 EXE 安装器，并统一应用、任务栏和安装器图标。
-          - 安装版与便携版统一把配置、日志、分组和壁纸放在程序目录，升级时安全迁移旧数据。
-          - 卸载安装版时会完整删除程序和全部用户数据，不再在 C 盘保留媒体库。
-          - 精简 Windows App SDK 卫星资源，只保留简体中文和英文。
+          - 性能副本显示真实百分比，并优先使用精确绑定的 NVIDIA、AMD 或 Intel 硬件路径。
+          - 保留源文件画质；性能副本另行生成，失败时不会覆盖原片。
+          - 提供中英文单 EXE 安装器和免安装便携包，均随附 App-local 运行库。
+          - 媒体库支持迁移到外置目录，升级、删除和卸载均采用保守的数据保护策略。
 
           ### 下载与校验
 
-          普通用户建议下载 `MotionWallpaper-v{{VERSION}}-setup-windows-x64.exe`，可在向导中选择安装位置。免安装使用可下载 `MotionWallpaper-v{{VERSION}}-windows-x64.zip`。可使用各自随附的 `.sha256` 文件校验完整性。
+          普通用户建议下载 `{{INSTALLER}}`，可在向导中选择安装位置。免安装使用可下载 `{{ARCHIVE}}`。可使用各自随附的 `.sha256` 文件校验完整性。
 
-          ### Alpha 提醒
+          ### 安全提示
 
-          这是未签名的预发布版本，Windows SmartScreen 可能显示警告。请仅用于测试。安装版卸载会同时删除壁纸、分组、配置和日志，请提前备份需要保留的内容；便携版升级时请保留程序旁的 `Wallpapers` 和 `Config`。遇到问题请通过仓库 Issue 反馈。
+          当前安装器尚未代码签名，Windows SmartScreen 可能显示警告。安装版卸载会删除安装目录内的默认壁纸、分组、配置和日志，请提前备份；迁移到安装目录外的媒体库会保留，需由用户自行管理。便携版升级时请保留程序旁的 `Wallpapers` 和 `Config`。
+
+          {{VALIDATION}}
           '@
-          $notes = $notes.Replace('{{VERSION}}', $version)
-          gh release create $env:GITHUB_REF_NAME $installer $installerChecksum $archive $checksum `
-            --repo $env:GITHUB_REPOSITORY `
-            --title "MotionWallpaper v$version（Alpha 测试版）" `
-            --notes $notes `
-            --prerelease `
-            --verify-tag
+          $notes = $notes.Replace('{{EDITION}}', $release.EditionName)
+          $notes = $notes.Replace('{{INSTALLER}}', $release.InstallerFileName)
+          $notes = $notes.Replace('{{ARCHIVE}}', $release.ArchiveFileName)
+          $validation = if ($release.IsPrerelease) {
+            '这是预发布测试版本，请在非关键设备上使用并通过 Issue 反馈问题。'
+          } else {
+          @'
+          ### 验证范围
+
+          自动化已覆盖 Release x64 构建、原生回归测试、发布负载检查及隔离 AppId 的安装/卸载冒烟测试。本版本尚未完成依赖与随附工具许可证复核、适用地区 H.264 专利许可判断、干净 Windows 10 且无全局 VC++ Runtime 环境、Intel 真机、更多 AMD/NVIDIA 机型、多显示器完整生命周期、睡眠/锁屏/关闭显示器/Explorer 重启，以及最终安装 EXE 的代码签名、SmartScreen 与杀毒软件误报验证。
+          '@
+          }
+          $notes = $notes.Replace('{{VALIDATION}}', $validation)
+          $releaseArguments = @(
+            'release', 'create', $env:GITHUB_REF_NAME,
+            $installer, $installerChecksum, $archive, $checksum,
+            '--repo', $env:GITHUB_REPOSITORY,
+            '--title', "MotionWallpaper v$version（$($release.EditionName)）",
+            '--notes', $notes,
+            '--verify-tag'
+          )
+          if ($release.IsPrerelease) { $releaseArguments += '--prerelease' }
+          & gh @releaseArguments
           if ($LASTEXITCODE -ne 0) {
             throw "GitHub Release 创建失败，退出码：$LASTEXITCODE"
           }

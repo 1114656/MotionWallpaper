@@ -10,7 +10,7 @@ namespace motion::app
         SettingsStore(std::filesystem::path dataRoot, std::filesystem::path applicationRoot)
             : path_(std::move(dataRoot) / L"Config" / L"settings.json"),
               agentPath_(std::move(applicationRoot) / L"motionwallpaper-agent.exe") {}
-        motion::Settings Load() const;
+        motion::Settings Load(bool* mediaLibraryAvailable = nullptr) const;
         bool Save(motion::Settings const& settings) const;
     private:
         bool ApplyStartup(bool enabled) const noexcept;

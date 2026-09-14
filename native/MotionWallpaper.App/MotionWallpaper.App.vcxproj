@@ -6,7 +6,7 @@
     <RootNamespace>MotionWallpaper</RootNamespace>
     <TargetName>MotionWallpaper</TargetName>
     <DefaultLanguage>zh-CN</DefaultLanguage>
-    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <MinimumVisualStudioVersion>18.0</MinimumVisualStudioVersion>
     <AppContainerApplication>false</AppContainerApplication>
     <AppxPackage>false</AppxPackage>
     <WindowsPackageType>None</WindowsPackageType>
@@ -50,6 +50,7 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="App.xaml.h"><DependentUpon>App.xaml</DependentUpon></ClInclude>
     <ClInclude Include="MainWindow.xaml.h"><DependentUpon>MainWindow.xaml</DependentUpon></ClInclude>
+    <ClInclude Include="LibraryMigration.h" />
     <ClInclude Include="MediaLibrary.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="SettingsStore.h" />

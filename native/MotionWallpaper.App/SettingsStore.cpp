@@ -16,10 +16,32 @@ namespace motion::app
         return result == ERROR_SUCCESS;
     }
 
-    motion::Settings SettingsStore::Load() const
+    motion::Settings SettingsStore::Load(bool* mediaLibraryAvailable) const
     {
-        auto settings = motion::load_settings(path_).value_or(motion::Settings{});
-        motion::save_settings(path_, settings); // Canonicalize legacy keys and remove dead settings.
+        if (mediaLibraryAvailable) *mediaLibraryAvailable = true;
+        std::error_code fileError;
+        bool exists = std::filesystem::exists(path_, fileError);
+        if (fileError) throw std::system_error(fileError);
+
+        motion::Settings settings;
+        if (exists) {
+            auto status = motion::load_settings_file(path_, settings);
+            // Corrupt files and future schemas are intentionally preserved.
+            // An older binary must never replace settings it cannot understand
+            // with a freshly serialized default document.
+            if (status == motion::SettingsFileStatus::invalid ||
+                status == motion::SettingsFileStatus::missing) {
+                throw std::runtime_error("settings schema is unsupported or corrupt");
+            }
+            if (status == motion::SettingsFileStatus::libraryUnavailable) {
+                if (mediaLibraryAvailable) *mediaLibraryAvailable = false;
+                ApplyStartup(settings.startWithWindows);
+                return settings;
+            }
+        }
+        // Create the first-run document or canonicalize a schema version that
+        // this binary successfully parsed and migrated in memory.
+        motion::save_settings(path_, settings);
         ApplyStartup(settings.startWithWindows);
         return settings;
     }

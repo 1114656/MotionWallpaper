@@ -6,6 +6,8 @@
 /native/packages/
 /native/obj/
 /native/x64/
+/native/*/x64/
+/website/
 **/Generated Files/
 **/AppPackages/
 **/BundleArtifacts/

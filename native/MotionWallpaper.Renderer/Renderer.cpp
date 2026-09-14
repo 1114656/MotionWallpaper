@@ -55,6 +55,7 @@ namespace
     bool hiddenRenderer{};
     std::wstring displayMode{ L"primary" };
     std::vector<std::wstring> monitorDeviceNames;
+    std::wstring requestedDecodeAdapter;
     PresentationMode presentationMode{ PresentationMode::Desktop };
     PlaybackState playbackState{ PlaybackState::Starting };
     uint64_t latestRevision{};
@@ -70,6 +71,7 @@ namespace
     bool resumePending{};
     bool returnToDesktopAfterFreeze{};
     bool visualShown{};
+    bool automaticDecodeStatusPending{};
     HANDLE lowMemoryNotification{};
 
     bool low_memory_pressure()
@@ -208,10 +210,12 @@ namespace
     {
     public:
         bool Initialize(HWND window, std::vector<RECT> regions, std::wstring const& preferredDisplay,
-            bool softwareRendering, bool allowSoftwareFallback, bool preferHighPerformance)
+            bool softwareRendering, bool allowSoftwareFallback, bool preferHighPerformance,
+            std::wstring const& requiredAdapter)
         {
             if (regions.empty() || !CreateDevice(
-                preferredDisplay, softwareRendering, allowSoftwareFallback, preferHighPerformance)) return false;
+                preferredDisplay, softwareRendering, allowSoftwareFallback,
+                preferHighPerformance, requiredAdapter)) return false;
             std::cerr << "adapter " << std::hex << adapterLuid_.HighPart << ':' << adapterLuid_.LowPart
             << std::dec << ' ' << motion::utf8_from_wide(adapterName_) << '\n' << std::flush;
 
@@ -245,6 +249,7 @@ namespace
         ID3D11Device* Device() const { return device_.Get(); }
         bool UsesSoftwareAdapter() const { return softwareAdapter_; }
         bool UsesSoftwareDecodeFallback() const { return softwareDecodeFallback_; }
+        bool HardwareVideoDeviceUnavailable() const { return hardwareVideoDeviceUnavailable_; }
         HRESULT LastError() const { return lastError_; }
         LONGLONG LastTimestamp() const { return lastTimestamp_; }
 
@@ -289,7 +294,13 @@ namespace
                     lastError_ = E_FAIL;
                     return FrameResult::Fatal;
                 }
-                for (auto& output : outputs_) output.frozenSurface.Reset();
+                // A first command may be Freeze/Pause, in which case this same
+                // frame both attaches the initial swap chain and captures the
+                // surface needed for low-memory compaction. Only a normal
+                // resume handoff makes the previous frozen surface obsolete.
+                if (!captureForFreeze) {
+                    for (auto& output : outputs_) output.frozenSurface.Reset();
+                }
             }
             lastTimestamp_ = timestamp;
             return FrameResult::Presented;
@@ -499,13 +510,16 @@ namespace
 
         static int AdapterRank(IDXGIAdapter1* adapter, std::wstring const& preferredDisplay)
         {
+            if (!adapter) return 2;
             MONITORINFOEXW primary{ sizeof(primary) };
             GetMonitorInfoW(MonitorFromPoint({}, MONITOR_DEFAULTTOPRIMARY), &primary);
             auto const preferred = preferredDisplay.empty() ? std::wstring(primary.szDevice) : preferredDisplay;
             bool hasDesktopOutput = false;
             for (UINT index = 0;; ++index) {
                 ComPtr<IDXGIOutput> output;
-                if (adapter->EnumOutputs(index, &output) == DXGI_ERROR_NOT_FOUND) break;
+                auto status = adapter->EnumOutputs(index, &output);
+                if (status == DXGI_ERROR_NOT_FOUND) break;
+                if (FAILED(status) || !output) break;
                 DXGI_OUTPUT_DESC description{};
                 if (FAILED(output->GetDesc(&description)) || !description.AttachedToDesktop) continue;
                 hasDesktopOutput = true;
@@ -514,9 +528,19 @@ namespace
             return hasDesktopOutput ? 1 : 2;
         }
 
-        bool CreateDevice(std::wstring const& preferredDisplay, bool softwareRendering,
-            bool allowSoftwareFallback, bool preferHighPerformance)
+        static std::wstring AdapterKey(DXGI_ADAPTER_DESC1 const& description)
         {
+            return std::to_wstring(description.AdapterLuid.HighPart) + L":" +
+                std::to_wstring(description.AdapterLuid.LowPart);
+        }
+
+        bool CreateDevice(std::wstring const& preferredDisplay, bool softwareRendering,
+            bool allowSoftwareFallback, bool preferHighPerformance,
+            std::wstring const& requiredAdapter)
+        {
+            softwareAdapter_ = false;
+            softwareDecodeFallback_ = false;
+            hardwareVideoDeviceUnavailable_ = false;
             UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
             if (!softwareRendering) flags |= D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
             D3D_FEATURE_LEVEL levels[]{
@@ -526,22 +550,35 @@ namespace
             if (softwareRendering) {
                 D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &device_, nullptr, &context_);
             } else {
+                struct Candidate
+                {
+                    ComPtr<IDXGIAdapter1> adapter;
+                    motion::renderer::AdapterCandidate policy;
+                };
+                std::vector<Candidate> candidates;
                 std::vector<ComPtr<IDXGIAdapter1>> adapters;
                 ComPtr<IDXGIFactory1> baseFactory;
                 if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&baseFactory)))) {
                     ComPtr<IDXGIFactory6> factory;
                     baseFactory.As(&factory);
+                    bool gpuPreferenceOrderAvailable = static_cast<bool>(factory);
                     if (factory) {
                         auto preference = preferHighPerformance ? DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE :
                             DXGI_GPU_PREFERENCE_MINIMUM_POWER;
                         for (UINT index = 0;; ++index) {
                             ComPtr<IDXGIAdapter1> adapter;
-                            if (factory->EnumAdapterByGpuPreference(
-                                index, preference, IID_PPV_ARGS(&adapter)) == DXGI_ERROR_NOT_FOUND) break;
+                            auto status = factory->EnumAdapterByGpuPreference(
+                                index, preference, IID_PPV_ARGS(&adapter));
+                            if (status == DXGI_ERROR_NOT_FOUND) break;
+                            if (FAILED(status) || !adapter) break;
                             DXGI_ADAPTER_DESC1 description{};
-                            adapter->GetDesc1(&description);
+                            if (FAILED(adapter->GetDesc1(&description))) continue;
                             if (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-                            adapters.push_back(std::move(adapter));
+                            if (!requiredAdapter.empty() && AdapterKey(description) != requiredAdapter) continue;
+                            auto displayRank = AdapterRank(adapter.Get(), preferredDisplay);
+                            candidates.push_back({ std::move(adapter), {
+                                index, displayRank,
+                                static_cast<uint64_t>(description.DedicatedVideoMemory) } });
                         }
                     } else {
                         // IDXGIFactory6 is unavailable on older supported
@@ -549,16 +586,26 @@ namespace
                         // back to DXGI 1.1 instead of losing video.
                         for (UINT index = 0;; ++index) {
                             ComPtr<IDXGIAdapter1> adapter;
-                            if (baseFactory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+                            auto status = baseFactory->EnumAdapters1(index, &adapter);
+                            if (status == DXGI_ERROR_NOT_FOUND) break;
+                            if (FAILED(status) || !adapter) break;
                             DXGI_ADAPTER_DESC1 description{};
-                            adapter->GetDesc1(&description);
+                            if (FAILED(adapter->GetDesc1(&description))) continue;
                             if (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-                            adapters.push_back(std::move(adapter));
+                            if (!requiredAdapter.empty() && AdapterKey(description) != requiredAdapter) continue;
+                            auto displayRank = AdapterRank(adapter.Get(), preferredDisplay);
+                            candidates.push_back({ std::move(adapter), {
+                                index, displayRank,
+                                static_cast<uint64_t>(description.DedicatedVideoMemory) } });
                         }
                     }
-                    std::stable_sort(adapters.begin(), adapters.end(), [&](auto const& left, auto const& right) {
-                        return AdapterRank(left.Get(), preferredDisplay) < AdapterRank(right.Get(), preferredDisplay);
+                    std::stable_sort(candidates.begin(), candidates.end(), [&](auto const& left, auto const& right) {
+                        return motion::renderer::adapter_candidate_precedes(
+                            left.policy, right.policy, preferHighPerformance,
+                            gpuPreferenceOrderAvailable);
                     });
+                    adapters.reserve(candidates.size());
+                    for (auto& candidate : candidates) adapters.push_back(std::move(candidate.adapter));
                     for (auto const& adapter : adapters) {
                         if (SUCCEEDED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &device_, nullptr, &context_))) break;
                     }
@@ -585,7 +632,16 @@ namespace
                     softwareDecodeFallback_ = true;
                 }
             }
-            if (!device_) return false;
+            if (!device_) {
+                // This is the only pre-playback capability failure that can be
+                // classified without guessing which decoder Media Engine will
+                // choose. In particular, MFT_ENUM_FLAG_HARDWARE must not be
+                // used as a DXVA probe: it deliberately excludes software MFTs
+                // that delegate decoding to the GPU, which are common on all
+                // major Windows graphics vendors.
+                hardwareVideoDeviceUnavailable_ = !softwareRendering;
+                return false;
+            }
             ComPtr<ID3D10Multithread> multithread;
             if (SUCCEEDED(device_.As(&multithread))) multithread->SetMultithreadProtected(TRUE);
 
@@ -611,6 +667,7 @@ namespace
         LUID adapterLuid_{};
         bool softwareAdapter_{};
         bool softwareDecodeFallback_{};
+        bool hardwareVideoDeviceUnavailable_{};
         HRESULT lastError_{ S_OK };
         LONGLONG lastTimestamp_{};
     } presenter;
@@ -653,6 +710,13 @@ namespace
         cancel_residency_timer();
         release_decoder();
         bool compacted = presenter.Compact();
+        if (!compacted && videoWindow) {
+            // Keep the already-paused renderer intact and retry slowly. A
+            // transient DComp failure must not turn one low-memory notification
+            // into permanent double-buffer residency or a tight wake loop.
+            SetTimer(videoWindow, residencyTimer,
+                motion::renderer::residency_memory_check_ms, nullptr);
+        }
         std::cerr << "residency " << (compacted ? "compact" : "decoder-only")
             << " presenter-mib " << (presenter.EstimatedPresenterBytes() / (1024 * 1024))
             << '\n' << std::flush;
@@ -747,9 +811,19 @@ namespace
             return;
         }
         if (result == FrameResult::Fatal) {
+            if (automaticDecodeStatusPending && !visualShown) {
+                automaticDecodeStatusPending = false;
+                report_decode_status("unavailable", "automatic-media-startup");
+            }
             report_error(pendingTargetRevision, "present", presenter.LastError());
             PostMessageW(videoWindow, WM_CLOSE, 0, 0);
             return;
+        }
+        if (automaticDecodeStatusPending) {
+            // Do not advertise a successful automatic path until the real
+            // media/driver combination has produced a presentable frame.
+            automaticDecodeStatusPending = false;
+            report_decode_status("automatic", "first-frame-presented");
         }
         auto processingTime = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - started).count();
@@ -862,6 +936,10 @@ namespace
     void handle_media_event(DWORD event, DWORD status)
     {
         if (FAILED(static_cast<HRESULT>(status))) {
+            if (automaticDecodeStatusPending && !visualShown) {
+                automaticDecodeStatusPending = false;
+                report_decode_status("unavailable", "automatic-media-startup");
+            }
             report_error(pendingTargetRevision, "media", static_cast<HRESULT>(status));
             PostMessageW(videoWindow, WM_CLOSE, 0, 0);
             return;
@@ -942,8 +1020,15 @@ namespace
             FAILED(MFGetAttributeRatio(mediaType.Get(), MF_MT_FRAME_RATE, &frameRateNumerator, &frameRateDenominator))) {
             return false;
         }
+        uint64_t aggregateOutputPixels{};
+        auto layout = selected_display_layout();
+        for (auto const& region : layout.regions) {
+            auto outputWidth = static_cast<uint64_t>((std::max)(0L, region.right - region.left));
+            auto outputHeight = static_cast<uint64_t>((std::max)(0L, region.bottom - region.top));
+            aggregateOutputPixels += outputWidth * outputHeight;
+        }
         bool highPerformance = motion::renderer::prefer_high_performance_adapter(
-            width, height, frameRateNumerator, frameRateDenominator);
+            width, height, frameRateNumerator, frameRateDenominator, aggregateOutputPixels);
         std::cerr << "workload " << width << 'x' << height << ' ' << frameRateNumerator << '/'
             << frameRateDenominator << " adapter-policy " << (highPerformance ? "performance" : "efficiency")
             << '\n' << std::flush;
@@ -951,7 +1036,8 @@ namespace
     }
 
     bool create_window(bool desktop, bool hidden, bool softwareRendering,
-        bool allowSoftwareFallback, bool preferHighPerformance)
+        bool allowSoftwareFallback, bool preferHighPerformance,
+        std::wstring const& requiredAdapter)
     {
         hiddenRenderer = hidden;
         HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -975,7 +1061,8 @@ namespace
         std::wstring preferredDisplay = monitorDeviceNames.empty() ? std::wstring{} : monitorDeviceNames.front();
         return videoWindow && apply_window_region() && presenter.Initialize(
             videoWindow, displayLayout.regions, preferredDisplay,
-            softwareRendering, allowSoftwareFallback, preferHighPerformance);
+            softwareRendering, allowSoftwareFallback, preferHighPerformance,
+            requiredAdapter);
     }
 
     bool create_engine(std::wstring const& source)
@@ -1087,6 +1174,7 @@ int wmain(int argc, wchar_t** argv)
         else if (argument == L"-display" && index + 1 < argc) displayMode = argv[++index];
         else if (argument == L"-frame-cap" && index + 1 < argc) configuredFrameRateCap = _wtoi(argv[++index]);
         else if (argument == L"-monitor" && index + 1 < argc) monitorDeviceNames.push_back(argv[++index]);
+        else if (argument == L"-adapter" && index + 1 < argc) requestedDecodeAdapter = argv[++index];
     }
     if (decodeMode != L"auto" && decodeMode != L"hardware" && decodeMode != L"software") return 6;
     if (mediaKind != L"video" && mediaKind != L"image") return 7;
@@ -1111,7 +1199,14 @@ int wmain(int argc, wchar_t** argv)
         motion::renderer::allows_software_device_fallback(decodePath);
     bool preferHighPerformance = !staticMedia && !softwareRendering &&
         video_prefers_high_performance_adapter(video);
-    if (!create_window(desktop, hidden, softwareRendering, allowSoftwareFallback, preferHighPerformance)) {
+    if (!create_window(desktop, hidden, softwareRendering, allowSoftwareFallback,
+            preferHighPerformance, requestedDecodeAdapter)) {
+        if ((decodePath == motion::renderer::DecodePath::Hardware ||
+                (decodePath == motion::renderer::DecodePath::Automatic &&
+                    !requestedDecodeAdapter.empty())) &&
+            presenter.HardwareVideoDeviceUnavailable()) {
+            report_decode_status("unavailable", "no-d3d11-video-device");
+        }
         result = 5;
     } else {
         if (presenter.UsesSoftwareAdapter() && !configuredFrameRateCap) {
@@ -1126,15 +1221,26 @@ int wmain(int argc, wchar_t** argv)
             // software MFT. The physical DXGI device is the valid acceleration
             // contract; WARP is used only when no physical D3D11 device exists.
             bool softwareFallback = presenter.UsesSoftwareDecodeFallback();
-            report_decode_status(softwareFallback ? "software-fallback" : "automatic",
-                presenter.UsesSoftwareAdapter() ? "no-physical-d3d11-adapter" :
-                softwareFallback ? "no-d3d11-video-support" : "dxgi-manager-enabled");
+            if (softwareFallback) {
+                report_decode_status("software-fallback",
+                    presenter.UsesSoftwareAdapter() ? "no-physical-d3d11-adapter" :
+                    "no-d3d11-video-support");
+            } else {
+                automaticDecodeStatusPending = true;
+            }
         } else if (decodePath == motion::renderer::DecodePath::Hardware) {
             report_decode_status("hardware", "dxgi-manager-required");
         } else {
             report_decode_status("software", "requested-software");
         }
         if (staticMedia ? !presenter.PresentImage(video) : !create_engine(video)) {
+            if (!staticMedia && decodePath == motion::renderer::DecodePath::Automatic &&
+                automaticDecodeStatusPending) {
+                automaticDecodeStatusPending = false;
+                report_decode_status("unavailable", "automatic-media-startup");
+            } else if (!staticMedia && decodePath == motion::renderer::DecodePath::Hardware) {
+                report_decode_status("unavailable", "hardware-media-startup");
+            }
             result = 5;
         } else {
             std::thread input(command_reader, false);

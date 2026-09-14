@@ -29,6 +29,7 @@
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="Renderer.cpp" /></ItemGroup>
   <ItemGroup><Manifest Include="app.manifest" /></ItemGroup>
+  <ItemGroup><ResourceCompile Include="MotionWallpaper.Renderer.rc" /></ItemGroup>
   <ItemGroup><ClInclude Include="AdapterPolicy.h" /><ClInclude Include="DecodePolicy.h" /><ClInclude Include="FrameScheduler.h" /><ClInclude Include="FrameTiming.h" /><ClInclude Include="ResidencyPolicy.h" /><ClInclude Include="SoftwareFramePolicy.h" /><ClInclude Include="..\MotionWallpaper.Protocol\RendererProtocol.h" /></ItemGroup>
   <ItemGroup><ProjectReference Include="..\MotionWallpaper.Common\MotionWallpaper.Common.vcxproj"><Project>{8E8B0D7C-63C7-4D90-A08E-8F15AA760E39}</Project></ProjectReference></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

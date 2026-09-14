@@ -1,14 +1,16 @@
 #pragma once
 
 #include "MainWindow.g.h"
+#include "LibraryMigration.h"
 #include "MediaLibrary.h"
 #include "SettingsStore.h"
-#include "VariantPageModel.h"
+#include "VariantTaskView.h"
 #include "../MotionWallpaper.Common/DisplayTopology.h"
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 
 namespace winrt::MotionWallpaper::implementation
@@ -42,6 +44,7 @@ namespace winrt::MotionWallpaper::implementation
         void MoveGroupDown_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void DeleteGroup_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void OpenLibrary_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
+        void MoveLibrary_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void CurrentWallpaper_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
 
     private:
@@ -51,6 +54,11 @@ namespace winrt::MotionWallpaper::implementation
         std::filesystem::path applicationRoot;
         std::unique_ptr<motion::app::SettingsStore> settingsStore;
         std::shared_ptr<motion::app::MediaLibrary> mediaLibrary;
+        std::shared_ptr<motion::app::LibraryAccessGate> libraryAccessGate{
+            std::make_shared<motion::app::LibraryAccessGate>() };
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> activeLibraryMigrationPause;
+        std::shared_ptr<std::atomic_bool> libraryMigrationCancellation{
+            std::make_shared<std::atomic_bool>() };
         motion::Settings settings;
         std::string appliedGroupId;
         std::string appliedMediaId;
@@ -73,8 +81,12 @@ namespace winrt::MotionWallpaper::implementation
         bool initializing{ true };
         bool reorderingGroups{};
         bool optimizationWorkVisible{};
+        bool settingsWritable{ true };
+        bool mediaLibraryAvailable{ true };
+        std::optional<motion::MediaLibraryTrustIdentity> mediaLibraryTrust;
         AppPage currentPage{ AppPage::Settings };
         std::unordered_map<std::string, uint8_t> variantSelections;
+        std::unordered_map<std::string, motion::app::VariantTaskCard> variantTaskCards;
         std::wstring variantViewFingerprint;
         std::string draggedGroupId;
 
@@ -106,9 +118,18 @@ namespace winrt::MotionWallpaper::implementation
         winrt::fire_and_forget ImportFiles(std::string kind, std::wstring title, std::wstring pattern);
         winrt::fire_and_forget RefreshMissingCovers(std::string groupId, std::vector<motion::MediaMetadata> media);
         winrt::fire_and_forget MoveMedia(motion::MediaMetadata media, std::string targetGroupId);
+        winrt::fire_and_forget DeleteGroup(motion::GroupMetadata group);
         winrt::fire_and_forget DeleteVariantProfiles(motion::MediaMetadata media, uint8_t selection);
         winrt::fire_and_forget DeleteSource(motion::MediaMetadata media);
         winrt::fire_and_forget DeleteMedia(motion::MediaMetadata media);
+        winrt::fire_and_forget MoveLibrary(std::filesystem::path target);
+        winrt::fire_and_forget FinalizeLibraryMigration(
+            std::shared_ptr<motion::app::LibraryMigrationTransaction> transaction,
+            std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause,
+            std::shared_ptr<motion::app::LibraryMigrationLease> migrationLease,
+            std::shared_ptr<std::atomic_bool> cancellation);
+        std::shared_ptr<motion::app::LibraryWriteLease> TryAcquireLibraryWrite(bool showError = true);
+        void SetLibraryMigrationUi(bool migrating);
         void StartController();
         void ShowStatus(std::wstring const& message, bool error = false);
         std::string ActiveGroupId();

@@ -1,6 +1,6 @@
 # 参与 MotionWallpaper 开发
 
-感谢你帮助改进 MotionWallpaper。项目目前处于 Alpha 阶段，包含可复现步骤、硬件信息和显示器信息的问题报告尤其有价值。
+感谢你帮助改进 MotionWallpaper。项目仍在快速迭代，包含可复现步骤、硬件信息和显示器信息的问题报告尤其有价值。
 
 ## 提交 Issue 前
 
@@ -20,10 +20,11 @@
 
 ## 开发环境
 
-安装 Visual Studio 2026 或兼容的 MSVC 环境，并包含：
+安装 Visual Studio 2026（18.x）或对应 Build Tools，并包含：
 
 - 使用 C++ 的桌面开发；
 - Windows 应用开发 / WinUI 工具；
+- MSVC v145 x64/x86 生成工具与 Redistributable 文件；
 - Windows 10/11 SDK 10.0.19041 或更高版本。
 
 构建并运行所有原生测试：

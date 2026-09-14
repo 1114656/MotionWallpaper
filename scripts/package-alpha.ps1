@@ -7,12 +7,12 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'release-metadata.ps1')
 if (-not $Version) {
     $Version = (Get-Content -LiteralPath (Join-Path $projectRoot 'VERSION') -Raw).Trim()
 }
-if ($Version -notmatch '^\d+\.\d+\.\d+-alpha\.\d+$') {
-    throw "Alpha release candidate version '$Version' is not in the expected 0.0.0-alpha.0 form."
-}
+$release = Get-MotionWallpaperReleaseMetadata $Version
+$Version = $release.Version
 
 if (-not $BuildDirectory) {
     $BuildDirectory = Join-Path $projectRoot 'build'
@@ -24,16 +24,21 @@ if (-not $ArtifactDirectory) {
 $buildRoot = [IO.Path]::GetFullPath($BuildDirectory)
 $artifactRoot = [IO.Path]::GetFullPath($ArtifactDirectory)
 $entryPoint = Join-Path $buildRoot 'MotionWallpaper.exe'
-if (-not (Test-Path -LiteralPath $entryPoint -PathType Leaf)) {
-    throw "Published application was not found at $entryPoint. Run scripts\build-native.ps1 first."
-}
-
-$archiveName = "MotionWallpaper-v$Version-windows-x64.zip"
+$archiveName = $release.ArchiveFileName
 $archivePath = Join-Path $artifactRoot $archiveName
 $checksumPath = "$archivePath.sha256"
 $temporaryBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
 $stagingRoot = Join-Path $temporaryBase ("MotionWallpaper-package-" + [guid]::NewGuid().ToString('N'))
-$payloadRoot = Join-Path $stagingRoot ("MotionWallpaper-v$Version-windows-x64")
+$payloadRoot = Join-Path $stagingRoot $release.ArchiveBaseName
+$fileVersion = $release.FileVersion
+$artifactReady = $false
+
+New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
+foreach ($path in @($archivePath, $checksumPath)) {
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+    }
+}
 
 function Get-RelativePath {
     param(
@@ -47,6 +52,18 @@ function Get-RelativePath {
 }
 
 try {
+    if (-not (Test-Path -LiteralPath $entryPoint -PathType Leaf)) {
+        throw "Published application was not found at $entryPoint. Run scripts\build-native.ps1 first."
+    }
+
+    foreach ($name in @('MotionWallpaper.exe', 'motionwallpaper-agent.exe', 'motionwallpaper-renderer.exe')) {
+        $info = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $buildRoot $name))
+        $numericVersion = "$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart).$($info.FilePrivatePart)"
+        if ($info.FileVersion -ne $fileVersion -or $info.ProductVersion -ne $Version -or $numericVersion -ne $fileVersion) {
+            throw "Published executable has inconsistent version metadata: $name ($($info.FileVersion) / $($info.ProductVersion))."
+        }
+    }
+
     New-Item -ItemType Directory -Path $payloadRoot -Force | Out-Null
     $excludedRoots = @('Wallpapers', 'Config')
     $excludedExtensions = @('.exp', '.iobj', '.ipdb', '.lib', '.pdb', '.log')
@@ -62,26 +79,28 @@ try {
         Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
     }
 
-    New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
-    Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $checksumPath -Force -ErrorAction SilentlyContinue
     Compress-Archive -LiteralPath $payloadRoot -DestinationPath $archivePath -CompressionLevel Optimal
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
     try {
         $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
-        $prefix = "MotionWallpaper-v$Version-windows-x64/"
+        $prefix = "$($release.ArchiveBaseName)/"
         $requiredEntries = @(
             'MotionWallpaper.exe',
             'motionwallpaper-agent.exe',
             'motionwallpaper-renderer.exe',
+            'msvcp140.dll',
+            'msvcp140_atomic_wait.dll',
+            'vcruntime140.dll',
+            'vcruntime140_1.dll',
             'portable.mode',
             'LICENSE.txt',
             'THIRD_PARTY_NOTICES.md',
             'Tools/ffmpeg/ffmpeg.exe',
             'Tools/ffmpeg/FFmpeg-NOTICE.txt',
-            'Tools/ffmpeg/LICENSE-FFmpeg.txt'
+            'Tools/ffmpeg/LICENSE-FFmpeg.txt',
+            'Tools/ffmpeg/LICENSE-OpenH264.txt'
         )
         foreach ($required in $requiredEntries) {
             if (($prefix + $required) -notin $entries) {
@@ -113,9 +132,17 @@ try {
 
     $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText($checksumPath, "$hash  $archiveName`r`n", [Text.UTF8Encoding]::new($false))
-    Write-Host "Validated alpha release candidate archive: $archivePath"
+    $artifactReady = $true
+    Write-Host "Validated $($release.EditionName) archive: $archivePath"
     Write-Host "SHA-256: $hash"
 } finally {
+    if (-not $artifactReady) {
+        foreach ($path in @($archivePath, $checksumPath)) {
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            }
+        }
+    }
     $resolvedStaging = [IO.Path]::GetFullPath($stagingRoot)
     if ($resolvedStaging.StartsWith($temporaryBase, [StringComparison]::OrdinalIgnoreCase) -and
         (Split-Path -Leaf $resolvedStaging) -like 'MotionWallpaper-package-*') {

@@ -11,11 +11,65 @@ namespace
     {
         return L"file:///" + path.generic_wstring();
     }
+
+    std::wstring variant_mode_label(std::string const& mode)
+    {
+        return mode == "power-saver" ? L"低功耗" : L"自动平衡";
+    }
+
+    std::wstring task_context(motion::app::VariantMediaSummary const& item)
+    {
+        return item.media.name + L"，" + variant_mode_label(item.status.requestedMode) + L"性能副本";
+    }
 }
 
 namespace motion::app
 {
-    Border create_variant_task_card(VariantMediaSummary const& item,
+    void update_variant_task_card(VariantTaskCard const& card,
+        VariantMediaSummary const& item, bool waitingForPower)
+    {
+        bool taskWaitingForPower = item.status.waitingForPower ||
+            (waitingForPower && !item.status.generating);
+        std::wstring stateLabel;
+        if (item.status.paused) stateLabel = L"已暂停";
+        else if (item.status.generating) stateLabel = L"正在生成";
+        else if (taskWaitingForPower) stateLabel = L"等待接通电源";
+        else stateLabel = L"等待生成";
+        if (item.status.progressKnown) {
+            stateLabel += L" · " + std::to_wstring(item.status.progressPercent) + L"%";
+        }
+
+        auto context = task_context(item);
+        if (card.root) {
+            Automation::AutomationProperties::SetName(card.root, hstring(context + L"任务"));
+        }
+        if (card.stateText) card.stateText.Text(stateLabel);
+        if (card.progress) {
+            card.progress.Value(item.status.progressKnown ? item.status.progressPercent : 0);
+            // FFmpeg reports a real media-time percentage once probing succeeds.
+            // Queued jobs without a known duration remain honestly indeterminate;
+            // paused/power-waiting jobs keep a stable bar instead of suggesting work.
+            card.progress.IsIndeterminate(!item.status.progressKnown &&
+                !item.status.paused && !taskWaitingForPower);
+            Automation::AutomationProperties::SetName(
+                card.progress, hstring(context + L"，" + stateLabel));
+        }
+        if (card.pause) {
+            auto actionLabel = item.status.paused ? std::wstring(L"继续") : std::wstring(L"暂停");
+            card.pause.Content(box_value(actionLabel));
+            // The click handler reads this current value rather than capturing
+            // the state that existed when the card was first constructed.
+            card.pause.Tag(box_value(item.status.paused));
+            Automation::AutomationProperties::SetName(
+                card.pause, hstring(context + L"，" + actionLabel + L"生成"));
+        }
+        if (card.cancel) {
+            Automation::AutomationProperties::SetName(
+                card.cancel, hstring(context + L"，取消生成"));
+        }
+    }
+
+    VariantTaskCard create_variant_task_card_view(VariantMediaSummary const& item,
         std::filesystem::path const& cover, bool waitingForPower,
         VariantPauseAction pauseAction, VariantCancelAction cancelAction)
     {
@@ -73,7 +127,7 @@ namespace motion::app
         layout.Children().Append(identity);
 
         TextBlock mode;
-        mode.Text(item.status.requestedMode == "power-saver" ? L"低功耗" : L"自动平衡");
+        mode.Text(variant_mode_label(item.status.requestedMode));
         mode.VerticalAlignment(VerticalAlignment::Center);
         Grid::SetColumn(mode, 2);
         layout.Children().Append(mode);
@@ -82,18 +136,13 @@ namespace motion::app
         state.Spacing(5);
         state.VerticalAlignment(VerticalAlignment::Center);
         TextBlock stateText;
-        if (item.status.paused) stateText.Text(L"已暂停");
-        else if (item.status.generating) stateText.Text(L"正在生成");
-        else if (waitingForPower) stateText.Text(L"等待接通电源");
-        else stateText.Text(L"等待生成");
         stateText.FontSize(12);
         state.Children().Append(stateText);
-        if (!item.status.paused && !waitingForPower) {
-            ProgressBar progress;
-            progress.IsIndeterminate(true);
-            progress.Height(3);
-            state.Children().Append(progress);
-        }
+        ProgressBar progress;
+        progress.Minimum(0);
+        progress.Maximum(100);
+        progress.Height(4);
+        state.Children().Append(progress);
         Grid::SetColumn(state, 3);
         layout.Children().Append(state);
 
@@ -102,9 +151,9 @@ namespace motion::app
         actions.Spacing(8);
         actions.VerticalAlignment(VerticalAlignment::Center);
         Button pause;
-        pause.Content(box_value(item.status.paused ? L"继续" : L"暂停"));
-        pause.Click([action = std::move(pauseAction), paused = item.status.paused](auto const&, auto const&) {
-            action(!paused);
+        pause.Click([action = std::move(pauseAction)](auto const& sender, auto const&) {
+            auto button = sender.template as<Button>();
+            action(!unbox_value_or<bool>(button.Tag(), false));
         });
         Button cancel;
         cancel.Content(box_value(L"取消"));
@@ -115,6 +164,16 @@ namespace motion::app
         layout.Children().Append(actions);
 
         task.Child(layout);
-        return task;
+        VariantTaskCard card{ task, stateText, progress, pause, cancel };
+        update_variant_task_card(card, item, waitingForPower);
+        return card;
+    }
+
+    Border create_variant_task_card(VariantMediaSummary const& item,
+        std::filesystem::path const& cover, bool waitingForPower,
+        VariantPauseAction pauseAction, VariantCancelAction cancelAction)
+    {
+        return create_variant_task_card_view(item, cover, waitingForPower,
+            std::move(pauseAction), std::move(cancelAction)).root;
     }
 }

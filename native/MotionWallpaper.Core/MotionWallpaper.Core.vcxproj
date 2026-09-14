@@ -25,11 +25,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\MotionWallpaper.Agent\VideoTranscoder.cpp" />
+    <ClCompile Include="..\MotionWallpaper.App\LibraryMigration.cpp" />
     <ClCompile Include="..\MotionWallpaper.App\MediaLibrary.cpp" />
     <ClCompile Include="..\MotionWallpaper.App\ThumbnailGenerator.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\MotionWallpaper.Agent\VideoTranscoder.h" />
+    <ClInclude Include="..\MotionWallpaper.App\LibraryMigration.h" />
     <ClInclude Include="..\MotionWallpaper.App\MediaLibrary.h" />
     <ClInclude Include="..\MotionWallpaper.App\ThumbnailGenerator.h" />
   </ItemGroup>

@@ -26,12 +26,12 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile><WarningLevel>Level4</WarningLevel><LanguageStandard>stdcpp20</LanguageStandard><PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions></ClCompile>
-    <Link><SubSystem>Windows</SubSystem><AdditionalDependencies>dwmapi.lib;powrprof.lib;wtsapi32.lib;user32.lib;windowsapp.lib;ole32.lib;d3d11.lib;dxgi.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><SubSystem>Windows</SubSystem><AdditionalDependencies>dwmapi.lib;powrprof.lib;wtsapi32.lib;user32.lib;windowsapp.lib;ole32.lib;d3d11.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="Agent.cpp" /><ClCompile Include="VideoOptimizer.cpp" /></ItemGroup>
   <ItemGroup><Manifest Include="app.manifest" /></ItemGroup>
   <ItemGroup><ResourceCompile Include="MotionWallpaper.Agent.rc" /></ItemGroup>
-  <ItemGroup><ClInclude Include="CoveragePolicy.h" /><ClInclude Include="PlaybackCapabilityPolicy.h" /><ClInclude Include="RandomSelectionPolicy.h" /><ClInclude Include="resource.h" /><ClInclude Include="SharedRendererPolicy.h" /><ClInclude Include="VideoOptimizer.h" /><ClInclude Include="VideoTranscoder.h" /><ClInclude Include="VideoVariantPolicy.h" /><ClInclude Include="..\MotionWallpaper.Protocol\RendererProtocol.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="CoveragePolicy.h" /><ClInclude Include="LibraryMigrationProtocol.h" /><ClInclude Include="PlaybackCapabilityPolicy.h" /><ClInclude Include="RandomSelectionPolicy.h" /><ClInclude Include="resource.h" /><ClInclude Include="SharedRendererPolicy.h" /><ClInclude Include="VideoOptimizer.h" /><ClInclude Include="VideoTranscoder.h" /><ClInclude Include="VideoVariantPolicy.h" /><ClInclude Include="..\MotionWallpaper.Protocol\RendererProtocol.h" /></ItemGroup>
   <ItemGroup>
     <ClInclude Include="RuntimePolicy.h" />
     <PackageReference Include="Microsoft.Windows.CppWinRT" Version="3.0.260715.1" />

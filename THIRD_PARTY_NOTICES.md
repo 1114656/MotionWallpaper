@@ -10,6 +10,15 @@ MotionWallpaper 的 MIT License 仅适用于本仓库的原创源代码。第三
 - 构建分发：https://github.com/BtbN/FFmpeg-Builds
 - 仓库内声明：`third_party/FFmpeg-NOTICE.txt`
 
+## OpenH264
+
+固定的 BtbN FFmpeg 构建启用了 Cisco OpenH264 编码器。OpenH264 源代码采用 BSD 许可证；发布负载在 `Tools/ffmpeg/LICENSE-OpenH264.txt` 中保留其版权、条件和免责声明。
+
+- 项目主页：https://github.com/cisco/openh264
+- 仓库内许可证副本：`third_party/OpenH264-LICENSE.txt`
+
+这里使用的是第三方 FFmpeg 构建中集成的 OpenH264，不是从 Cisco 官方下载的预编译 OpenH264 二进制；本声明不主张 Cisco 对官方预编译二进制提供的专利许可适用于该构建。正式分发前，发布者仍需独立确认适用地区的 H.264 专利许可要求。
+
 ## Microsoft Windows 组件
 
 项目通过 NuGet 恢复以下组件：
@@ -21,5 +30,7 @@ MotionWallpaper 的 MIT License 仅适用于本仓库的原创源代码。第三
 - Microsoft.Windows.SDK.BuildTools 10.0.28000.2526。
 
 Windows App SDK 组件适用其 NuGet 包中附带的 Microsoft 许可证；C++/WinRT 使用 MIT License；SDK Build Tools 仅用于构建。
+
+发布负载还会从用于构建的 Visual Studio 2026 MSVC v145 Redistributable 目录旁加载部署 x64 Visual C++ Runtime DLL。其使用和再分发受对应 Visual Studio 许可条款约束；这些 DLL 只用于免管理员安装和便携运行，不替换或修改系统组件。
 
 项目已不再引用 Windows App SDK 2.x Engineering Preview。固定使用的 Windows App SDK 1.8 组件包含可分发代码，其分发权仍以包内 Microsoft 许可证为准。发布时必须保留这些许可证文件，并完成 `docs/RELEASING.md` 中的检查。

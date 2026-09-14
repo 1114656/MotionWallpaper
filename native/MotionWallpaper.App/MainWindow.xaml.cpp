@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "MainWindow.xaml.h"
+#include "LibraryMigration.h"
 #include "resource.h"
 #include "VariantTaskView.h"
 
@@ -80,7 +81,7 @@ namespace
         append_fingerprint(output, std::to_wstring(value));
     }
 
-    std::wstring variant_page_fingerprint(
+    std::wstring variant_page_structure_fingerprint(
         std::vector<motion::app::VariantMediaSummary> const& items, bool waitingForPower)
     {
         std::wstring output;
@@ -97,6 +98,10 @@ namespace
             append_fingerprint(output, static_cast<uint64_t>(item.status.queued));
             append_fingerprint(output, static_cast<uint64_t>(item.status.generating));
             append_fingerprint(output, static_cast<uint64_t>(item.status.paused));
+            append_fingerprint(output, static_cast<uint64_t>(item.status.waitingForPower));
+            // Progress values are updated on the existing task controls. Keep
+            // them out of the structure fingerprint so a one-percent change
+            // does not rebuild every media card or discard keyboard/UIA focus.
             append_fingerprint(output, static_cast<uint64_t>(item.status.cancelled));
             append_fingerprint(output, static_cast<uint64_t>(item.status.failed));
             append_fingerprint(output, item.status.failedMode);
@@ -118,6 +123,7 @@ namespace
         winrt::weak_ref<CheckBox> balanced;
         winrt::weak_ref<CheckBox> powerSaver;
         winrt::weak_ref<Button> remove;
+        std::wstring mediaName;
         uint8_t available{};
     };
 
@@ -134,8 +140,12 @@ namespace
         setChecked(controls->balanced, selection & variant_balanced);
         setChecked(controls->powerSaver, selection & variant_power_saver);
         if (auto remove = controls->remove.get()) {
-            remove.Content(box_value(selection & variant_source
-                ? L"删除源文件" : selection ? L"删除所选" : L"先选择"));
+            auto label = selection & variant_source
+                ? std::wstring(L"删除源文件")
+                : selection ? std::wstring(L"删除所选") : std::wstring(L"先选择");
+            remove.Content(box_value(label));
+            Automation::AutomationProperties::SetName(
+                remove, hstring(controls->mediaName + L"，" + label));
             remove.IsEnabled(selection != 0);
         }
     }
@@ -211,6 +221,27 @@ namespace
         }
         return paths;
     }
+
+    fs::path select_folder(HWND owner, wchar_t const* title)
+    {
+        com_ptr<IFileOpenDialog> dialog;
+        check_hresult(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(dialog.put())));
+        DWORD options{};
+        check_hresult(dialog->GetOptions(&options));
+        check_hresult(dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM));
+        check_hresult(dialog->SetTitle(title));
+        auto result = dialog->Show(owner);
+        if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) return {};
+        check_hresult(result);
+        com_ptr<IShellItem> item;
+        check_hresult(dialog->GetResult(item.put()));
+        PWSTR path{};
+        check_hresult(item->GetDisplayName(SIGDN_FILESYSPATH, &path));
+        fs::path selected(path);
+        CoTaskMemFree(path);
+        return selected;
+    }
+
 }
 
 namespace winrt::MotionWallpaper::implementation
@@ -262,6 +293,8 @@ namespace winrt::MotionWallpaper::implementation
         Closed([this](auto const&, auto const&) {
             closing.store(true, std::memory_order_release);
             if (importCancellation) importCancellation->store(true, std::memory_order_release);
+            if (libraryMigrationCancellation) libraryMigrationCancellation->store(true, std::memory_order_release);
+            if (activeLibraryMigrationPause) activeLibraryMigrationPause->Cancel();
             settingsSaveTimer.Stop();
             statusHideTimer.Stop();
             settingsReloadTimer.Stop();
@@ -269,14 +302,75 @@ namespace winrt::MotionWallpaper::implementation
         });
 
         applicationRoot = motion::executable_directory();
-        root = motion::application_data_directory();
+        bool legacyDataConflict = motion::legacy_data_conflict_present(applicationRoot);
+        // A migration conflict deliberately has no authoritative side. Keep a
+        // path only for UI construction, but do not inspect either data tree.
+        root = legacyDataConflict ? applicationRoot : motion::application_data_directory();
         settingsStore = std::make_unique<motion::app::SettingsStore>(root, applicationRoot);
-        mediaLibrary = std::make_shared<motion::app::MediaLibrary>(root);
-        mediaLibrary->EnsureDirectories();
-        try { settings = settingsStore->Load(); }
-        catch (...) { ShowStatus(L"设置文件无法读取，已使用安全默认值；原文件未被覆盖。", true); }
+        try {
+            if (legacyDataConflict) {
+                settingsWritable = false;
+                mediaLibraryAvailable = false;
+            } else {
+                settings = settingsStore->Load(&mediaLibraryAvailable);
+            }
+        } catch (...) {
+            settingsWritable = false;
+            mediaLibraryAvailable = false;
+            ShowStatus(L"设置文件无法读取，已使用安全默认值；原文件未被覆盖。", true);
+        }
+        fs::path configuredLibraryPath;
+        try {
+            configuredLibraryPath = legacyDataConflict
+                ? (root / L"Wallpapers").lexically_normal()
+                : motion::wallpaper_library_directory(root, settings.mediaLibraryPath);
+        } catch (...) {
+            settingsWritable = false;
+            mediaLibraryAvailable = false;
+            configuredLibraryPath = (root / L"Wallpapers").lexically_normal();
+            ShowStatus(L"媒体库路径无效，已进入安全只读状态；原设置和目标路径均未修改。", true);
+        }
+        // An unreadable/future settings document may contain a library path
+        // this binary does not understand. Stay fully read-only instead of
+        // creating or repairing a different default library behind the user's
+        // back; once the settings file is repaired, a restart resumes normally.
+        if (settingsWritable && mediaLibraryAvailable) {
+            if (settings.mediaLibraryPath.empty()) {
+                // The application-owned default remains the compatible
+                // first-start path and may be created after construction.
+            } else {
+                // SettingsStore has performed the full owned-tree validation.
+                // Bind that result to stable direct object identities so every
+                // later operation can cheaply detect drive/root replacement.
+                auto identity = motion::capture_media_library_trust(
+                    configuredLibraryPath);
+                if (!identity || identity->ownershipId != settings.mediaLibraryId ||
+                    !motion::is_owned_media_library(identity->root) ||
+                    !motion::revalidate_media_library_trust(*identity)) {
+                    mediaLibraryAvailable = false;
+                } else {
+                    mediaLibraryTrust = std::move(*identity);
+                }
+            }
+        }
+        try {
+            mediaLibrary = std::make_shared<motion::app::MediaLibrary>(root,
+                motion::app::DeleteMode::RecycleBin, configuredLibraryPath,
+                mediaLibraryTrust);
+        } catch (...) {
+            if (settings.mediaLibraryPath.empty()) throw;
+            mediaLibraryTrust.reset();
+            mediaLibraryAvailable = false;
+            mediaLibrary = std::make_shared<motion::app::MediaLibrary>(root,
+                motion::app::DeleteMode::RecycleBin, configuredLibraryPath);
+        }
+        if (settingsWritable && mediaLibraryAvailable &&
+            settings.mediaLibraryPath.empty()) {
+            mediaLibrary->EnsureDirectories();
+        }
         motion::RuntimeState runtime;
-        if (motion::try_load_runtime(root / L"Config" / L"runtime.json", runtime)) {
+        if (!legacyDataConflict &&
+            motion::try_load_runtime(root / L"Config" / L"runtime.json", runtime)) {
             appliedGroupId = std::move(runtime.activeGroupId);
             appliedMediaId = std::move(runtime.activeMediaId);
             actualDecodePath = std::move(runtime.decodePath);
@@ -296,12 +390,20 @@ namespace winrt::MotionWallpaper::implementation
         auto const libraryPath = mediaLibrary->WallpapersPath().wstring();
         LibraryPath().Text(libraryPath);
         LibraryPathFull().Text(libraryPath);
+        if (legacyDataConflict) {
+            ShowStatus(L"安装数据迁移检测到旧库与新库冲突；两侧均未读写，媒体功能已安全停用。请先完成恢复后重启应用。", true);
+        } else if (settingsWritable && !mediaLibraryAvailable) {
+            ShowStatus(L"自定义媒体库当前不可访问或所有权校验失败；已停用所有媒体读写。连接原磁盘后可重试迁移位置。", true);
+        }
         settingsReloadTimer.Start();
         if (!motion::notify_settings_changed()) StartController();
     }
 
     void MainWindow::SaveSettings()
     {
+        if (!settingsWritable) {
+            throw std::runtime_error("settings are read-only after an unsupported or corrupt load");
+        }
         if (!settingsStore->Save(settings)) StartController();
     }
 
@@ -313,6 +415,75 @@ namespace winrt::MotionWallpaper::implementation
         } catch (...) {
             ShowStatus(L"无法保存设置，请确认用户数据目录可写且配置文件未被占用。", true);
             return false;
+        }
+    }
+
+    std::shared_ptr<motion::app::LibraryWriteLease> MainWindow::TryAcquireLibraryWrite(bool showError)
+    {
+        if (!settingsWritable) {
+            if (showError) {
+                ShowStatus(L"当前设置文件无法安全读取，媒体库以只读方式停用；请修复设置文件后重启应用。", true);
+            }
+            return {};
+        }
+        if (!mediaLibraryAvailable) {
+            if (showError) {
+                ShowStatus(L"自定义媒体库当前离线或未通过所有权校验；不会读取、创建或修改该路径。", true);
+            }
+            return {};
+        }
+        auto lease = libraryAccessGate->TryAcquireWrite();
+        if (!lease) {
+            if (showError) ShowStatus(L"媒体库正在迁移，请等待迁移完成后再操作。", true);
+            return {};
+        }
+        if (!settings.mediaLibraryPath.empty()) {
+            auto trust = mediaLibraryTrust &&
+                mediaLibraryTrust->ownershipId == settings.mediaLibraryId
+                ? motion::acquire_media_library_trust(*mediaLibraryTrust)
+                : std::shared_ptr<motion::MediaLibraryTrustLease>{};
+            if (!trust) {
+                // Keep the settings path intact for recovery, but make the
+                // current process fail closed until the user reconnects a fully
+                // validated owned library.
+                lease.reset();
+                mediaLibraryTrust.reset();
+                mediaLibraryAvailable = false;
+                if (!motion::notify_settings_changed()) StartController();
+                if (showError) {
+                    ShowStatus(L"媒体库磁盘、目录身份或所有权标记已变化；已立即停止所有媒体访问。请连接已有的有效媒体库。", true);
+                }
+                return {};
+            }
+            lease->RetainMediaLibraryTrust(*mediaLibraryTrust, std::move(trust));
+        }
+        return lease;
+    }
+
+    void MainWindow::SetLibraryMigrationUi(bool migrating)
+    {
+        // Destructive library operations keep a rollback snapshot of settings while
+        // the Agent drains renderers and transcoders.  Disable every page (including
+        // the currently focused control) so a later rollback cannot overwrite a
+        // setting the user changed during that acknowledgement window.
+        Content().as<FrameworkElement>().IsHitTestVisible(!migrating);
+        SettingsPage().IsEnabled(!migrating);
+        VariantsPage().IsEnabled(!migrating);
+        WallpaperPage().IsEnabled(!migrating);
+        SettingsNavButton().IsEnabled(!migrating);
+        VariantsNavButton().IsEnabled(!migrating);
+        AddGroupButton().IsEnabled(!migrating);
+        NewGroupName().IsEnabled(!migrating);
+        GroupPicker().IsEnabled(!migrating);
+        MediaList().IsEnabled(!migrating);
+        ImportImageButton().IsEnabled(!migrating);
+        ImportVideoButton().IsEnabled(!migrating);
+        if (migrating) {
+            DeleteMediaButton().IsEnabled(false);
+            RenameMediaButton().IsEnabled(false);
+            MoveMediaButton().IsEnabled(false);
+        } else {
+            UpdateMediaActionState();
         }
     }
 
@@ -431,6 +602,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::UpdateStatusSummary()
     {
+        auto writeLease = TryAcquireLibraryWrite(false);
+        if (!writeLease) return;
         CurrentWallpaperName().Text(L"尚未选择壁纸");
         CurrentWallpaperDetails().Text(L"从壁纸分组中选择即可应用");
         CurrentWallpaperPreview().Source(nullptr);
@@ -481,16 +654,19 @@ namespace winrt::MotionWallpaper::implementation
             ? L"已停止"
             : settings.activePlaybackEnabled ? L"正在播放" : L"已冻结省电");
         std::wstring decodeStatus;
-        if (actualDecodePath == "automatic") decodeStatus = L"自动解码 · 已启用 DXGI/DXVA 加速";
-        else if (actualDecodePath == "hardware") decodeStatus = L"硬件解码 · 已启用 DXGI/DXVA 加速";
+        if (actualDecodePath == "automatic") decodeStatus = L"自动解码 · 已启用 DXGI/DXVA 路径";
+        else if (actualDecodePath == "hardware") decodeStatus = L"硬件解码 · 已请求 DXGI/DXVA 路径";
         else if (actualDecodePath == "software-fallback") decodeStatus =
             actualDecodeReason == "no-physical-d3d11-adapter"
             ? L"软件渲染 · 自动回退（无可用物理 D3D11 设备）"
             : actualDecodeReason == "no-d3d11-video-support"
             ? L"CPU 解码 · 物理 GPU 合成"
-            : L"软件解码 · 自动回退（未检测到适用硬解码器）";
+            : L"软件解码 · 自动回退";
         else if (actualDecodePath == "software") decodeStatus = L"软件解码 · 手动选择";
-        else if (actualDecodePath == "unavailable") decodeStatus = L"硬件解码不可用 · 未检测到适用硬解码器";
+        else if (actualDecodePath == "unavailable") decodeStatus =
+            actualDecodeReason == "no-d3d11-video-device"
+            ? L"硬件解码不可用 · 无可用 D3D11 视频设备"
+            : L"硬件解码不可用";
         else if (actualDecodePath == "probing") decodeStatus = L"正在检测视频解码器…";
         else decodeStatus = settings.decodeMode == "software"
             ? L"软件解码"
@@ -503,6 +679,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::UpdatePerformanceModeAvailability()
     {
+        auto writeLease = TryAcquireLibraryWrite(false);
+        if (!writeLease) return;
         bool originalAvailable = true;
         std::vector<std::pair<std::string, std::string>> selectedMedia;
         if (motion::valid_id(settings.selectedGroupId) && motion::valid_id(settings.selectedMediaId)) {
@@ -536,6 +714,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::LoadGroups()
     {
+        auto writeLease = TryAcquireLibraryWrite(false);
+        if (!writeLease) return;
         bool wasInitializing = initializing;
         initializing = true;
         GroupPicker().Items().Clear();
@@ -572,6 +752,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::LoadMedia()
     {
+        auto writeLease = TryAcquireLibraryWrite(false);
+        if (!writeLease) return;
         auto groupId = ActiveGroupId();
         allMedia = groupId.empty() ? std::vector<motion::MediaMetadata>{} : mediaLibrary->LoadMedia(groupId);
         RefreshMedia();
@@ -580,6 +762,8 @@ namespace winrt::MotionWallpaper::implementation
 
     winrt::fire_and_forget MainWindow::RefreshMissingCovers(std::string groupId, std::vector<motion::MediaMetadata> media)
     {
+        auto writeLease = TryAcquireLibraryWrite(false);
+        if (!writeLease) co_return;
         if (coversRefreshing.exchange(true, std::memory_order_acq_rel)) co_return;
         auto library = mediaLibrary;
         auto weak = get_weak();
@@ -587,7 +771,13 @@ namespace winrt::MotionWallpaper::implementation
         bool changed{};
         co_await winrt::resume_background();
         try {
+            if (!writeLease->RevalidateMediaLibraryTrust()) {
+                throw std::runtime_error("media library identity changed before cover refresh");
+            }
             for (auto const& item : media) {
+                if (!writeLease->RevalidateMediaLibraryTrust()) {
+                    throw std::runtime_error("media library identity changed during cover refresh");
+                }
                 changed = library->EnsureCover(item) || changed;
             }
         } catch (...) {}
@@ -595,6 +785,8 @@ namespace winrt::MotionWallpaper::implementation
             if (auto self = weak.get()) {
                 self->coversRefreshing.store(false, std::memory_order_release);
                 if (changed && self->ActiveGroupId() == groupId) {
+                    auto writeLease = self->TryAcquireLibraryWrite(false);
+                    if (!writeLease) return;
                     self->allMedia = self->mediaLibrary->LoadMedia(groupId);
                     self->RefreshMedia();
                     self->UpdateStatusSummary();
@@ -607,9 +799,10 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::RefreshMedia()
     {
+        auto writeLease = TryAcquireLibraryWrite(false);
+        if (!writeLease) return;
         bool wasInitializing = initializing;
         initializing = true;
-        optimizationWorkVisible = false;
         filteredMedia = allMedia;
         auto sort = combo_string(SortPicker(), "name");
         std::stable_sort(filteredMedia.begin(), filteredMedia.end(), [&](auto const& left, auto const& right) {
@@ -758,6 +951,10 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::OpenNewGroup_Click(IInspectable const&, RoutedEventArgs const&)
     {
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"媒体库正在迁移，请稍后再创建分组。", true);
+            return;
+        }
         if (auto flyout = AddGroupButton().Flyout()) flyout.ShowAt(AddGroupButton());
     }
 
@@ -799,6 +996,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::RefreshVariants()
     {
+        auto writeLease = TryAcquireLibraryWrite(false);
+        if (!writeLease) return;
         auto items = motion::app::load_variant_page(*mediaLibrary, groups);
         std::stable_sort(items.begin(), items.end(), [](auto const& left, auto const& right) {
             return _wcsicmp(left.media.name.c_str(), right.media.name.c_str()) < 0;
@@ -817,9 +1016,33 @@ namespace winrt::MotionWallpaper::implementation
 
         SYSTEM_POWER_STATUS powerStatus{};
         bool waitingForPower = GetSystemPowerStatus(&powerStatus) && powerStatus.ACLineStatus == 0;
-        auto fingerprint = variant_page_fingerprint(items, waitingForPower);
-        if (fingerprint == variantViewFingerprint) return;
+        auto fingerprint = variant_page_structure_fingerprint(items, waitingForPower);
+        if (fingerprint == variantViewFingerprint) {
+            bool controlsMatch = variantTaskCards.size() == static_cast<size_t>(taskCount) &&
+                VariantTasks().Children().Size() == taskCount;
+            if (controlsMatch) {
+                for (auto const& item : items) {
+                    if (!item.status.queued) continue;
+                    auto found = variantTaskCards.find(item.media.id);
+                    if (found == variantTaskCards.end() || !found->second.root ||
+                        !found->second.stateText || !found->second.progress ||
+                        !found->second.pause || !found->second.cancel) {
+                        controlsMatch = false;
+                        break;
+                    }
+                }
+            }
+            if (controlsMatch) {
+                for (auto const& item : items) {
+                    if (!item.status.queued) continue;
+                    motion::app::update_variant_task_card(
+                        variantTaskCards.at(item.media.id), item, waitingForPower);
+                }
+                return;
+            }
+        }
 
+        variantTaskCards.clear();
         VariantTasks().Children().Clear();
         VariantCards().Children().Clear();
         VariantSummaryText().Text(std::to_wstring(items.size()) + L" 个视频 · " +
@@ -837,14 +1060,16 @@ namespace winrt::MotionWallpaper::implementation
         for (auto const& item : items) {
             if (!item.status.queued) continue;
             auto cover = mediaLibrary->MediaDirectory(item.media) / item.media.coverFileName;
-            VariantTasks().Children().Append(motion::app::create_variant_task_card(
+            auto taskCard = motion::app::create_variant_task_card_view(
                 item, cover, waitingForPower,
                 [weak = get_weak(), media = item.media](bool paused) {
                     if (auto self = weak.get()) self->SetVariantPaused(media, paused);
                 },
                 [weak = get_weak(), media = item.media] {
                     if (auto self = weak.get()) self->CancelVariant(media);
-                }));
+                });
+            VariantTasks().Children().Append(taskCard.root);
+            variantTaskCards.insert_or_assign(item.media.id, std::move(taskCard));
         }
 
         for (auto const& item : items) {
@@ -923,6 +1148,7 @@ namespace winrt::MotionWallpaper::implementation
             }
 
             auto selectionControls = std::make_shared<VariantSelectionControls>();
+            selectionControls->mediaName = item.media.name;
             selectionControls->available = availableSelections;
 
             Button remove;
@@ -969,6 +1195,9 @@ namespace winrt::MotionWallpaper::implementation
                 panel.Spacing(5);
                 CheckBox heading;
                 heading.Content(box_value(title));
+                auto profileContext = item.media.name + L"，" + title + L"性能副本";
+                Automation::AutomationProperties::SetName(
+                    heading, hstring(profileContext + L"，保留选择"));
                 heading.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
                 TextBlock detail;
                 bool active = item.status.requestedMode == mode && (item.status.queued || item.status.generating);
@@ -1004,8 +1233,12 @@ namespace winrt::MotionWallpaper::implementation
                     selectProfile(profileSelection, checked && checked.Value());
                 });
                 Button action;
-                action.Content(box_value(active ? L"任务进行中" : profileFailed ? L"重试" :
-                    profile.files ? L"已生成" : L"生成"));
+                auto actionLabel = active ? std::wstring(L"任务进行中")
+                    : profileFailed ? std::wstring(L"重试")
+                    : profile.files ? std::wstring(L"已生成") : std::wstring(L"生成");
+                action.Content(box_value(actionLabel));
+                Automation::AutomationProperties::SetName(
+                    action, hstring(profileContext + L"，" + actionLabel));
                 action.HorizontalAlignment(HorizontalAlignment::Left);
                 action.Padding(ThicknessHelper::FromLengths(12, 5, 12, 5));
                 if (active) {
@@ -1020,6 +1253,8 @@ namespace winrt::MotionWallpaper::implementation
                     });
                 } else if (!profile.files) {
                     action.Content(box_value(L"需要源文件"));
+                    Automation::AutomationProperties::SetName(
+                        action, hstring(profileContext + L"，需要源文件"));
                     action.IsEnabled(false);
                 } else {
                     action.IsEnabled(false);
@@ -1035,6 +1270,8 @@ namespace winrt::MotionWallpaper::implementation
             source.Spacing(5);
             CheckBox sourceTitle;
             sourceTitle.Content(box_value(L"源文件"));
+            Automation::AutomationProperties::SetName(
+                sourceTitle, hstring(item.media.name + L"，源文件，保留选择"));
             sourceTitle.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
             sourceTitle.IsEnabled(item.sourceAvailable);
             if (selection & variant_source) {
@@ -1104,6 +1341,7 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::GroupPicker_DragItemsStarting(IInspectable const&, DragItemsStartingEventArgs const& args)
     {
+        if (libraryAccessGate->MigrationInProgress()) return;
         if (args.Items().Size() == 0) return;
         auto name = unbox_value_or<hstring>(args.Items().GetAt(0), {});
         auto found = std::find_if(groups.begin(), groups.end(), [&](auto const& group) { return group.name == name; });
@@ -1117,6 +1355,11 @@ namespace winrt::MotionWallpaper::implementation
     {
         if (!reorderingGroups) return;
         reorderingGroups = false;
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) {
+            draggedGroupId.clear();
+            return;
+        }
         try {
             std::vector<std::string> orderedIds;
             orderedIds.reserve(GroupPicker().Items().Size());
@@ -1149,6 +1392,8 @@ namespace winrt::MotionWallpaper::implementation
     void MainWindow::Media_SelectionChanged(IInspectable const&, SelectionChangedEventArgs const&)
     {
         if (initializing) return;
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) return;
         auto index = MediaList().SelectedIndex();
         bool valid = index >= 0 && static_cast<size_t>(index) < filteredMedia.size();
         UpdateMediaActionState();
@@ -1187,6 +1432,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::CreateGroup_Click(IInspectable const&, RoutedEventArgs const&)
     {
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) return;
         try {
             auto group = mediaLibrary->CreateGroup(NewGroupName().Text().c_str(), groups);
             NewGroupName().Text(L"");
@@ -1213,6 +1460,10 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::RenameActiveGroup()
     {
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"媒体库正在迁移，请稍后再重命名分组。", true);
+            return;
+        }
         auto selected = GroupPicker().SelectedIndex();
         if (selected < 0 || static_cast<size_t>(selected) >= groups.size()) return;
         auto group = groups[static_cast<size_t>(selected)];
@@ -1231,6 +1482,8 @@ namespace winrt::MotionWallpaper::implementation
         operation.Completed([weak = get_weak(), group, input](auto const& result, Windows::Foundation::AsyncStatus status) {
             if (status != Windows::Foundation::AsyncStatus::Completed || result.GetResults() != ContentDialogResult::Primary) return;
             if (auto self = weak.get()) {
+                auto writeLease = self->TryAcquireLibraryWrite();
+                if (!writeLease) return;
                 try {
                     self->mediaLibrary->RenameGroup(group, input.Text().c_str(), self->groups);
                     self->LoadGroups();
@@ -1243,6 +1496,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::ReorderActiveGroup(int direction)
     {
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) return;
         auto groupId = ActiveGroupId();
         if (groupId.empty()) return;
         try {
@@ -1260,6 +1515,10 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::DeleteGroup_Click(IInspectable const&, RoutedEventArgs const&)
     {
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"媒体库正在迁移，请稍后再删除分组。", true);
+            return;
+        }
         auto selected = GroupPicker().SelectedIndex();
         if (selected < 0 || static_cast<size_t>(selected) >= groups.size()) return;
         if (groups.size() <= 1) { ShowStatus(L"至少需要保留一个壁纸分组。", true); return; }
@@ -1274,34 +1533,100 @@ namespace winrt::MotionWallpaper::implementation
         auto operation = dialog.ShowAsync();
         operation.Completed([weak = get_weak(), group](auto const& result, Windows::Foundation::AsyncStatus status) {
             if (status != Windows::Foundation::AsyncStatus::Completed || result.GetResults() != ContentDialogResult::Primary) return;
+            if (auto self = weak.get()) self->DeleteGroup(group);
+        });
+    }
+
+    winrt::fire_and_forget MainWindow::DeleteGroup(motion::GroupMetadata group)
+    {
+        if (activeLibraryMigrationPause) {
+            ShowStatus(L"媒体库操作正在等待后台服务，请稍后再试。", true);
+            co_return;
+        }
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) co_return;
+        auto weak = get_weak();
+        auto library = mediaLibrary;
+        auto dispatcher = DispatcherQueue();
+        auto previousSettings = settings;
+        auto previousBrowsingGroup = browsingGroupId;
+        try {
+            if (settings.selectedGroupId == group.id) {
+                auto replacement = std::find_if(groups.begin(), groups.end(),
+                    [&](auto const& item) { return item.id != group.id; });
+                if (replacement == groups.end()) {
+                    throw std::runtime_error("replacement group not found");
+                }
+                settings.selectedGroupId = replacement->id;
+                settings.selectedMediaId.clear();
+            }
+            if (browsingGroupId == group.id) browsingGroupId.clear();
+            if (settings.randomGroupId == group.id) settings.randomGroupId.clear();
+            std::erase_if(settings.displayAssignments,
+                [&](auto const& assignment) { return assignment.groupId == group.id; });
+            SaveSettings();
+        } catch (...) {
+            settings = std::move(previousSettings);
+            browsingGroupId = std::move(previousBrowsingGroup);
+            try { SaveSettings(); } catch (...) {}
+            ShowStatus(L"无法安全切换当前分组；未删除任何文件。", true);
+            co_return;
+        }
+
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
+        try {
+            agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
+        } catch (...) {
+            settings = std::move(previousSettings);
+            browsingGroupId = std::move(previousBrowsingGroup);
+            ApplySettingsToControls();
+            try { SaveSettings(); } catch (...) {}
+            ShowStatus(L"无法建立与后台服务的删除协调通道；未删除分组。", true);
+            co_return;
+        }
+        activeLibraryMigrationPause = agentPause;
+        SetLibraryMigrationUi(true);
+        ShowStatus(L"正在暂停后台播放并安全删除分组…", false);
+
+        co_await winrt::resume_background();
+        bool paused = agentPause->RequestAndWait(std::chrono::seconds(20));
+        bool deleted{};
+        if (paused && !closing.load(std::memory_order_acquire)) {
+            try {
+                if (!writeLease->RevalidateMediaLibraryTrust()) {
+                    throw std::runtime_error("media library identity changed before group deletion");
+                }
+                library->DeleteGroup(group);
+                deleted = true;
+            } catch (...) {}
+        }
+        bool resumed{};
+        if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
+        else agentPause->Cancel();
+
+        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
+            writeLease = std::move(writeLease), previousSettings = std::move(previousSettings),
+            previousBrowsingGroup = std::move(previousBrowsingGroup), paused, deleted, resumed]() mutable {
             if (auto self = weak.get()) {
-                auto previousSettings = self->settings;
-                auto previousBrowsingGroup = self->browsingGroupId;
-                bool deleted = false;
-                try {
-                    if (self->settings.selectedGroupId == group.id) {
-                        auto replacement = std::find_if(self->groups.begin(), self->groups.end(), [&](auto const& item) { return item.id != group.id; });
-                        if (replacement == self->groups.end()) throw std::runtime_error("replacement group not found");
-                        self->settings.selectedGroupId = replacement->id;
-                        self->settings.selectedMediaId.clear();
-                    }
-                    if (self->browsingGroupId == group.id) self->browsingGroupId.clear();
-                    if (self->settings.randomGroupId == group.id) self->settings.randomGroupId.clear();
-                    std::erase_if(self->settings.displayAssignments,
-                        [&](auto const& assignment) { return assignment.groupId == group.id; });
-                    self->SaveSettings();
-                    self->mediaLibrary->DeleteGroup(group);
-                    deleted = true;
-                    self->LoadGroups();
-                    self->LoadMedia();
+                if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
+                writeLease.reset();
+                self->SetLibraryMigrationUi(false);
+                if (!deleted) {
+                    self->settings = std::move(previousSettings);
+                    self->browsingGroupId = std::move(previousBrowsingGroup);
+                    self->ApplySettingsToControls();
+                    try { self->SaveSettings(); } catch (...) {}
+                }
+                self->LoadGroups();
+                self->LoadMedia();
+                if (!paused) {
+                    self->ShowStatus(L"后台服务未确认暂停；为保护正在使用的文件，未删除分组。", true);
+                } else if (!deleted) {
+                    self->ShowStatus(L"删除已安全中止；媒体库身份可能已变化，未继续按原路径操作。", true);
+                } else if (!resumed) {
+                    self->ShowStatus(L"分组已删除，但后台服务未及时确认恢复；请重启应用。", true);
+                } else {
                     self->ShowStatus(L"分组已移到 Windows 回收站。");
-                } catch (...) {
-                    if (!deleted) {
-                        self->settings = previousSettings;
-                        self->browsingGroupId = previousBrowsingGroup;
-                        try { self->SaveSettings(); } catch (...) {}
-                    }
-                    self->ShowStatus(L"删除分组失败，请关闭正在占用其中壁纸的程序后重试。", true);
                 }
             }
         });
@@ -1327,14 +1652,16 @@ namespace winrt::MotionWallpaper::implementation
     winrt::fire_and_forget MainWindow::ImportFiles(std::string kind, std::wstring title, std::wstring pattern)
     {
         auto weak = get_weak();
-        auto library = mediaLibrary;
         auto dispatcher = DispatcherQueue();
         try {
             HWND window{};
             auto native = this->try_as<::IWindowNative>();
             check_hresult(native->get_WindowHandle(&window));
             auto files = select_files(window, title.c_str(), pattern.c_str());
-            if (files.empty() || importing.exchange(true)) co_return;
+            if (files.empty()) co_return;
+            auto writeLease = TryAcquireLibraryWrite();
+            if (!writeLease || importing.exchange(true)) co_return;
+            auto library = mediaLibrary;
             auto groupId = ActiveGroupId();
             auto displayId = selectedDisplayId;
             auto optimizationMode = settings.performanceMode;
@@ -1359,8 +1686,14 @@ namespace winrt::MotionWallpaper::implementation
             bool optimizationRequested{};
             std::wstring errorMessage;
             try {
+                if (!writeLease->RevalidateMediaLibraryTrust()) {
+                    throw std::runtime_error("media library identity changed before import");
+                }
                 for (auto const& path : files) {
                     if (cancellation->load(std::memory_order_acquire)) break;
+                    if (!writeLease->RevalidateMediaLibraryTrust()) {
+                        throw std::runtime_error("media library identity changed during import");
+                    }
                     uint64_t fileBytes = fs::file_size(path);
                     lastId = library->Import(path, kind, groupId, [&](uint64_t copied, uint64_t) {
                         int percent = totalBytes ? static_cast<int>((completedBytes + copied) * 100 / totalBytes) : 100;
@@ -1385,7 +1718,14 @@ namespace winrt::MotionWallpaper::implementation
                     ++completedFiles;
                 }
             } catch (...) {
-                errorMessage = kind == "video" ? L"导入失败。请确认文件格式受支持且媒体库可写。" : L"图片导入失败。请确认格式受 Windows 图像组件支持。";
+                // Import() aborts its current temporary directory by throwing
+                // after observing the cancellation flag. That is a successful
+                // user cancellation, not a media-format or I/O failure.
+                if (!cancellation->load(std::memory_order_acquire)) {
+                    errorMessage = kind == "video"
+                        ? L"导入失败。请确认文件格式受支持且媒体库可写。"
+                        : L"图片导入失败。请确认格式受 Windows 图像组件支持。";
+                }
             }
 
             bool cancelled = cancellation->load(std::memory_order_acquire);
@@ -1426,6 +1766,10 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::RenameMedia_Click(IInspectable const&, RoutedEventArgs const&)
     {
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"媒体库正在迁移，请稍后再重命名壁纸。", true);
+            return;
+        }
         auto selected = MediaList().SelectedIndex();
         if (selected < 0 || static_cast<size_t>(selected) >= filteredMedia.size()) return;
         auto media = filteredMedia[static_cast<size_t>(selected)];
@@ -1444,6 +1788,8 @@ namespace winrt::MotionWallpaper::implementation
         operation.Completed([weak = get_weak(), media = std::move(media), input](auto const& result, Windows::Foundation::AsyncStatus status) {
             if (status != Windows::Foundation::AsyncStatus::Completed || result.GetResults() != ContentDialogResult::Primary) return;
             if (auto self = weak.get()) {
+                auto writeLease = self->TryAcquireLibraryWrite();
+                if (!writeLease) return;
                 try {
                     self->mediaLibrary->Rename(media, input.Text().c_str());
                     self->LoadMedia();
@@ -1455,6 +1801,10 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::MoveMedia_Click(IInspectable const&, RoutedEventArgs const&)
     {
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"媒体库正在迁移，请稍后再移动壁纸。", true);
+            return;
+        }
         auto selected = MediaList().SelectedIndex();
         if (selected < 0 || static_cast<size_t>(selected) >= filteredMedia.size()) return;
         auto media = filteredMedia[static_cast<size_t>(selected)];
@@ -1486,26 +1836,77 @@ namespace winrt::MotionWallpaper::implementation
 
     winrt::fire_and_forget MainWindow::MoveMedia(motion::MediaMetadata media, std::string targetId)
     {
+        if (activeLibraryMigrationPause) {
+            ShowStatus(L"媒体库操作正在等待后台服务，请稍后再试。", true);
+            co_return;
+        }
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) co_return;
         auto weak = get_weak();
         auto library = mediaLibrary;
         auto dispatcher = DispatcherQueue();
-        bool moved{};
+        auto previousSettings = settings;
         try {
-            co_await winrt::resume_background();
-            library->Move(media, targetId);
-            moved = true;
-        } catch (...) {}
-        dispatcher.TryEnqueue([weak, media = std::move(media), targetId = std::move(targetId), moved]() mutable {
-            if (auto self = weak.get()) {
-                if (moved) {
-                    if (self->settings.selectedGroupId == media.groupId && self->settings.selectedMediaId == media.id) {
-                        self->settings.selectedGroupId = targetId;
-                    }
-                    for (auto& assignment : self->settings.displayAssignments) {
-                        if (assignment.groupId == media.groupId && assignment.mediaId == media.id) assignment.groupId = targetId;
-                    }
+            if (settings.selectedGroupId == media.groupId && settings.selectedMediaId == media.id) {
+                settings.selectedGroupId = targetId;
+            }
+            for (auto& assignment : settings.displayAssignments) {
+                if (assignment.groupId == media.groupId && assignment.mediaId == media.id) {
+                    assignment.groupId = targetId;
                 }
-                try { self->SaveSettings(); } catch (...) {}
+            }
+            SaveSettings();
+        } catch (...) {
+            settings = std::move(previousSettings);
+            try { SaveSettings(); } catch (...) {}
+            ShowStatus(L"无法安全切换壁纸分组；未移动任何文件。", true);
+            co_return;
+        }
+
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
+        try {
+            agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
+        } catch (...) {
+            settings = std::move(previousSettings);
+            ApplySettingsToControls();
+            try { SaveSettings(); } catch (...) {}
+            ShowStatus(L"无法建立与后台服务的移动协调通道；未移动壁纸。", true);
+            co_return;
+        }
+        activeLibraryMigrationPause = agentPause;
+        SetLibraryMigrationUi(true);
+        ShowStatus(L"正在暂停后台播放并安全移动壁纸…", false);
+
+        co_await winrt::resume_background();
+        bool paused = agentPause->RequestAndWait(std::chrono::seconds(20));
+        bool moved{};
+        if (paused && !closing.load(std::memory_order_acquire)) {
+            try {
+                if (!writeLease->RevalidateMediaLibraryTrust()) {
+                    throw std::runtime_error("media library identity changed before move");
+                }
+                library->Move(media, targetId);
+                moved = true;
+            } catch (...) {}
+        }
+        bool resumed{};
+        if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
+        else agentPause->Cancel();
+
+        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
+            writeLease = std::move(writeLease), previousSettings = std::move(previousSettings),
+            media = std::move(media), targetId = std::move(targetId), paused, moved, resumed]() mutable {
+            if (auto self = weak.get()) {
+                if (self->activeLibraryMigrationPause == agentPause) {
+                    self->activeLibraryMigrationPause.reset();
+                }
+                writeLease.reset();
+                self->SetLibraryMigrationUi(false);
+                if (!moved) {
+                    self->settings = std::move(previousSettings);
+                    self->ApplySettingsToControls();
+                    try { self->SaveSettings(); } catch (...) {}
+                }
                 if (moved) {
                     self->initializing = true;
                     for (size_t index = 0; index < self->groups.size(); ++index) {
@@ -1514,10 +1915,14 @@ namespace winrt::MotionWallpaper::implementation
                     self->initializing = false;
                     self->LoadMedia();
                     self->ShowWallpaperPage();
-                    self->ShowStatus(L"壁纸已移动到新分组。");
+                    self->ShowStatus(resumed
+                        ? L"壁纸已移动到新分组。"
+                        : L"壁纸已移动，但后台服务未及时确认恢复；请重启应用。", !resumed);
                 } else {
                     self->LoadMedia();
-                    self->ShowStatus(L"移动失败，请确认目标分组可写且壁纸未被其他程序占用。", true);
+                    self->ShowStatus(!paused
+                        ? L"后台服务未确认暂停；为保护正在使用的文件，未移动壁纸。"
+                        : L"移动已安全中止；媒体库身份可能已变化，未继续按原路径操作。", true);
                 }
             }
         });
@@ -1545,6 +1950,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::RequestVariant(motion::MediaMetadata const& media, std::string const& mode)
     {
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) return;
         try {
             if (!mediaLibrary->RequestOptimization(media, mode)) {
                 ShowStatus(L"无法创建优化任务。", true);
@@ -1560,6 +1967,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::SetVariantPaused(motion::MediaMetadata const& media, bool paused)
     {
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) return;
         try {
             if (paused) mediaLibrary->PauseOptimization(media);
             else mediaLibrary->ResumeOptimization(media);
@@ -1575,6 +1984,8 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::CancelVariant(motion::MediaMetadata const& media)
     {
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) return;
         try {
             mediaLibrary->CancelOptimization(media);
             motion::notify_settings_changed();
@@ -1588,6 +1999,8 @@ namespace winrt::MotionWallpaper::implementation
     void MainWindow::ConfirmDeleteVariantSelection(motion::MediaMetadata const& media,
         uint8_t selection)
     {
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) return;
         if (selection & variant_source) {
             auto status = mediaLibrary->VariantStatus(media);
             if (!mediaLibrary->SourceAvailable(media) || status.entries.empty()) {
@@ -1672,10 +2085,19 @@ namespace winrt::MotionWallpaper::implementation
 
     winrt::fire_and_forget MainWindow::DeleteVariantProfiles(motion::MediaMetadata media, uint8_t selection)
     {
+        if (activeLibraryMigrationPause) {
+            ShowStatus(L"媒体库操作正在等待后台服务，请稍后再试。", true);
+            co_return;
+        }
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) co_return;
         auto weak = get_weak();
         auto library = mediaLibrary;
         auto dispatcher = DispatcherQueue();
         bool sourceAvailable = library->SourceAvailable(media);
+        auto previousSettings = settings;
+        bool settingsChanged{};
+        std::vector<std::string> modes;
         try {
             auto status = library->VariantStatus(media);
             if (!sourceAvailable) {
@@ -1697,40 +2119,97 @@ namespace winrt::MotionWallpaper::implementation
                     initializing = true;
                     select_tag(PerformanceMode(), motion::utf8_to_wide(fallback));
                     initializing = wasInitializing;
-                    if (!TrySaveSettings()) co_return;
+                    if (!TrySaveSettings()) throw std::runtime_error("cannot save fallback performance mode");
+                    settingsChanged = true;
                 }
             }
-            if (selection & variant_balanced) library->SuppressOptimization(media, "balanced");
-            if (selection & variant_power_saver) library->SuppressOptimization(media, "power-saver");
-            motion::notify_settings_changed();
-            co_await winrt::resume_after(std::chrono::milliseconds(1200));
-            co_await winrt::resume_background();
-            if (selection & variant_balanced) library->DeleteVariantProfile(media, "balanced");
-            if (selection & variant_power_saver) library->DeleteVariantProfile(media, "power-saver");
-            dispatcher.TryEnqueue([weak, mediaId = media.id, sourceAvailable] {
-                if (auto self = weak.get()) {
-                    self->variantSelections.erase(mediaId);
-                    self->RefreshVariants();
+            if (selection & variant_balanced) modes.push_back("balanced");
+            if (selection & variant_power_saver) modes.push_back("power-saver");
+            if (modes.empty()) throw std::runtime_error("no variant profile selected");
+        } catch (...) {
+            if (settingsChanged) {
+                settings = std::move(previousSettings);
+                ApplySettingsToControls();
+                try { SaveSettings(); } catch (...) {}
+            }
+            ShowStatus(L"无法删除副本；请确认至少保留一个可播放文件且副本未被占用。", true);
+            co_return;
+        }
+
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
+        try {
+            agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
+        } catch (...) {
+            if (settingsChanged) {
+                settings = std::move(previousSettings);
+                ApplySettingsToControls();
+                try { SaveSettings(); } catch (...) {}
+            }
+            ShowStatus(L"无法建立与后台服务的删除协调通道；未删除任何副本。", true);
+            co_return;
+        }
+        activeLibraryMigrationPause = agentPause;
+        SetLibraryMigrationUi(true);
+        ShowStatus(L"正在暂停后台播放并安全删除所选副本…", false);
+
+        co_await winrt::resume_background();
+        bool paused = agentPause->RequestAndWait(std::chrono::seconds(20));
+        bool deleted{};
+        if (paused && !closing.load(std::memory_order_acquire)) {
+            try {
+                if (!writeLease->RevalidateMediaLibraryTrust()) {
+                    throw std::runtime_error("media library identity changed before variant deletion");
+                }
+                library->DeleteVariantProfiles(media, modes);
+                deleted = true;
+            } catch (...) {}
+        }
+        bool resumed{};
+        if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
+        else agentPause->Cancel();
+
+        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
+            writeLease = std::move(writeLease), previousSettings = std::move(previousSettings),
+            settingsChanged, mediaId = media.id, sourceAvailable, paused, deleted, resumed]() mutable {
+            if (auto self = weak.get()) {
+                if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
+                writeLease.reset();
+                self->SetLibraryMigrationUi(false);
+                if (!deleted && settingsChanged) {
+                    self->settings = std::move(previousSettings);
+                    self->ApplySettingsToControls();
+                    try { self->SaveSettings(); } catch (...) {}
+                }
+                self->variantSelections.erase(mediaId);
+                self->RefreshVariants();
+                if (!paused) {
+                    self->ShowStatus(L"后台服务未确认暂停；为保护正在使用的文件，未删除任何副本。", true);
+                } else if (!deleted) {
+                    self->ShowStatus(L"删除已安全中止；媒体库身份可能已变化，未继续按原路径操作。", true);
+                } else if (!resumed) {
+                    self->ShowStatus(L"副本已删除，但后台服务未及时确认恢复；请重启应用。", true);
+                } else {
                     self->ShowStatus(sourceAvailable
                         ? L"所选性能副本已删除，源文件和其他副本已保留。"
                         : L"所选性能副本已删除，剩余副本会继续播放。");
                 }
-            });
-        } catch (...) {
-            dispatcher.TryEnqueue([weak] {
-                if (auto self = weak.get()) {
-                    self->RefreshVariants();
-                    self->ShowStatus(L"无法删除副本；请确认至少保留一个可播放文件且副本未被占用。", true);
-                }
-            });
-        }
+            }
+        });
     }
 
     winrt::fire_and_forget MainWindow::DeleteSource(motion::MediaMetadata media)
     {
+        if (activeLibraryMigrationPause) {
+            ShowStatus(L"媒体库操作正在等待后台服务，请稍后再试。", true);
+            co_return;
+        }
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) co_return;
         auto weak = get_weak();
         auto library = mediaLibrary;
         auto dispatcher = DispatcherQueue();
+        auto previousSettings = settings;
+        bool settingsChanged{};
         try {
             auto status = library->VariantStatus(media);
             bool balancedAvailable = std::any_of(status.entries.begin(), status.entries.end(),
@@ -1749,37 +2228,87 @@ namespace winrt::MotionWallpaper::implementation
                 initializing = true;
                 select_tag(PerformanceMode(), motion::utf8_to_wide(settings.performanceMode));
                 initializing = wasInitializing;
-                if (!TrySaveSettings()) co_return;
+                if (!TrySaveSettings()) throw std::runtime_error("cannot save fallback performance mode");
+                settingsChanged = true;
             }
+        } catch (...) {
+            if (settingsChanged) {
+                settings = std::move(previousSettings);
+                ApplySettingsToControls();
+                try { SaveSettings(); } catch (...) {}
+            }
+            ShowStatus(L"无法删除源文件；请确认副本完整且文件未被占用。", true);
+            co_return;
+        }
 
-            library->CancelOptimization(media);
-            motion::notify_settings_changed();
-            co_await winrt::resume_after(std::chrono::milliseconds(1200));
-            co_await winrt::resume_background();
-            library->DeleteSource(media);
-            motion::notify_settings_changed();
-            dispatcher.TryEnqueue([weak, mediaId = media.id] {
-                if (auto self = weak.get()) {
-                    self->variantSelections.erase(mediaId);
-                    self->variantViewFingerprint.clear();
-                    self->RefreshVariants();
-                    self->LoadMedia();
-                    self->UpdateStatusSummary();
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
+        try {
+            agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
+        } catch (...) {
+            if (settingsChanged) {
+                settings = std::move(previousSettings);
+                ApplySettingsToControls();
+                try { SaveSettings(); } catch (...) {}
+            }
+            ShowStatus(L"无法建立与后台服务的删除协调通道；未删除源文件。", true);
+            co_return;
+        }
+        activeLibraryMigrationPause = agentPause;
+        SetLibraryMigrationUi(true);
+        ShowStatus(L"正在暂停后台播放并安全删除源文件…", false);
+
+        co_await winrt::resume_background();
+        bool paused = agentPause->RequestAndWait(std::chrono::seconds(20));
+        bool deleted{};
+        if (paused && !closing.load(std::memory_order_acquire)) {
+            try {
+                if (!writeLease->RevalidateMediaLibraryTrust()) {
+                    throw std::runtime_error("media library identity changed before source deletion");
+                }
+                library->DeleteSource(media);
+                deleted = true;
+            } catch (...) {}
+        }
+        bool resumed{};
+        if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
+        else agentPause->Cancel();
+
+        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
+            writeLease = std::move(writeLease), previousSettings = std::move(previousSettings),
+            settingsChanged, mediaId = media.id, paused, deleted, resumed]() mutable {
+            if (auto self = weak.get()) {
+                if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
+                writeLease.reset();
+                self->SetLibraryMigrationUi(false);
+                if (!deleted && settingsChanged) {
+                    self->settings = std::move(previousSettings);
+                    self->ApplySettingsToControls();
+                    try { self->SaveSettings(); } catch (...) {}
+                }
+                self->variantSelections.erase(mediaId);
+                self->variantViewFingerprint.clear();
+                self->RefreshVariants();
+                self->LoadMedia();
+                self->UpdateStatusSummary();
+                if (!paused) {
+                    self->ShowStatus(L"后台服务未确认暂停；为保护正在使用的文件，未删除源文件。", true);
+                } else if (!deleted) {
+                    self->ShowStatus(L"删除已安全中止；媒体库身份可能已变化，未继续按原路径操作。", true);
+                } else if (!resumed) {
+                    self->ShowStatus(L"源文件已删除，但后台服务未及时确认恢复；请重启应用。", true);
+                } else {
                     self->ShowStatus(L"源文件已移入回收站；性能副本、首帧和名称已保留。");
                 }
-            });
-        } catch (...) {
-            dispatcher.TryEnqueue([weak] {
-                if (auto self = weak.get()) {
-                    self->RefreshVariants();
-                    self->ShowStatus(L"无法删除源文件；请确认副本完整且文件未被占用。", true);
-                }
-            });
-        }
+            }
+        });
     }
 
     void MainWindow::DeleteMedia_Click(IInspectable const&, RoutedEventArgs const&)
     {
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"媒体库正在迁移，请稍后再删除壁纸。", true);
+            return;
+        }
         auto selected = MediaList().SelectedIndex();
         if (selected < 0 || static_cast<size_t>(selected) >= filteredMedia.size()) return;
         auto media = filteredMedia[static_cast<size_t>(selected)];
@@ -1799,12 +2328,17 @@ namespace winrt::MotionWallpaper::implementation
 
     winrt::fire_and_forget MainWindow::DeleteMedia(motion::MediaMetadata media)
     {
+        if (activeLibraryMigrationPause) {
+            ShowStatus(L"媒体库操作正在等待后台服务，请稍后再试。", true);
+            co_return;
+        }
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) co_return;
         auto weak = get_weak();
         auto library = mediaLibrary;
         auto dispatcher = DispatcherQueue();
         auto previousSettings = settings;
         try {
-            library->CancelOptimization(media);
             if (settings.selectedGroupId == media.groupId && settings.selectedMediaId == media.id) {
                 settings.selectedMediaId.clear();
             }
@@ -1819,34 +2353,334 @@ namespace winrt::MotionWallpaper::implementation
             co_return;
         }
 
-        co_await winrt::resume_after(std::chrono::milliseconds(1200));
-        co_await winrt::resume_background();
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
         try {
-            library->Delete(media);
-            dispatcher.TryEnqueue([weak, mediaId = media.id] {
-                if (auto self = weak.get()) {
-                    self->variantSelections.erase(mediaId);
-                    self->LoadMedia();
-                    if (self->currentPage == AppPage::Variants) self->RefreshVariants();
+            agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
+        } catch (...) {
+            settings = std::move(previousSettings);
+            ApplySettingsToControls();
+            try { SaveSettings(); } catch (...) {}
+            ShowStatus(L"无法建立与后台服务的删除协调通道；未删除壁纸。", true);
+            co_return;
+        }
+        activeLibraryMigrationPause = agentPause;
+        SetLibraryMigrationUi(true);
+        ShowStatus(L"正在暂停后台播放并安全删除壁纸…", false);
+
+        co_await winrt::resume_background();
+        bool paused = agentPause->RequestAndWait(std::chrono::seconds(20));
+        bool deleted{};
+        if (paused && !closing.load(std::memory_order_acquire)) {
+            try {
+                if (!writeLease->RevalidateMediaLibraryTrust()) {
+                    throw std::runtime_error("media library identity changed before wallpaper deletion");
+                }
+                library->CancelOptimization(media);
+                if (!writeLease->RevalidateMediaLibraryTrust()) {
+                    throw std::runtime_error("media library identity changed after optimizer cancellation");
+                }
+                library->Delete(media);
+                deleted = true;
+            } catch (...) {}
+        }
+        bool resumed{};
+        if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
+        else agentPause->Cancel();
+
+        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
+            writeLease = std::move(writeLease), previousSettings = std::move(previousSettings),
+            mediaId = media.id, paused, deleted, resumed]() mutable {
+            if (auto self = weak.get()) {
+                if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
+                writeLease.reset();
+                self->SetLibraryMigrationUi(false);
+                if (!deleted) {
+                    self->settings = std::move(previousSettings);
+                    self->ApplySettingsToControls();
+                    try { self->SaveSettings(); } catch (...) {}
+                }
+                self->variantSelections.erase(mediaId);
+                self->LoadMedia();
+                if (self->currentPage == AppPage::Variants) self->RefreshVariants();
+                if (!paused) {
+                    self->ShowStatus(L"后台服务未确认暂停；为保护正在使用的文件，未删除壁纸。", true);
+                } else if (!deleted) {
+                    self->ShowStatus(L"删除已安全中止；媒体库身份可能已变化，未继续按原路径操作。", true);
+                } else if (!resumed) {
+                    self->ShowStatus(L"壁纸已删除，但后台服务未及时确认恢复；请重启应用。", true);
+                } else {
                     self->ShowStatus(L"壁纸本体及其优化副本已移到 Windows 回收站。");
                 }
-            });
-        } catch (...) {
-            dispatcher.TryEnqueue([weak, previousSettings = std::move(previousSettings)]() mutable {
-                if (auto self = weak.get()) {
-                    self->settings = std::move(previousSettings);
-                    try { self->SaveSettings(); } catch (...) {}
-                    self->LoadMedia();
-                    self->ShowStatus(L"删除失败。请关闭正在占用该壁纸的程序后重试。", true);
-                }
-            });
-        }
+            }
+        });
     }
 
     void MainWindow::OpenLibrary_Click(IInspectable const&, RoutedEventArgs const&)
     {
+        auto access = TryAcquireLibraryWrite();
+        if (!access) return;
         auto path = mediaLibrary->WallpapersPath();
         ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    void MainWindow::MoveLibrary_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        if (!settingsWritable) {
+            ShowStatus(L"当前设置文件无法安全读取，不能迁移媒体库；请修复设置文件后重启应用。", true);
+            return;
+        }
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"媒体库迁移已经在进行中。", true);
+            return;
+        }
+        try {
+            HWND window{};
+            auto nativeWindow = this->try_as<::IWindowNative>();
+            check_hresult(nativeWindow->get_WindowHandle(&window));
+            auto target = select_folder(window, mediaLibraryAvailable
+                ? L"选择新的媒体库文件夹（必须为空）"
+                : L"连接已有 MotionWallpaper 媒体库（不会在空文件夹中新建）");
+            if (!target.empty()) MoveLibrary(std::move(target));
+        } catch (...) {
+            ShowStatus(L"无法选择媒体库位置。", true);
+        }
+    }
+
+    winrt::fire_and_forget MainWindow::MoveLibrary(fs::path target)
+    {
+        auto weak = get_weak();
+        auto dispatcher = DispatcherQueue();
+        auto source = mediaLibrary->WallpapersPath();
+        bool connectExistingLibrary = !mediaLibraryAvailable;
+        if (!connectExistingLibrary) {
+            try {
+                if (!settings.mediaLibraryPath.empty() &&
+                    (!mediaLibraryTrust ||
+                        mediaLibraryTrust->ownershipId != settings.mediaLibraryId)) {
+                    mediaLibraryTrust.reset();
+                    mediaLibraryAvailable = false;
+                    if (!motion::notify_settings_changed()) StartController();
+                    ShowStatus(L"当前媒体库身份或所有权已变化，不能从该路径迁移。请选择连接一个已有的有效媒体库。", true);
+                    co_return;
+                }
+                if (motion::same_filesystem_path(source, target)) {
+                    ShowStatus(L"新位置与当前媒体库相同。", true);
+                    co_return;
+                }
+            } catch (...) {
+                ShowStatus(L"无法安全解析媒体库位置，迁移没有开始。", true);
+                co_return;
+            }
+        }
+        auto migrationLease = libraryAccessGate->TryBeginMigration();
+        if (!migrationLease) {
+            ShowStatus(L"仍有导入、封面、移动或删除任务正在使用媒体库，请等待完成后重试。", true);
+            co_return;
+        }
+
+        std::optional<motion::MediaLibraryTrustIdentity> sourceIdentity;
+        std::shared_ptr<motion::MediaLibraryTrustLease> sourceTrust;
+        if (!connectExistingLibrary) {
+            sourceIdentity = settings.mediaLibraryPath.empty()
+                ? motion::capture_media_library_trust(source)
+                : mediaLibraryTrust;
+            if (!settings.mediaLibraryPath.empty() && sourceIdentity &&
+                sourceIdentity->ownershipId != settings.mediaLibraryId) {
+                sourceIdentity.reset();
+            }
+            sourceTrust = sourceIdentity
+                ? motion::acquire_media_library_trust(*sourceIdentity)
+                : std::shared_ptr<motion::MediaLibraryTrustLease>{};
+            if (!sourceTrust) {
+                migrationLease.reset();
+                if (!settings.mediaLibraryPath.empty()) {
+                    mediaLibraryTrust.reset();
+                    mediaLibraryAvailable = false;
+                    if (!motion::notify_settings_changed()) StartController();
+                }
+                ShowStatus(L"当前媒体库身份或所有权已变化，迁移没有开始。", true);
+                co_return;
+            }
+        }
+
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
+        try {
+            agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
+        } catch (...) {
+            migrationLease.reset();
+            ShowStatus(L"无法建立与后台服务的迁移协调通道。", true);
+            co_return;
+        }
+        auto cancellation = std::make_shared<std::atomic_bool>();
+        activeLibraryMigrationPause = agentPause;
+        libraryMigrationCancellation = cancellation;
+        SetLibraryMigrationUi(true);
+        ShowStatus(connectExistingLibrary
+            ? L"正在安全暂停壁纸服务并验证已有媒体库…"
+            : L"正在安全暂停壁纸服务…", false);
+        if (!motion::notify_settings_changed()) StartController();
+
+        std::shared_ptr<motion::app::LibraryMigrationTransaction> transaction;
+        std::optional<motion::MediaLibraryTrustIdentity> targetTrust;
+        std::wstring failure;
+        try {
+            co_await winrt::resume_background();
+            if (!agentPause->RequestAndWait(std::chrono::seconds(20))) {
+                failure = L"后台壁纸服务未能确认暂停，迁移没有开始。请重启应用后重试。";
+            } else if (cancellation->load(std::memory_order_acquire)) {
+                failure = L"媒体库迁移已取消，原位置保持不变。";
+            } else if (connectExistingLibrary) {
+                target = fs::absolute(target).lexically_normal();
+                auto identity = motion::capture_media_library_trust(target);
+                if (identity && motion::is_owned_media_library(target) &&
+                    motion::revalidate_media_library_trust(*identity)) {
+                    targetTrust = std::move(*identity);
+                    // Safe reconnect/switch: the unavailable source is neither
+                    // traversed nor cleaned and the existing target is not
+                    // modified before it becomes the configured library.
+                } else {
+                    failure = L"原媒体库当前离线。只能连接一个已存在、带 MotionWallpaper 所有权标记且不含重解析点的媒体库；未创建或修改所选文件夹。";
+                }
+            } else {
+                if (!sourceIdentity || !sourceTrust ||
+                    !motion::revalidate_media_library_trust(*sourceIdentity)) {
+                    throw std::runtime_error("source media library identity changed before migration");
+                }
+                transaction = motion::app::LibraryMigrationTransaction::Begin(
+                    source, target, *sourceIdentity);
+                // The transaction acquired its own lease before this
+                // pre-pause lease is released, leaving no unguarded copy gap.
+                sourceTrust.reset();
+                auto lastPercent = std::make_shared<std::atomic_int>(-1);
+                transaction->CopyAndVerify([dispatcher, weak, lastPercent](uint64_t copied, uint64_t total) {
+                    int percent = total ? static_cast<int>((std::min)(
+                        static_cast<long double>(copied) * 100.0L / static_cast<long double>(total), 100.0L)) : 100;
+                    if (lastPercent->exchange(percent, std::memory_order_acq_rel) == percent) return;
+                    dispatcher.TryEnqueue([weak, percent] {
+                        if (auto self = weak.get(); self && !self->closing.load(std::memory_order_acquire)) {
+                            self->ShowStatus(L"正在复制并逐文件校验媒体库（" +
+                                std::to_wstring(percent) + L"%）…", false);
+                        }
+                    });
+                }, cancellation.get());
+                transaction->CommitPreparedTarget();
+                auto identity = motion::capture_media_library_trust(transaction->Target());
+                if (!identity || !motion::is_owned_media_library(transaction->Target()) ||
+                    !motion::revalidate_media_library_trust(*identity)) {
+                    throw std::runtime_error("committed media library identity changed");
+                }
+                targetTrust = std::move(*identity);
+            }
+        } catch (...) {
+            failure = L"迁移失败。请确认当前媒体库结构完整、目标文件夹为空，且目标磁盘空间充足可写；原媒体库未改动。";
+        }
+
+        dispatcher.TryEnqueue([weak, transaction = std::move(transaction), agentPause = std::move(agentPause),
+            migrationLease = std::move(migrationLease), cancellation = std::move(cancellation),
+            failure = std::move(failure), target = std::move(target),
+            targetTrust = std::move(targetTrust), connectExistingLibrary]() mutable {
+                auto self = weak.get();
+                if (!self || self->closing.load(std::memory_order_acquire)) {
+                    agentPause->Cancel();
+                    return;
+                }
+                if (!failure.empty() || !targetTrust || (!connectExistingLibrary && !transaction)) {
+                    agentPause->Cancel();
+                    if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
+                    migrationLease.reset();
+                    self->SetLibraryMigrationUi(false);
+                    self->ShowStatus(failure.empty() ? L"媒体库迁移失败，原位置保持不变。" : failure, true);
+                    return;
+                }
+
+                auto previousPath = self->settings.mediaLibraryPath;
+                auto previousLibraryId = self->settings.mediaLibraryId;
+                auto previousLibrary = self->mediaLibrary;
+                auto previousLibraryAvailable = self->mediaLibraryAvailable;
+                auto previousLibraryTrust = self->mediaLibraryTrust;
+                try {
+                    auto destination = connectExistingLibrary ? target : transaction->Target();
+                    auto trustLease = motion::acquire_media_library_trust(*targetTrust);
+                    if (!trustLease) throw std::runtime_error("target media library identity changed");
+                    auto newLibrary = std::make_shared<motion::app::MediaLibrary>(self->root,
+                        motion::app::DeleteMode::RecycleBin, destination, *targetTrust);
+                    self->settings.mediaLibraryPath = destination.wstring();
+                    self->settings.mediaLibraryId = targetTrust->ownershipId;
+                    self->SaveSettings();
+                    self->mediaLibrary = std::move(newLibrary);
+                    self->mediaLibraryTrust = std::move(*targetTrust);
+                    self->mediaLibraryAvailable = true;
+                    if (transaction) transaction->MarkActivated();
+                    self->LibraryPath().Text(destination.wstring());
+                    self->LibraryPathFull().Text(destination.wstring());
+                    self->ShowStatus(L"新媒体库已启用，正在等待后台服务确认切换…", false);
+                    self->FinalizeLibraryMigration(std::move(transaction), std::move(agentPause),
+                        std::move(migrationLease), std::move(cancellation));
+                } catch (...) {
+                    self->settings.mediaLibraryPath = std::move(previousPath);
+                    self->settings.mediaLibraryId = std::move(previousLibraryId);
+                    self->mediaLibrary = std::move(previousLibrary);
+                    self->mediaLibraryAvailable = previousLibraryAvailable;
+                    self->mediaLibraryTrust = std::move(previousLibraryTrust);
+                    try { self->SaveSettings(); } catch (...) {}
+                    agentPause->Cancel();
+                    if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
+                    migrationLease.reset();
+                    self->SetLibraryMigrationUi(false);
+                    self->ShowStatus(L"无法启用新媒体库；设置和原位置保持不变。", true);
+                }
+            });
+    }
+
+    winrt::fire_and_forget MainWindow::FinalizeLibraryMigration(
+        std::shared_ptr<motion::app::LibraryMigrationTransaction> transaction,
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause,
+        std::shared_ptr<motion::app::LibraryMigrationLease> migrationLease,
+        std::shared_ptr<std::atomic_bool> cancellation)
+    {
+        auto weak = get_weak();
+        auto dispatcher = DispatcherQueue();
+        co_await winrt::resume_background();
+        bool applied{};
+        fs::path backup;
+        if (!cancellation->load(std::memory_order_acquire)) {
+            applied = agentPause->ResumeAndWait(std::chrono::seconds(20));
+            if (transaction && applied && !cancellation->load(std::memory_order_acquire)) {
+                try { backup = transaction->ArchiveVerifiedSource(); }
+                catch (...) {}
+            }
+        } else {
+            agentPause->Cancel();
+        }
+
+        dispatcher.TryEnqueue([weak, transaction = std::move(transaction), agentPause = std::move(agentPause),
+            migrationLease = std::move(migrationLease), cancellation = std::move(cancellation),
+            applied, backup = std::move(backup)]() mutable {
+            if (auto self = weak.get(); self && !self->closing.load(std::memory_order_acquire)) {
+                if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
+                migrationLease.reset();
+                self->SetLibraryMigrationUi(false);
+                self->variantSelections.clear();
+                self->variantViewFingerprint.clear();
+                self->LoadGroups();
+                self->LoadMedia();
+                if (self->currentPage == AppPage::Variants) self->RefreshVariants();
+                if (!applied) {
+                    auto detail = transaction
+                        ? L"；旧媒体库已保留在原位置。请重启应用确认后再手动处理旧库：" + transaction->Source().wstring()
+                        : L"。原离线库的路径和数据均未清理";
+                    self->ShowStatus(L"新媒体库已保存，但后台服务未及时确认切换" +
+                        detail, true);
+                } else if (!transaction) {
+                    self->ShowStatus(L"已安全连接所选的现有媒体库；原离线库的数据未读取、迁移或清理。", false);
+                } else if (backup.empty()) {
+                    self->ShowStatus(L"媒体库已切换；旧媒体库未能归档，仍安全保留在：" +
+                        transaction->Source().wstring(), true);
+                } else {
+                    self->ShowStatus(L"媒体库已安全迁移。旧库已作为可恢复备份保留在：" + backup.wstring(), false);
+                }
+            }
+        });
     }
 
     void MainWindow::StartController()

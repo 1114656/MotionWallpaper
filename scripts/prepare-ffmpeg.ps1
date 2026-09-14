@@ -12,6 +12,8 @@ $headers = @{ 'User-Agent' = 'MotionWallpaper-build' }
 $expectedHash = '7b32983c242dd73d43c20836582572e9927986f8cb112aafd62aa9978f4be645'
 $downloadUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-23-13-03/' + $assetName
 $notice = Join-Path $projectRoot 'third_party\FFmpeg-NOTICE.txt'
+$openH264License = Join-Path $projectRoot 'third_party\OpenH264-LICENSE.txt'
+$expectedOpenH264LicenseHash = 'e7e7f1b027867f49b2a4731f2c317fe6572ff66fd0909d1469b0a7a328e8a293'
 
 function Copy-FfmpegPackage {
     param([string]$PackageRoot)
@@ -26,10 +28,17 @@ function Copy-FfmpegPackage {
     } | Copy-Item -Destination $Destination -Force
     Copy-Item -LiteralPath $license -Destination (Join-Path $Destination 'LICENSE-FFmpeg.txt') -Force
     Copy-Item -LiteralPath $notice -Destination $Destination -Force
+    if (-not (Test-Path -LiteralPath $openH264License -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $openH264License -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedOpenH264LicenseHash) {
+        throw 'The pinned OpenH264 license text is missing or has an unexpected SHA-256 hash.'
+    }
+    Copy-Item -LiteralPath $openH264License -Destination (Join-Path $Destination 'LICENSE-OpenH264.txt') -Force
 
     $publishedFfmpeg = Join-Path $Destination 'ffmpeg.exe'
     $encoders = (& $publishedFfmpeg -hide_banner -encoders 2>&1 | Out-String)
-    foreach ($requiredEncoder in @('hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'libkvazaar', 'libopenh264')) {
+    foreach ($requiredEncoder in @(
+        'h264_nvenc', 'h264_qsv', 'h264_amf',
+        'hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'libopenh264')) {
         if ($encoders -notmatch [Regex]::Escape($requiredEncoder)) {
             throw "The verified FFmpeg package does not provide required encoder '$requiredEncoder'."
         }
@@ -41,17 +50,6 @@ function Copy-FfmpegPackage {
 }
 
 New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
-$verifiedCacheRoot = Join-Path $cacheRoot $expectedHash
-$cachedPackage = if (Test-Path -LiteralPath $verifiedCacheRoot) {
-    Get-ChildItem -LiteralPath $verifiedCacheRoot -Directory | Where-Object {
-        Test-Path -LiteralPath (Join-Path $_.FullName 'bin\ffmpeg.exe')
-    } | Select-Object -First 1
-}
-if ($cachedPackage) {
-    Copy-FfmpegPackage $cachedPackage.FullName
-    return
-}
-
 $archive = Join-Path $cacheRoot $assetName
 $validArchive = (Test-Path -LiteralPath $archive) -and
     ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -eq $expectedHash)
@@ -66,11 +64,24 @@ if (-not $validArchive) {
     Move-Item -LiteralPath $download -Destination $archive -Force
 }
 
-$expanded = Join-Path $cacheRoot $expectedHash
-if (-not (Test-Path -LiteralPath $expanded)) {
+# A hash-shaped directory is not an integrity proof: it can be stale or edited
+# independently of the pinned zip. Re-check the archive on every invocation and
+# extract into a fresh private directory before any bundled executable is run.
+if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedHash) {
+    throw 'The cached FFmpeg archive changed after verification.'
+}
+$temporaryBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+$expanded = Join-Path $temporaryBase ('MotionWallpaper-ffmpeg-' + [guid]::NewGuid().ToString('N'))
+try {
     New-Item -ItemType Directory -Path $expanded | Out-Null
     Expand-Archive -LiteralPath $archive -DestinationPath $expanded
+    $packages = @(Get-ChildItem -LiteralPath $expanded -Directory)
+    if ($packages.Count -ne 1) { throw 'The FFmpeg archive did not contain exactly one package directory.' }
+    Copy-FfmpegPackage $packages[0].FullName
+} finally {
+    $resolvedExpanded = [IO.Path]::GetFullPath($expanded)
+    if ($resolvedExpanded.StartsWith($temporaryBase, [StringComparison]::OrdinalIgnoreCase) -and
+        (Split-Path -Leaf $resolvedExpanded).StartsWith('MotionWallpaper-ffmpeg-', [StringComparison]::Ordinal)) {
+        Remove-Item -LiteralPath $resolvedExpanded -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
-$package = Get-ChildItem -LiteralPath $expanded -Directory | Select-Object -First 1
-if (-not $package) { throw 'The FFmpeg archive did not contain a package directory.' }
-Copy-FfmpegPackage $package.FullName

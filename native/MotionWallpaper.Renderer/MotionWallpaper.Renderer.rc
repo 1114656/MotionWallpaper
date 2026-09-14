@@ -1,0 +1,4 @@
+#define MOTION_FILE_DESCRIPTION "MotionWallpaper media renderer"
+#define MOTION_INTERNAL_NAME "motionwallpaper-renderer"
+#define MOTION_ORIGINAL_FILENAME "motionwallpaper-renderer.exe"
+#include "..\\MotionWallpaper.Version.rcinc"

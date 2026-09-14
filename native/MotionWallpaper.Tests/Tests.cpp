@@ -17,9 +17,15 @@
 #include "../MotionWallpaper.Renderer/DesktopHostPolicy.h"
 #include "../MotionWallpaper.Renderer/TransitionPolicy.h"
 #include "../MotionWallpaper.Protocol/RendererProtocol.h"
+#include "../MotionWallpaper.App/LibraryMigration.h"
 #include "../MotionWallpaper.App/MediaLibrary.h"
 
 #include <winrt/base.h>
+
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -41,6 +47,18 @@ namespace
         if (!condition) throw std::runtime_error(message);
     }
 
+    constexpr char testLibraryId[] = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    constexpr char replacementLibraryId[] = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+
+    void create_owned_library_root(fs::path const& root,
+        char const* ownershipId = testLibraryId)
+    {
+        fs::create_directories(root / L"Groups");
+        std::ofstream(root / motion::media_library_ownership_marker_name, std::ios::binary)
+            << motion::media_library_ownership_marker_prefix
+            << ownershipId << '\n';
+    }
+
     void settings_round_trip_clears_empty_values(fs::path const& root)
     {
         auto path = root / L"settings.json";
@@ -55,6 +73,9 @@ namespace
         settings.displayOffAfterLockEnabled = true;
         settings.displayOffAfterLockDelaySeconds = 30;
         settings.performanceMode = "power-saver";
+        settings.mediaLibraryPath = (root / L"custom-wallpapers").wstring();
+        create_owned_library_root(settings.mediaLibraryPath);
+        settings.mediaLibraryId = testLibraryId;
         settings.displayMode = "primary";
         settings.displayAssignments.push_back({ "MONITOR\\TEST\\1", settings.selectedGroupId, settings.selectedMediaId });
         motion::save_settings(path, settings);
@@ -73,6 +94,10 @@ namespace
         require(populated->displayOffAfterLockEnabled && populated->displayOffAfterLockDelaySeconds == 30,
             "post-lock display-off settings did not round-trip");
         require(populated->performanceMode == "power-saver", "wallpaper performance mode did not round-trip");
+        require(populated->mediaLibraryPath == fs::path(settings.mediaLibraryPath).lexically_normal().wstring(),
+            "custom media-library path did not round-trip");
+        require(populated->mediaLibraryId == settings.mediaLibraryId,
+            "custom media-library ownership ID did not round-trip");
         require(populated->displayMode == "primary", "display mode did not round-trip");
         require(populated->displayAssignments.size() == 1 && populated->displayAssignments.front().displayId == "MONITOR\\TEST\\1",
             "per-display wallpaper assignment did not round-trip");
@@ -101,11 +126,55 @@ namespace
             "installed FFmpeg path was detached from the application directory");
         require(motion::select_application_data_directory(applicationRoot, localRoot) == localRoot / L"MotionWallpaper",
             "fresh installed app did not use LocalAppData");
+        require(motion::wallpaper_library_directory(applicationRoot) == applicationRoot / L"Wallpapers",
+            "default media library was detached from the installed App directory");
+        auto customLibrary = root / L"relocated" / L"Wallpapers";
+        require(motion::wallpaper_library_directory(applicationRoot, customLibrary.wstring()) == customLibrary,
+            "custom media-library location was ignored");
+        bool relativeRejected{};
+        try { (void)motion::wallpaper_library_directory(applicationRoot, L"relative\\Wallpapers"); }
+        catch (...) { relativeRejected = true; }
+        require(relativeRejected,
+            "an invalid configured media-library path silently fell back to a writable default");
+        auto identityPath = fs::absolute(root / L"Case-Identity" / L"Folder");
+        auto identityAlias = identityPath.parent_path() / L"." / L"folder";
+        require(motion::same_filesystem_path(identityPath, identityAlias) &&
+            motion::filesystem_path_is_nested(identityPath.parent_path(), identityAlias),
+            "Windows path identity was case-sensitive or failed to normalize aliases");
 
         std::ofstream(applicationRoot / L"portable.mode") << "portable\n";
         require(motion::select_application_data_directory(applicationRoot, localRoot) == applicationRoot,
             "portable marker did not keep data beside the executable");
+
+        auto legacyRoot = localRoot / L"MotionWallpaper";
+        fs::create_directories(legacyRoot);
+        std::ofstream(applicationRoot / motion::legacy_data_fallback_marker_name)
+            << "MotionWallpaper.LegacyFallback/v1\n";
+        fs::create_directories(applicationRoot / L"Config");
+        fs::create_directories(applicationRoot / L"Wallpapers");
+        require(motion::select_application_data_directory(applicationRoot, localRoot) == legacyRoot,
+            "an installer fallback marker did not override partial portable data");
+        fs::remove(applicationRoot / motion::legacy_data_fallback_marker_name);
+        fs::remove_all(applicationRoot / L"Config");
+        fs::remove_all(applicationRoot / L"Wallpapers");
+        fs::remove_all(legacyRoot);
+
+        std::ofstream(applicationRoot / motion::legacy_data_fallback_marker_name)
+            << "MotionWallpaper.LegacyFallback/v1\n";
+        require(motion::select_application_data_directory(applicationRoot, localRoot) == applicationRoot,
+            "a fallback marker selected a missing LocalAppData legacy root");
+        fs::remove(applicationRoot / motion::legacy_data_fallback_marker_name);
         fs::remove(applicationRoot / L"portable.mode");
+
+        std::ofstream(applicationRoot / motion::legacy_data_conflict_marker_name)
+            << "MotionWallpaper.LegacyConflict/v1\n";
+        require(motion::legacy_data_conflict_present(applicationRoot),
+            "an installer data-conflict marker was not recognized");
+        fs::remove(applicationRoot / motion::legacy_data_conflict_marker_name);
+        fs::create_directories(applicationRoot / motion::legacy_data_conflict_marker_name);
+        require(!motion::legacy_data_conflict_present(applicationRoot),
+            "a directory was accepted as the installer data-conflict marker");
+        fs::remove(applicationRoot / motion::legacy_data_conflict_marker_name);
 
         fs::create_directories(applicationRoot / L"Config");
         require(motion::select_application_data_directory(applicationRoot, localRoot) == applicationRoot,
@@ -219,6 +288,361 @@ namespace
         auto path = root / L"future-settings.json";
         std::ofstream(path) << R"({"version":999,"desktopPlayback":false})";
         require(!motion::load_settings(path).has_value(), "unsupported future settings schema was accepted");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream storeFile(sourceRoot / L"MotionWallpaper.App" / L"SettingsStore.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(storeFile), "SettingsStore source file was not found");
+        std::string store((std::istreambuf_iterator<char>(storeFile)), {});
+        require(store.find("SettingsFileStatus::invalid") != std::string::npos &&
+            store.find("load_settings(path_).value_or") == std::string::npos,
+            "SettingsStore can still overwrite a future schema with defaults");
+        std::ifstream windowFile(sourceRoot / L"MotionWallpaper.App" / L"MainWindow.xaml.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(windowFile), "MainWindow source file was not found");
+        std::string window((std::istreambuf_iterator<char>(windowFile)), {});
+        require(window.find("settingsWritable = false") != std::string::npos &&
+            window.find("if (!settingsWritable)") != std::string::npos,
+            "the App can still save defaults after rejecting an existing settings file");
+    }
+
+    void custom_library_settings_require_owned_safe_roots(fs::path const& root)
+    {
+        auto path = root / L"owned-library-settings.json";
+        motion::Settings settings;
+        auto unowned = fs::absolute(root / L"unowned-custom-library");
+        fs::create_directories(unowned / L"Groups");
+        settings.mediaLibraryPath = unowned.wstring();
+        settings.mediaLibraryId = testLibraryId;
+        motion::save_settings(path, settings);
+        require(!motion::load_settings(path),
+            "an unmarked custom media library was accepted");
+        motion::Settings unavailable;
+        require(motion::load_settings_file(path, unavailable) ==
+            motion::SettingsFileStatus::libraryUnavailable &&
+            unavailable.mediaLibraryPath == unowned.lexically_normal().wstring() &&
+            unavailable.mediaLibraryId == testLibraryId,
+            "an unavailable custom library path/ID was not preserved for UI recovery");
+
+        create_owned_library_root(unowned);
+        require(motion::is_owned_media_library(unowned) && motion::load_settings(path),
+            "a valid owned custom media library was rejected");
+        auto ownershipId = motion::media_library_ownership_id(unowned);
+        require(ownershipId && *ownershipId == testLibraryId,
+            "the shared media-library ownership marker format was not recognized");
+
+        auto version9Path = root / L"version-9-external-library.json";
+        motion::save_settings(version9Path, settings);
+        {
+            std::ifstream input(version9Path, std::ios::binary);
+            std::string json((std::istreambuf_iterator<char>(input)), {});
+            auto version = json.find("\"version\":10");
+            require(version != std::string::npos,
+                "current settings did not serialize the expected schema version");
+            json.replace(version, std::string("\"version\":10").size(), "\"version\":9");
+            std::ofstream(version9Path, std::ios::binary | std::ios::trunc) << json;
+        }
+        motion::Settings version9;
+        require(motion::load_settings_file(version9Path, version9) ==
+            motion::SettingsFileStatus::libraryUnavailable &&
+            version9.mediaLibraryPath == unowned.lexically_normal().wstring() &&
+            version9.mediaLibraryId.empty(),
+            "a v9 external path was silently promoted to a trusted v10 library");
+
+        std::ofstream(unowned / L"user-file.txt") << "not library data";
+        require(!motion::is_owned_media_library(unowned) && !motion::load_settings(path),
+            "a broad custom directory with unrelated root data was accepted");
+        fs::remove(unowned / L"user-file.txt");
+
+        auto reparseTarget = fs::absolute(root / L"reparse-target");
+        auto reparseChild = unowned / L"Groups" / L"linked-library-data";
+        fs::create_directories(reparseTarget);
+        if (CreateSymbolicLinkW(reparseChild.c_str(), reparseTarget.c_str(),
+            SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+            require(!motion::is_owned_media_library(unowned) && !motion::load_settings(path),
+                "a custom media library containing a reparse point was accepted");
+            std::error_code removeError;
+            fs::remove(reparseChild, removeError);
+        }
+
+        auto deceptiveRoot = fs::absolute(root).root_path() / L"MotionWallpaper-path-check" / L"..";
+        settings.mediaLibraryPath = deceptiveRoot.wstring();
+        motion::save_settings(path, settings);
+        require(!motion::load_settings(path),
+            "a path that normalizes to a drive root was accepted");
+        motion::Settings rejected;
+        require(motion::load_settings_file(path, rejected) == motion::SettingsFileStatus::invalid,
+            "a normalized drive-root path was treated as a recoverable media library");
+        bool resolverRejected{};
+        try { (void)motion::wallpaper_library_directory(root, settings.mediaLibraryPath); }
+        catch (...) { resolverRejected = true; }
+        require(resolverRejected, "the media-library resolver accepted a normalized drive root");
+
+        auto defaultDataRoot = fs::absolute(root / L"unsafe-default-data");
+        auto defaultTarget = fs::absolute(root / L"unsafe-default-target");
+        fs::create_directories(defaultDataRoot);
+        fs::create_directories(defaultTarget);
+        auto defaultLink = defaultDataRoot / L"Wallpapers";
+        if (CreateSymbolicLinkW(defaultLink.c_str(), defaultTarget.c_str(),
+            SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+            bool unsafeDefaultRejected{};
+            try { (void)motion::wallpaper_library_directory(defaultDataRoot); }
+            catch (...) { unsafeDefaultRejected = true; }
+            require(unsafeDefaultRejected,
+                "an existing reparse-point default library was accepted for scanning");
+            std::error_code removeError;
+            fs::remove(defaultLink, removeError);
+        }
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream windowFile(sourceRoot / L"MotionWallpaper.App" / L"MainWindow.xaml.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(windowFile), "MainWindow source file was not found");
+        std::string window((std::istreambuf_iterator<char>(windowFile)), {});
+        require(window.find("Load(&mediaLibraryAvailable)") != std::string::npos &&
+            window.find("settingsWritable && mediaLibraryAvailable") != std::string::npos &&
+            window.find("select_folder(window") < window.find("MoveLibrary(std::move(target))") &&
+            window.find("is_owned_media_library(target)") != std::string::npos &&
+            window.find("legacy_data_conflict_present(applicationRoot)") != std::string::npos,
+            "an unavailable external library can still crash startup, be rebuilt, or block location selection");
+    }
+
+    void persisted_library_identity_rejects_same_path_replacement(fs::path const& root)
+    {
+        auto library = fs::absolute(root / L"persistent-library-identity");
+        auto parked = fs::absolute(root / L"persistent-library-identity.original");
+        auto settingsPath = root / L"persistent-library-settings.json";
+        create_owned_library_root(library, testLibraryId);
+
+        motion::Settings settings;
+        settings.mediaLibraryPath = library.wstring();
+        settings.mediaLibraryId = testLibraryId;
+        motion::save_settings(settingsPath, settings);
+
+        motion::Settings loaded;
+        require(motion::load_settings_file(settingsPath, loaded) ==
+            motion::SettingsFileStatus::valid &&
+            loaded.mediaLibraryPath == library.lexically_normal().wstring() &&
+            loaded.mediaLibraryId == testLibraryId,
+            "the persisted path/ownership-ID pair did not load");
+
+        fs::rename(library, parked);
+        create_owned_library_root(library, replacementLibraryId);
+        motion::Settings unavailable;
+        require(motion::is_owned_media_library(library) &&
+            motion::load_settings_file(settingsPath, unavailable) ==
+                motion::SettingsFileStatus::libraryUnavailable &&
+            unavailable.mediaLibraryPath == library.lexically_normal().wstring() &&
+            unavailable.mediaLibraryId == testLibraryId &&
+            !motion::load_settings(settingsPath),
+            "a different valid MotionWallpaper library at the same path inherited trust");
+
+        fs::remove_all(library);
+        fs::rename(parked, library);
+        motion::Settings restored;
+        require(motion::load_settings_file(settingsPath, restored) ==
+            motion::SettingsFileStatus::valid &&
+            restored.mediaLibraryId == testLibraryId,
+            "the original library identity did not reconnect after its disk returned");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream windowFile(sourceRoot / L"MotionWallpaper.App" / L"MainWindow.xaml.cpp",
+            std::ios::binary);
+        std::ifstream agentFile(sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp",
+            std::ios::binary);
+        require(windowFile && agentFile, "App or Agent identity integration source was not found");
+        std::string window((std::istreambuf_iterator<char>(windowFile)), {});
+        std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        require(window.find("identity->ownershipId != settings.mediaLibraryId") != std::string::npos &&
+            window.find("self->settings.mediaLibraryId = targetTrust->ownershipId") != std::string::npos &&
+            agent.find("identity->ownershipId != settings.mediaLibraryId") != std::string::npos,
+            "App initialization, library switching, or Agent startup lost the persisted ownership-ID check");
+    }
+
+    void media_library_trust_detects_runtime_replacement(fs::path const& root)
+    {
+        auto library = fs::absolute(root / L"runtime-trust-library");
+        auto settingsPath = root / L"runtime-trust-settings.json";
+        create_owned_library_root(library);
+        motion::Settings settings;
+        settings.mediaLibraryPath = library.wstring();
+        settings.mediaLibraryId = testLibraryId;
+        motion::save_settings(settingsPath, settings);
+        auto unchangedSettingsTime = fs::last_write_time(settingsPath);
+
+        auto original = motion::capture_media_library_trust(library);
+        require(original && motion::revalidate_media_library_trust(*original),
+            "a valid owned library could not acquire a runtime trust identity");
+        auto stableGroups = original
+            ? motion::media_library_stable_path(*original, library / L"Groups")
+            : std::optional<fs::path>{};
+        require(original && !original->stableRoot.empty() &&
+            original->stableRoot.wstring().starts_with(L"\\\\?\\Volume{") &&
+            motion::revalidate_media_library_stable_root(*original) &&
+            stableGroups && *stableGroups == original->stableRoot / L"Groups" &&
+            !motion::media_library_stable_path(*original, root / L"outside") &&
+            motion::same_direct_filesystem_object(library, original->stableRoot),
+            "volume-GUID capture or the alias-to-stable mapping is not fail-closed");
+        {
+            auto lease = motion::acquire_media_library_trust(*original);
+            require(static_cast<bool>(lease), "a valid runtime trust lease was rejected");
+            std::error_code removeError;
+            bool removed = fs::remove(library / motion::media_library_ownership_marker_name, removeError);
+            require(!removed && fs::is_regular_file(
+                library / motion::media_library_ownership_marker_name),
+                "a live trust lease did not pin the ownership marker");
+        }
+
+        fs::remove(library / motion::media_library_ownership_marker_name);
+        require(!motion::revalidate_media_library_trust(*original),
+            "removing the ownership marker did not revoke runtime trust");
+        std::ofstream(library / motion::media_library_ownership_marker_name, std::ios::binary)
+            << motion::media_library_ownership_marker_prefix
+            << testLibraryId << '\n';
+        require(!motion::revalidate_media_library_trust(*original),
+            "recreating identical marker text bypassed marker FileId validation");
+
+        auto markerReplacement = motion::capture_media_library_trust(library);
+        require(static_cast<bool>(markerReplacement),
+            "the repaired owned library could not be recaptured");
+        auto originalGroups = library / L"Groups.original";
+        fs::rename(library / L"Groups", originalGroups);
+        fs::create_directory(library / L"Groups");
+        require(!motion::revalidate_media_library_trust(*markerReplacement),
+            "replacing Groups without changing settings bypassed directory FileId validation");
+        fs::remove(library / L"Groups");
+        fs::rename(originalGroups, library / L"Groups");
+
+        auto reparseIdentity = motion::capture_media_library_trust(library);
+        require(static_cast<bool>(reparseIdentity),
+            "the restored Groups identity could not be captured");
+        auto reparseTarget = fs::absolute(root / L"runtime-trust-reparse-target");
+        fs::create_directories(reparseTarget);
+        fs::rename(library / L"Groups", originalGroups);
+        auto groupsLink = library / L"Groups";
+        if (CreateSymbolicLinkW(groupsLink.c_str(), reparseTarget.c_str(),
+            SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+            require(!motion::revalidate_media_library_trust(*reparseIdentity),
+                "a runtime Groups reparse replacement retained trust");
+            std::error_code linkError;
+            fs::remove(groupsLink, linkError);
+        }
+        if (!fs::exists(groupsLink)) fs::rename(originalGroups, groupsLink);
+
+        auto rootIdentity = motion::capture_media_library_trust(library);
+        require(static_cast<bool>(rootIdentity),
+            "the restored root identity could not be captured");
+        auto originalRoot = fs::absolute(root / L"runtime-trust-library.original");
+        fs::rename(library, originalRoot);
+        create_owned_library_root(library);
+        auto replacementSentinel = library / L"Groups" / L"replacement-sentinel.txt";
+        std::ofstream(replacementSentinel, std::ios::binary) << "do not touch";
+        require(!motion::revalidate_media_library_trust(*rootIdentity),
+            "replacing the library root at the same path bypassed volume/FileId validation");
+        bool libraryRejectedReplacement{};
+        try {
+            motion::app::MediaLibrary guarded(root / L"runtime-trust-data",
+                motion::app::DeleteMode::Permanent, library, *rootIdentity);
+        } catch (...) {
+            libraryRejectedReplacement = true;
+        }
+        require(libraryRejectedReplacement && fs::is_regular_file(replacementSentinel),
+            "MediaLibrary accepted or modified a replacement behind the configured alias");
+        require(fs::last_write_time(settingsPath) == unchangedSettingsTime,
+            "the runtime replacement regression accidentally relied on a settings timestamp change");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream windowFile(sourceRoot / L"MotionWallpaper.App" / L"MainWindow.xaml.cpp",
+            std::ios::binary);
+        std::ifstream agentFile(sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp",
+            std::ios::binary);
+        std::ifstream optimizerFile(sourceRoot / L"MotionWallpaper.Agent" / L"VideoOptimizer.cpp",
+            std::ios::binary);
+        require(windowFile && agentFile && optimizerFile,
+            "runtime trust integration source files were not found");
+        std::string window((std::istreambuf_iterator<char>(windowFile)), {});
+        std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        std::string optimizer((std::istreambuf_iterator<char>(optimizerFile)), {});
+        auto agentGuard = agent.find("loopLibraryTrust");
+        auto agentMediaScan = agent.find("imported_optimization_requests(wallpapers)", agentGuard);
+        require(window.find("RetainMediaLibraryTrust") != std::string::npos &&
+            window.find("acquire_media_library_trust(*mediaLibraryTrust)") != std::string::npos &&
+            agentGuard != std::string::npos && agentMediaScan != std::string::npos &&
+            agentGuard < agentMediaScan &&
+            agent.find("videoOptimizer.reset();", agentGuard) != std::string::npos &&
+            optimizer.find("VideoTranscodePathAccess pathAccess") != std::string::npos &&
+            optimizer.find("trustLost || !LibraryTrusted()") != std::string::npos,
+            "App, Agent, or optimizer can continue path I/O after runtime trust loss");
+    }
+
+    void agent_settings_fail_closed_until_recovery(fs::path const& root)
+    {
+        auto path = root / L"agent-settings-state.json";
+        motion::Settings loaded;
+        require(motion::load_settings_file(path, loaded) == motion::SettingsFileStatus::missing,
+            "a genuinely missing first-run settings file was not distinguished");
+
+        std::ofstream(path) << R"({"version":999,"desktopPlayback":true})";
+        loaded.idleTimeoutSeconds = 321;
+        require(motion::load_settings_file(path, loaded) == motion::SettingsFileStatus::invalid &&
+            loaded.idleTimeoutSeconds == 321,
+            "future settings were accepted or destroyed the last parsed destination");
+
+        motion::Settings valid;
+        valid.idleTimeoutSeconds = 444;
+        motion::save_settings(path, valid);
+        require(motion::load_settings_file(path, loaded) == motion::SettingsFileStatus::valid &&
+            loaded.idleTimeoutSeconds == 444,
+            "the settings state did not recover after a valid document was restored");
+        std::ofstream(path, std::ios::trunc) << "{broken";
+        require(motion::load_settings_file(path, loaded) == motion::SettingsFileStatus::invalid,
+            "a settings file that became corrupt remained enabled");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream agentFile(sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp", std::ios::binary);
+        require(static_cast<bool>(agentFile), "Agent source file was not found");
+        std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        auto failClosed = agent.find("if (!configurationAvailable || !videoOptimizer)");
+        auto scan = agent.find("imported_optimization_requests(wallpapers)", failClosed);
+        auto conflictGuard = agent.find("legacy_data_conflict_present(applicationRoot)");
+        auto initialLoad = agent.find("load_settings_file(configPath");
+        require(initialLoad != std::string::npos && conflictGuard != std::string::npos &&
+            conflictGuard < initialLoad &&
+            failClosed != std::string::npos && scan != std::string::npos && failClosed < scan &&
+            agent.find("same_filesystem_path(configuredWallpapers, wallpapers)") != std::string::npos &&
+            agent.find("videoOptimizer.reset();", agent.find("same_filesystem_path(configuredWallpapers, wallpapers)")) != std::string::npos &&
+            agent.find("继续使用上一份有效配置") == std::string::npos,
+            "the Agent can still scan or optimize a library after settings validation fails");
+    }
+
+    void migration_owner_channel_recovers_only_orphaned_requests()
+    {
+        auto suffix = motion::utf8_to_wide(motion::new_id());
+        auto mutexName = L"Local\\MotionWallpaper.Tests.MigrationOwner.Mutex." + suffix;
+        auto mappingName = L"Local\\MotionWallpaper.Tests.MigrationOwner.Mapping." + suffix;
+        motion::LibraryMigrationOwnerChannel owner(mutexName.c_str(), mappingName.c_str());
+        motion::LibraryMigrationOwnerChannel observer(mutexName.c_str(), mappingName.c_str());
+        motion::unique_handle requested(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        motion::unique_handle quiesced(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        motion::unique_handle applied(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        require(owner && observer && requested && quiesced && applied,
+            "migration owner test channels could not be created");
+        require(owner.TryClaimAndReset(requested.get(), quiesced.get(), applied.get()) &&
+            SetEvent(requested.get()) && SetEvent(quiesced.get()),
+            "a live migration requester could not claim the protocol");
+        require(!observer.TryClaimAndReset(requested.get(), quiesced.get(), applied.get()) &&
+            !observer.ClearOrphanedRequest(requested.get(), quiesced.get(), applied.get()) &&
+            WaitForSingleObject(requested.get(), 0) == WAIT_OBJECT_0 &&
+            WaitForSingleObject(quiesced.get(), 0) == WAIT_OBJECT_0,
+            "a second process channel cleared or stole a live migration request");
+
+        // Releasing the exact PID/creation-time/token claim without resetting
+        // Requested models the observable state left by a terminated App.
+        owner.ReleaseClaim();
+        require(observer.ClearOrphanedRequest(requested.get(), quiesced.get(), applied.get()) &&
+            WaitForSingleObject(requested.get(), 0) == WAIT_TIMEOUT &&
+            WaitForSingleObject(quiesced.get(), 0) == WAIT_TIMEOUT,
+            "an orphaned migration request could leave the Agent quiesced forever");
     }
 
     void media_activity_suspends_idle_time()
@@ -310,6 +734,10 @@ namespace
             "stable playback still wakes the Agent policy loop at high frequency");
         require(motion::agent::runtime_wait_interval_ms(true, true) == 50,
             "short media-library transactions lost their responsive hold interval");
+        require(motion::agent::performance_copy_wait_interval_ms(false) == 50,
+            "a pending freeze ACK no longer receives a responsive retry");
+        require(motion::agent::performance_copy_wait_interval_ms(true) == 500,
+            "a long performance-copy task still polls at twenty hertz");
     }
 
     void battery_power_pauses_optional_variant_generation()
@@ -324,15 +752,759 @@ namespace
             "non-priority transcoding competes with active playback");
     }
 
+    void active_playback_waits_for_selected_performance_copy()
+    {
+        using motion::agent::active_playback_waits_for_performance_copy;
+        require(active_playback_waits_for_performance_copy("balanced", true, true),
+            "balanced source fallback played while its performance copy was pending");
+        require(active_playback_waits_for_performance_copy("power-saver", true, true),
+            "power-saver source fallback played while its performance copy was pending");
+        require(!active_playback_waits_for_performance_copy("balanced", true, false),
+            "a completed balanced copy was blocked from active playback");
+        require(!active_playback_waits_for_performance_copy("original", true, true),
+            "original-quality playback was coupled to a derived copy");
+        require(!active_playback_waits_for_performance_copy("balanced", false, true),
+            "a failed, paused, battery-blocked, or otherwise ineligible copy froze active playback");
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream optimizerFile(sourceRoot / L"MotionWallpaper.Agent" / L"VideoOptimizer.cpp",
+            std::ios::binary);
+        std::ifstream agentFile(sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(optimizerFile) && static_cast<bool>(agentFile),
+            "performance-copy pending sources were not found");
+        std::string optimizer((std::istreambuf_iterator<char>(optimizerFile)), {});
+        std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        require(optimizer.find("performanceCopyPending = selectedPerformanceMode && eligible") !=
+                std::string::npos &&
+            optimizer.find("generationAllowed_ && !battery") != std::string::npos &&
+            agent.find("resolved.performanceCopyPending") != std::string::npos,
+            "Resolve and Agent no longer propagate real-time copy eligibility into freeze policy");
+        require(!motion::agent::runtime_selection_can_publish(true, true) &&
+            motion::agent::runtime_selection_can_publish(true, false) &&
+            !motion::agent::runtime_selection_can_publish(false, false),
+            "a frozen old route can publish new runtime media IDs before replacement first-frame ACK");
+    }
+
+    void variant_progress_round_trips_and_resets(fs::path const& root)
+    {
+        auto mediaDirectory = root / L"variant-progress";
+        fs::create_directories(mediaDirectory);
+
+        require(motion::request_variant_generation(mediaDirectory, "balanced"),
+            "a durable variant request could not be created");
+        auto balancedRequest = motion::read_variant_generation_request(mediaDirectory);
+        require(balancedRequest.mode == "balanced" && !balancedRequest.requestId.empty(),
+            "a new variant request was persisted without an ABA-safe identity");
+        auto queued = motion::inspect_variant_cache(mediaDirectory);
+        require(queued.queued && !queued.progressKnown && !queued.generating,
+            "a newly queued variant exposed fabricated progress");
+
+        require(motion::write_variant_progress_if_current(mediaDirectory, balancedRequest,
+            motion::VariantProgressState::generating, 42, true),
+            "determinate variant progress could not be persisted");
+        auto generating = motion::inspect_variant_cache(mediaDirectory);
+        require(generating.generating && generating.progressKnown &&
+            generating.progressPercent == 42,
+            "variant progress did not round-trip through the cache status");
+
+        require(motion::pause_variant_generation(mediaDirectory),
+            "an active variant request could not be paused");
+        auto paused = motion::inspect_variant_cache(mediaDirectory);
+        require(paused.paused && paused.progressKnown && paused.progressPercent == 42,
+            "pausing a variant discarded its last honest percentage");
+
+        require(motion::resume_variant_generation(mediaDirectory),
+            "a paused variant request could not be resumed");
+        auto resumed = motion::inspect_variant_cache(mediaDirectory);
+        require(resumed.queued && !resumed.paused && !resumed.progressKnown,
+            "a restarted FFmpeg attempt retained stale percentage data");
+
+        require(motion::write_variant_progress_if_current(mediaDirectory, balancedRequest,
+            motion::VariantProgressState::waitingForPower),
+            "the battery-waiting state could not be persisted");
+        require(motion::inspect_variant_cache(mediaDirectory).waitingForPower,
+            "the battery-waiting state was not surfaced to the UI model");
+
+        require(motion::complete_variant_generation(mediaDirectory, balancedRequest),
+            "the matching tokenized request could not be completed");
+        auto completed = motion::inspect_variant_cache(mediaDirectory);
+        require(!completed.queued && !fs::exists(motion::variant_progress_path(mediaDirectory)),
+            "completing a variant left stale task progress behind");
+
+        require(motion::request_variant_generation(mediaDirectory, "power-saver"),
+            "a second variant request could not be created");
+        require(motion::cancel_variant_generation(mediaDirectory),
+            "a variant request could not be cancelled");
+        auto cancelled = motion::inspect_variant_cache(mediaDirectory);
+        require(!cancelled.queued && cancelled.cancelled &&
+            !fs::exists(motion::variant_progress_path(mediaDirectory)),
+            "cancelling a variant left a live request or stale progress behind");
+    }
+
+    void variant_retention_honors_runtime_leases(fs::path const& root)
+    {
+        auto mediaDirectory = root / L"variant-retention-leases";
+        auto variants = mediaDirectory / L"Variants";
+        fs::create_directories(variants);
+        auto keep = variants / L"balanced-60-1920x1080-v5.mp4";
+        auto leased = variants / L"balanced-30-1280x720-v5.mp4";
+        std::ofstream(keep, std::ios::binary) << "keep";
+        std::ofstream(leased, std::ios::binary) << "leased";
+
+        bool removalWasRechecked{};
+        auto retained = motion::retain_variant_profile(mediaDirectory, "balanced",
+            keep.filename().wstring(), [&](fs::path const& candidate) {
+                removalWasRechecked = candidate == leased;
+                return false;
+            });
+        require(removalWasRechecked && !retained && fs::is_regular_file(leased),
+            "profile retention bypassed the runtime lease deletion guard");
+
+        retained = motion::retain_variant_profile(mediaDirectory, "balanced",
+            keep.filename().wstring(), [](fs::path const& candidate) {
+                std::error_code error;
+                return fs::remove(candidate, error) && !error;
+            });
+        require(retained && !fs::exists(leased) && fs::is_regular_file(keep),
+            "profile retention could not finish after the retired lease was released");
+    }
+
+    void runtime_variant_cleanup_is_lease_safe_and_atomic()
+    {
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream optimizerFile(
+            sourceRoot / L"MotionWallpaper.Agent" / L"VideoOptimizer.cpp", std::ios::binary);
+        require(static_cast<bool>(optimizerFile), "VideoOptimizer source file was not found");
+        std::string optimizer((std::istreambuf_iterator<char>(optimizerFile)), {});
+
+        auto prepare = optimizer.find("void Prepare(fs::path const& source");
+        auto prepareEnd = optimizer.find("void InvalidateChoices()", prepare);
+        auto durableCheck = optimizer.find("if (!durableRequestIsCurrent()) return;", prepare);
+        auto sourceProbe = optimizer.find("source_rate(*stableSource)", prepare);
+        auto clearFailure = optimizer.find("failed_.erase(key)", prepare);
+        require(prepare != std::string::npos && prepareEnd != std::string::npos &&
+            durableCheck != std::string::npos && sourceProbe != std::string::npos &&
+            clearFailure != std::string::npos &&
+            durableCheck < sourceProbe && durableCheck < clearFailure && clearFailure < prepareEnd,
+            "Prepare can act on a cached request after its durable marker disappeared");
+
+        auto adopter = optimizer.find("bool TryAdoptVariant(");
+        auto adopterEnd = optimizer.find("void Run(std::stop_token", adopter);
+        auto adopterLock = optimizer.find("std::lock_guard lock(mutex_)", adopter);
+        auto adopterValidation = optimizer.find(
+            "current_variant(*stableSource, destinationAccess->path)", adopter);
+        require(adopter != std::string::npos && adopterEnd != std::string::npos &&
+            adopterLock != std::string::npos && adopterValidation != std::string::npos &&
+            adopterLock < adopterValidation && adopterValidation < adopterEnd,
+            "variant validation and lease publication are not serialized");
+        require(optimizer.find("RemoveVariantIfUnleased(*configured, &protectedFiles)") != std::string::npos &&
+            optimizer.find("RemoveVariantIfUnleased(*configured);", adopter) < adopterEnd,
+            "cache pruning or profile retention bypasses the per-candidate lease recheck");
+        require(optimizer.find("PlaybackVariantIsLeasedLocked(path)") != std::string::npos &&
+            optimizer.find("RetainPlaybackVariantLocked(destination,") != std::string::npos,
+            "a live Renderer token does not independently protect its exact variant from pruning");
+        require(optimizer.find("std::shared_ptr<motion::MediaLibraryTrustLease> libraryTrust") !=
+                std::string::npos &&
+            optimizer.find("RetainPlaybackVariantLocked(destination, libraryTrust)") !=
+                std::string::npos &&
+            optimizer.find("RetainLibraryPlaybackLease(trust, acquirePlaybackLease)") !=
+                std::string::npos &&
+            optimizer.find("RetainLibraryPlaybackLease(trust, true)") != std::string::npos,
+            "Renderer playback tokens do not retain external-library identity handles for source and variant paths");
+        auto playbackSweep = optimizer.find("void RemoveExpiredPlaybackLeasesLocked()");
+        require(playbackSweep != std::string::npos &&
+            optimizer.find("lease->second.expired()", playbackSweep) != std::string::npos &&
+            optimizer.find("RemoveExpiredPlaybackLeasesLocked();",
+                optimizer.find("RetainPlaybackVariantLocked")) != std::string::npos,
+            "expired playback registrations can grow without bound across historical media paths");
+        require(optimizer.find("choices_") == std::string::npos &&
+            optimizer.find("leasedVariants_") == std::string::npos,
+            "historical random-playback choices can permanently pin the variant cache");
+        auto remover = optimizer.find("bool RemoveVariantIfUnleased(");
+        auto finalAlternatePin = optimizer.find(
+            "PinAlternatePlayableFileForRemoval(access->path)", remover);
+        auto candidateRemoval = optimizer.find("fs::remove(access->path, error)", finalAlternatePin);
+        require(remover != std::string::npos && finalAlternatePin != std::string::npos &&
+            candidateRemoval != std::string::npos && finalAlternatePin < candidateRemoval,
+            "variant pruning can delete without pinning a final alternate playable file");
+
+        auto prune = optimizer.find("void prune_variant_cache(");
+        auto pruneEnd = optimizer.find("std::wstring variant_prefix", prune);
+        auto identityProbe = optimizer.find(
+            "GetFileInformationByHandleEx(file.get(), FileIdInfo", prune);
+        // physical_variant_identity is declared immediately before prune, so
+        // search that helper independently while keeping the accounting checks
+        // bounded to prune's body.
+        if (identityProbe == std::string::npos || identityProbe >= pruneEnd) {
+            identityProbe = optimizer.find("GetFileInformationByHandleEx(file.get(), FileIdInfo");
+        }
+        auto volumeIdentity = optimizer.find("identity.VolumeSerialNumber", identityProbe);
+        auto fileIdentity = optimizer.find("identity.FileId.Identifier", identityProbe);
+        auto aggregate = optimizer.find("allocationByIdentity.try_emplace(", prune);
+        auto lastLink = optimizer.find("--allocation.remainingCacheLinks == 0", aggregate);
+        auto physicalSubtract = optimizer.find(
+            "total = total >= allocation.size ? total - allocation.size : 0", lastLink);
+        require(prune != std::string::npos && pruneEnd != std::string::npos &&
+            identityProbe != std::string::npos && volumeIdentity != std::string::npos &&
+            fileIdentity != std::string::npos && aggregate != std::string::npos &&
+            lastLink != std::string::npos && physicalSubtract != std::string::npos &&
+            identityProbe < prune && aggregate < lastLink && lastLink < physicalSubtract &&
+            physicalSubtract < pruneEnd &&
+            optimizer.find("total -= candidate.size", prune) >= pruneEnd,
+            "hard-linked variant aliases are double-counted or release cache bytes before the last link is removed");
+
+        std::ifstream agentFile(
+            sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp", std::ios::binary);
+        require(static_cast<bool>(agentFile), "Agent source file was not found");
+        std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        auto rendererLease = agent.find("playbackLease_ = media.playbackLease");
+        auto processExit = agent.find("WaitForSingleObject(process_.get(), 1200)");
+        auto leaseRelease = agent.find("playbackLease_.reset()", processExit);
+        require(agent.find("ResolveWithLease(") != std::string::npos &&
+            agent.find("AcquirePlaybackLease(") != std::string::npos &&
+            rendererLease != std::string::npos && processExit != std::string::npos &&
+            leaseRelease != std::string::npos && processExit < leaseRelease,
+            "the playback lease is not retained by Renderer until its process has stopped");
+        require(agent.find("if (!output.media.playbackLease)") != std::string::npos,
+            "static-image paths can reach Renderer without an external-library identity lease");
+        require(agent.find("void ReapExited()") != std::string::npos &&
+            agent.find("renderer->ReapExited()") != std::string::npos,
+            "an exited transition renderer can pin its playback variant indefinitely");
+
+
+        auto publish = optimizer.find(
+            "MoveFileExW(temporary.c_str(), destinationAccess->path.c_str()");
+        auto decodeProbe = optimizer.find(
+            "bool decodesFirstFrame = video_candidate_decodes_first_frame(temporary)");
+        require(publish != std::string::npos &&
+            decodeProbe != std::string::npos && decodeProbe < publish &&
+            optimizer.find("validateCandidate, &selectedCodec", prepare) < publish &&
+            optimizer.find("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH", publish) != std::string::npos &&
+            optimizer.find("fs::remove(request.destination") == std::string::npos &&
+            optimizer.find("fs::rename(temporary, request.destination") == std::string::npos,
+            "a completed performance copy is still published through a delete/rename gap");
+        auto candidateVisualCheck = optimizer.find(
+            "preservesSourceVisualMetadata(actual, codec)", prepare);
+        auto finalVisualCheck = optimizer.find(
+            "matchingVisualMetadata = preservesSourceVisualMetadata(actual, selectedCodec)",
+            candidateVisualCheck);
+        require(optimizer.find("MF_MT_TRANSFER_FUNCTION") != std::string::npos &&
+            optimizer.find("MF_MT_VIDEO_PRIMARIES") != std::string::npos &&
+            optimizer.find("MF_MT_MPEG2_PROFILE") != std::string::npos &&
+            candidateVisualCheck != std::string::npos && finalVisualCheck != std::string::npos &&
+            candidateVisualCheck < finalVisualCheck && finalVisualCheck < publish,
+            "candidate/final acceptance can drop known colour metadata or HEVC Main10 profile");
+        auto finalControlBeforePublish = optimizer.rfind("finalControl = control()", publish);
+        auto finalControlAfterPublish = optimizer.find("finalControl = control()", publish);
+        auto accepted = optimizer.find("accepted = TryAdoptVariant(");
+        auto acceptedProgress = optimizer.find(
+            "WriteProgress(request.source.parent_path()", accepted);
+        require(finalControlBeforePublish != std::string::npos &&
+            finalControlAfterPublish != std::string::npos &&
+            finalControlBeforePublish < publish && publish < finalControlAfterPublish &&
+            accepted != std::string::npos && acceptedProgress != std::string::npos &&
+            acceptedProgress < optimizer.find("CompleteGeneration(", accepted),
+            "pause/cancel can publish a candidate or report 100% before final adoption");
+        auto progressCallback = optimizer.find("auto publishProgress =");
+        auto progressAuthority = optimizer.rfind("auto progressIsAuthoritative =", progressCallback);
+        auto progressTokenCheck = optimizer.find("durableRequest == request.durableRequest",
+            progressAuthority);
+        auto progressWrite = optimizer.find(
+            "motion::write_variant_progress_if_current(*stableMediaDirectory", progressCallback);
+        auto progressPostCheck = optimizer.find("if (!progressIsAuthoritative())", progressWrite);
+        auto progressCleanup = optimizer.find("motion::clear_variant_progress(*stableMediaDirectory,",
+            progressPostCheck);
+        require(progressAuthority != std::string::npos && progressTokenCheck != std::string::npos &&
+            progressCallback != std::string::npos && progressWrite != std::string::npos &&
+            progressPostCheck != std::string::npos && progressCleanup != std::string::npos &&
+            progressAuthority < progressTokenCheck && progressTokenCheck < progressCallback &&
+            progressCallback < progressWrite && progressWrite < progressPostCheck &&
+            progressPostCheck < progressCleanup &&
+            progressCleanup < optimizer.find("};", progressPostCheck),
+            "a cancelled or replaced request can resurrect stale generating progress");
+
+        auto stableBoundary = optimizer.find("AcquireStableAccess(");
+        auto stableRevalidation = optimizer.find(
+            "motion::revalidate_media_library_stable_root(*libraryTrust_)", stableBoundary);
+        auto stableMapping = optimizer.find(
+            "motion::media_library_stable_path(*libraryTrust_, configuredPath)", stableRevalidation);
+        auto normalization = optimizer.find(
+            "normalize_variant_profiles(wallpapersAccess->path)");
+        auto stablePrune = optimizer.find("prune_variant_cache(*stableWallpapers");
+        auto stableTranscode = optimizer.find("*stableSource, temporary", progressCallback);
+        require(stableBoundary != std::string::npos && stableRevalidation != std::string::npos &&
+            stableMapping != std::string::npos && normalization != std::string::npos &&
+            stablePrune != std::string::npos && stableTranscode != std::string::npos &&
+            stableBoundary < stableRevalidation && stableRevalidation < stableMapping,
+            "optimizer mutations can still follow a reused configured drive letter");
+        require(optimizer.find("return { destination, std::move(playbackLease) }") != std::string::npos &&
+            optimizer.find("destinationAccess->path.c_str()", publish) != std::string::npos,
+            "stable internal publishing leaked a volume-GUID path to Renderer/UI");
+        auto transcode = optimizer.find("VideoTranscodeResult Transcode(");
+        auto partialToken = optimizer.find("motion::new_variant_request_id()", transcode);
+        auto tokenizedPartial = optimizer.find("L\".part-\"", partialToken);
+        require(partialToken != std::string::npos && tokenizedPartial != std::string::npos &&
+            tokenizedPartial < optimizer.find("L\".part.mp4\"", tokenizedPartial),
+            "FFmpeg partial names are not isolated by a high-entropy attempt token");
+
+        std::ifstream cacheFile(
+            sourceRoot / L"MotionWallpaper.Common" / L"VariantCache.h", std::ios::binary);
+        require(static_cast<bool>(cacheFile), "VariantCache source file was not found");
+        std::string cache((std::istreambuf_iterator<char>(cacheFile)), {});
+        auto tokenClear = cache.find(
+            "VariantGenerationRequest const& expected) noexcept",
+            cache.find("inline void clear_variant_progress"));
+        auto progressLock = cache.find("GENERIC_READ | DELETE, FILE_SHARE_READ", tokenClear);
+        auto progressDisposition = cache.find("mark_locked_request_for_deletion(file.get())", progressLock);
+        require(tokenClear != std::string::npos && progressLock != std::string::npos &&
+            progressDisposition != std::string::npos && tokenClear < progressLock &&
+            progressLock < progressDisposition,
+            "token-specific stale-progress cleanup is not a handle-locked compare-and-delete");
+
+        std::ifstream transcoderFile(
+            sourceRoot / L"MotionWallpaper.Agent" / L"VideoTranscoder.cpp", std::ios::binary);
+        require(static_cast<bool>(transcoderFile), "VideoTranscoder source file was not found");
+        std::string transcoder((std::istreambuf_iterator<char>(transcoderFile)), {});
+        require(transcoder.find("validateCandidate && !validateCandidate(destination, backend, codec)") !=
+                std::string::npos &&
+            transcoder.find("fs::remove(destination, fileError)",
+                transcoder.find("validateCandidate && !validateCandidate")) != std::string::npos,
+            "a backend candidate can bypass decode validation before the next fallback attempt");
+        auto stopAndConfirm = transcoder.find("auto stopAndConfirm =");
+        auto killChild = transcoder.find("TerminateProcess(processHandle.get()", stopAndConfirm);
+        auto killJob = transcoder.find("job.reset();", killChild);
+        auto confirmLoop = transcoder.find("for (;;)", killJob);
+        auto cancelledStop = transcoder.find("stopAndConfirm(ERROR_CANCELLED)", confirmLoop);
+        auto exceptionalStop = transcoder.find("stopAndConfirm(ERROR_PROCESS_ABORTED)", cancelledStop);
+        require(stopAndConfirm != std::string::npos && killChild != std::string::npos &&
+            killJob != std::string::npos && confirmLoop != std::string::npos &&
+            cancelledStop != std::string::npos && exceptionalStop != std::string::npos,
+            "FFmpeg cancellation can acknowledge optimizer quiescence before the child exits");
+    }
+
+    void first_freeze_keeps_its_compaction_surface()
+    {
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream rendererFile(
+            sourceRoot / L"MotionWallpaper.Renderer" / L"Renderer.cpp", std::ios::binary);
+        require(static_cast<bool>(rendererFile), "Renderer source file was not found");
+        std::string renderer((std::istreambuf_iterator<char>(rendererFile)), {});
+        auto composition = renderer.find("if (compositionChanged)");
+        auto preserve = renderer.find("if (!captureForFreeze)", composition);
+        auto reset = renderer.find("frozenSurface.Reset()", preserve);
+        auto frameComplete = renderer.find("lastTimestamp_ = timestamp", composition);
+        require(composition != std::string::npos && preserve < reset && reset < frameComplete,
+            "the first Freeze/Pause frame still discards its low-memory compaction surface");
+
+        auto compact = renderer.find("bool compacted = presenter.Compact()");
+        auto retry = renderer.find("SetTimer(videoWindow, residencyTimer", compact);
+        require(compact != std::string::npos && retry != std::string::npos,
+            "a transient frozen-surface compaction failure is never retried");
+    }
+
+    void library_migration_is_verified_and_ownership_scoped(fs::path const& root)
+    {
+        auto createLibrary = [&](fs::path const& source, std::string const& suffix) {
+            create_owned_library_root(source);
+            auto groupId = "aaaaaaaa-aaaa-aaaa-aaaa-" + suffix;
+            auto mediaId = "bbbbbbbb-bbbb-bbbb-bbbb-" + suffix;
+            auto mediaDirectory = source / L"Groups" / motion::utf8_to_wide(groupId) /
+                L"Videos" / motion::utf8_to_wide(mediaId);
+            fs::create_directories(mediaDirectory);
+            motion::GroupMetadata group;
+            group.id = groupId;
+            group.name = L"Migration test";
+            group.createdAt = group.updatedAt = motion::timestamp_utc();
+            motion::save_group(mediaDirectory.parent_path().parent_path() / L"group.json", group);
+            motion::MediaMetadata media;
+            media.id = mediaId;
+            media.groupId = groupId;
+            media.name = media.originalName = L"wallpaper.mp4";
+            media.fileName = L"wallpaper.mp4";
+            media.kind = "video";
+            media.sizeBytes = 24;
+            media.revision = 1;
+            media.importedAt = media.updatedAt = motion::timestamp_utc();
+            motion::save_media(mediaDirectory / L"metadata.json", media);
+            std::ofstream(mediaDirectory / media.fileName, std::ios::binary)
+                << "verified wallpaper bytes";
+            return mediaDirectory / media.fileName;
+        };
+        auto beginMigration = [&](fs::path const& source, fs::path const& target) {
+            auto identity = motion::capture_media_library_trust(source);
+            require(identity.has_value(), "migration source identity was not captured");
+            return motion::app::LibraryMigrationTransaction::Begin(
+                source, target, *identity);
+        };
+        auto leaveMigrationFromChild = [&](fs::path const& source,
+            fs::path const& target, std::wstring_view phase) {
+            auto executable = motion::executable_directory() / L"MotionWallpaper.Tests.exe";
+            auto command = motion::build_command_line({ executable.wstring(),
+                L"--leave-library-migration", source.wstring(), target.wstring(),
+                std::wstring(phase) });
+            STARTUPINFOW startup{ sizeof(startup) };
+            startup.dwFlags = STARTF_USESHOWWINDOW;
+            startup.wShowWindow = SW_HIDE;
+            PROCESS_INFORMATION created{};
+            require(CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                CREATE_NO_WINDOW, nullptr, executable.parent_path().c_str(),
+                &startup, &created) != FALSE,
+                "migration crash-fixture process failed to launch");
+            motion::unique_handle process(created.hProcess), thread(created.hThread);
+            require(WaitForSingleObject(process.get(), 30'000) == WAIT_OBJECT_0,
+                "migration crash-fixture process timed out");
+            DWORD exitCode{};
+            require(GetExitCodeProcess(process.get(), &exitCode) && exitCode == 71,
+                "migration crash-fixture process did not stop at the requested phase");
+        };
+        auto migrationConflicts = [&](fs::path const& target) {
+            std::vector<fs::path> result;
+            auto prefix = target.filename().wstring() +
+                L".MotionWallpaper-migration-conflict-";
+            std::error_code error;
+            for (fs::directory_iterator entries(target.parent_path(), error), end;
+                !error && entries != end; entries.increment(error)) {
+                auto name = entries->path().filename().wstring();
+                if (entries->is_directory() && name.starts_with(prefix)) {
+                    result.push_back(entries->path());
+                }
+            }
+            require(!error, "migration conflict directory enumeration failed");
+            return result;
+        };
+
+        auto source = root / L"migration-source";
+        auto target = root / L"migration-target";
+        createLibrary(source, "000000000001");
+        {
+            auto transaction = beginMigration(source, target);
+            transaction->CopyAndVerify();
+            transaction->CommitPreparedTarget();
+            transaction->MarkActivated();
+            auto backup = transaction->ArchiveVerifiedSource();
+            require(!fs::exists(source) && fs::is_directory(backup) &&
+                fs::is_directory(target / L"Groups"),
+                "a verified migration did not activate the target and archive the source");
+        }
+
+        auto copyingCrashSource = root / L"migration-copying-crash-source";
+        auto copyingCrashTarget = root / L"migration-copying-crash-target";
+        auto copyingCrashMedia = createLibrary(copyingCrashSource, "000000000011");
+        {
+            std::fstream large(copyingCrashMedia,
+                std::ios::binary | std::ios::in | std::ios::out);
+            large.seekp(8 * 1024 * 1024, std::ios::beg);
+            large.put('x');
+            require(static_cast<bool>(large),
+                "copying crash fixture could not enlarge its source file");
+        }
+        leaveMigrationFromChild(copyingCrashSource, copyingCrashTarget, L"copying");
+        require(fs::is_regular_file(copyingCrashTarget / L".mwm-stage" /
+            L".motionwallpaper-migration-state"),
+            "copying crash did not retain its durable migration state");
+        {
+            auto retry = beginMigration(copyingCrashSource, copyingCrashTarget);
+            auto conflicts = migrationConflicts(copyingCrashTarget);
+            require(conflicts.size() == 1 &&
+                fs::is_directory(conflicts.front() / L".mwm-stage") &&
+                fs::is_regular_file(conflicts.front() / L".mwm-stage" /
+                    L".motionwallpaper-migration-state"),
+                "copying crash residue was not atomically preserved as one conflict");
+            retry->CopyAndVerify();
+            retry->CommitPreparedTarget();
+            retry->MarkActivated();
+        }
+        require(fs::is_directory(copyingCrashSource) &&
+            motion::is_owned_media_library(copyingCrashTarget),
+            "copying crash retry damaged the source or failed to publish the target");
+
+        auto preparedCrashSource = root / L"migration-prepared-crash-source";
+        auto preparedCrashTarget = root / L"migration-prepared-crash-target";
+        createLibrary(preparedCrashSource, "000000000012");
+        leaveMigrationFromChild(preparedCrashSource, preparedCrashTarget, L"prepared");
+        {
+            auto retry = beginMigration(preparedCrashSource, preparedCrashTarget);
+            auto conflicts = migrationConflicts(preparedCrashTarget);
+            require(conflicts.size() == 1 &&
+                fs::is_regular_file(conflicts.front() / L".mwm-stage" /
+                    L".motionwallpaper-migration-owner"),
+                "prepared crash residue was not preserved before retry");
+            retry->CopyAndVerify();
+            retry->CommitPreparedTarget();
+            retry->MarkActivated();
+        }
+
+        auto partialCommitSource = root / L"migration-partial-commit-source";
+        auto partialCommitTarget = root / L"migration-partial-commit-target";
+        createLibrary(partialCommitSource, "000000000013");
+        leaveMigrationFromChild(partialCommitSource, partialCommitTarget, L"prepared");
+        auto partialStage = partialCommitTarget / L".mwm-stage";
+        fs::copy_file(partialStage / L".motionwallpaper-migration-owner",
+            partialStage / L"Groups" / L".motionwallpaper-migration-owner");
+        fs::copy_file(partialStage / L".motionwallpaper-migration-state",
+            partialStage / L"Groups" / L".motionwallpaper-migration-state");
+        require(MoveFileExW((partialStage / L"Groups").c_str(),
+            (partialCommitTarget / L"Groups").c_str(), MOVEFILE_WRITE_THROUGH) != FALSE,
+            "partial-commit crash fixture could not publish Groups");
+        {
+            auto retry = beginMigration(partialCommitSource, partialCommitTarget);
+            auto conflicts = migrationConflicts(partialCommitTarget);
+            require(conflicts.size() == 1 &&
+                fs::is_directory(conflicts.front() / L"Groups") &&
+                fs::is_directory(conflicts.front() / L".mwm-stage"),
+                "partial commit was not preserved as a single conflict directory");
+            retry->CopyAndVerify();
+            retry->CommitPreparedTarget();
+            retry->MarkActivated();
+        }
+
+        auto tamperedCrashSource = root / L"migration-tampered-crash-source";
+        auto tamperedCrashTarget = root / L"migration-tampered-crash-target";
+        createLibrary(tamperedCrashSource, "000000000014");
+        leaveMigrationFromChild(tamperedCrashSource, tamperedCrashTarget, L"prepared");
+        auto tamperedState = tamperedCrashTarget / L".mwm-stage" /
+            L".motionwallpaper-migration-state";
+        std::ofstream(tamperedState, std::ios::binary | std::ios::app) << "tampered\n";
+        bool rejectedTamperedState{};
+        try {
+            (void)beginMigration(tamperedCrashSource, tamperedCrashTarget);
+        } catch (...) {
+            rejectedTamperedState = true;
+        }
+        require(rejectedTamperedState && fs::is_regular_file(tamperedState) &&
+            migrationConflicts(tamperedCrashTarget).empty(),
+            "an unverifiable migration state was moved, deleted, or reused");
+
+        auto changedSource = root / L"migration-changing-source";
+        auto changedTarget = root / L"migration-changing-target";
+        createLibrary(changedSource, "000000000002");
+        bool detectedChange{};
+        try {
+            auto transaction = beginMigration(changedSource, changedTarget);
+            transaction->CopyAndVerify([&](uint64_t copied, uint64_t total) {
+                if (copied == total) {
+                    std::ofstream(changedSource / L"concurrent-change.tmp", std::ios::binary)
+                        << "changed while copying";
+                }
+            });
+        } catch (...) {
+            detectedChange = true;
+        }
+        require(detectedChange, "a source mutation during migration escaped verification");
+        require(fs::is_directory(changedSource) && !fs::exists(changedTarget),
+            "a failed migration deleted the source or retained its owned target");
+
+        auto pinnedSource = root / L"migration-pinned-source";
+        auto pinnedTarget = root / L"migration-pinned-target";
+        auto pinnedReplacement = root / L"migration-pinned-target.replaced";
+        createLibrary(pinnedSource, "000000000005");
+        auto pinnedTransaction = beginMigration(pinnedSource, pinnedTarget);
+        std::error_code pinnedError;
+        fs::rename(pinnedTarget, pinnedReplacement, pinnedError);
+        if (!pinnedError) {
+            fs::create_directories(pinnedTarget);
+            std::ofstream(pinnedTarget / L"replacement-sentinel.txt",
+                std::ios::binary) << "replacement";
+            bool rejectedAliasReplacement{};
+            try {
+                pinnedTransaction->CopyAndVerify();
+            } catch (...) {
+                rejectedAliasReplacement = true;
+            }
+            pinnedTransaction.reset();
+            std::ifstream sentinel(pinnedTarget / L"replacement-sentinel.txt",
+                std::ios::binary);
+            std::string sentinelContents((std::istreambuf_iterator<char>(sentinel)), {});
+            require(rejectedAliasReplacement && sentinelContents == "replacement" &&
+                fs::is_directory(pinnedReplacement / L".mwm-stage"),
+                "migration target alias replacement was written to or cleaned by path");
+        } else {
+            pinnedTransaction.reset();
+            require(!fs::exists(pinnedTarget),
+                "rolling back a pinned migration target left owned staging behind");
+        }
+        require(fs::is_directory(pinnedSource),
+            "target identity replacement damaged the migration source");
+
+        auto occupiedTarget = root / L"migration-occupied-target";
+        fs::create_directories(occupiedTarget);
+        std::ofstream(occupiedTarget / L"user-file.txt") << "keep";
+        bool rejectedOccupiedTarget{};
+        try {
+            (void)beginMigration(changedSource, occupiedTarget);
+        } catch (...) {
+            rejectedOccupiedTarget = true;
+        }
+        require(rejectedOccupiedTarget && fs::is_regular_file(occupiedTarget / L"user-file.txt"),
+            "migration accepted or damaged a target containing unowned user data");
+
+        auto replacedSource = root / L"migration-replaced-source";
+        auto replacedTarget = root / L"migration-replaced-target";
+        createLibrary(replacedSource, "000000000004");
+        auto replacedIdentity = motion::capture_media_library_trust(replacedSource);
+        require(replacedIdentity.has_value(), "replaceable migration identity was not captured");
+        fs::remove(replacedSource / motion::media_library_ownership_marker_name);
+        std::ofstream(replacedSource / motion::media_library_ownership_marker_name, std::ios::binary)
+            << motion::media_library_ownership_marker_prefix
+            << "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee\n";
+        bool rejectedReplacement{};
+        try {
+            (void)motion::app::LibraryMigrationTransaction::Begin(
+                replacedSource, replacedTarget, *replacedIdentity);
+        } catch (...) {
+            rejectedReplacement = true;
+        }
+        require(rejectedReplacement && !fs::exists(replacedTarget),
+            "migration accepted a replacement source identity or modified its target");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream migrationFile(
+            sourceRoot / L"MotionWallpaper.App" / L"LibraryMigration.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(migrationFile), "migration source file was not found");
+        std::string migrationSource((std::istreambuf_iterator<char>(migrationFile)), {});
+        require(migrationSource.find("capture_stable_directory(impl->target)") !=
+                std::string::npos &&
+            migrationSource.find("impl_->targetAccess") != std::string::npos &&
+            migrationSource.find("impl_->RequireTargetTrust()") != std::string::npos,
+            "migration target I/O no longer remains bound to its stable volume path");
+
+        auto intrudedSource = root / L"migration-intruded-source";
+        auto intrudedTarget = root / L"migration-intruded-target";
+        createLibrary(intrudedSource, "000000000003");
+        bool cancelledIntrudedCopy{};
+        {
+            auto transaction = beginMigration(intrudedSource, intrudedTarget);
+            std::atomic_bool cancel{};
+            try {
+                transaction->CopyAndVerify([&](uint64_t, uint64_t) {
+                    if (cancel.exchange(true, std::memory_order_acq_rel)) return;
+                    std::ofstream(intrudedTarget / L".mwm-stage" / L"user-file.txt",
+                        std::ios::binary) << "keep";
+                }, &cancel);
+            } catch (...) {
+                cancelledIntrudedCopy = true;
+            }
+        }
+        std::ifstream preserved(intrudedTarget / L".mwm-stage" / L"user-file.txt",
+            std::ios::binary);
+        std::string preservedContents((std::istreambuf_iterator<char>(preserved)), {});
+        require(cancelledIntrudedCopy && fs::is_directory(intrudedSource) &&
+            preservedContents == "keep",
+            "migration rollback deleted a file that the transaction did not own");
+
+        motion::app::LibraryAccessGate gate;
+        auto writer = gate.TryAcquireWrite();
+        require(writer && !gate.TryBeginMigration(),
+            "migration entered while an asynchronous library writer was active");
+        writer.reset();
+        auto migration = gate.TryBeginMigration();
+        require(migration && gate.MigrationInProgress() && !gate.TryAcquireWrite(),
+            "library writes were not excluded by the migration lease");
+        migration.reset();
+        require(!gate.MigrationInProgress() && gate.TryAcquireWrite(),
+            "the library gate did not reopen after migration");
+    }
+
+    void pending_performance_copy_preserves_the_presented_frame()
+    {
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream agentFile(sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp", std::ios::binary);
+        require(static_cast<bool>(agentFile), "Agent source file was not found");
+        std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        auto branch = agent.find("else if (waitingForPerformanceCopy)");
+        require(branch != std::string::npos, "performance-copy wait branch disappeared");
+        auto nextBranch = agent.find("} else {", branch);
+        require(nextBranch != std::string::npos, "performance-copy wait branch is malformed");
+        auto body = agent.substr(branch, nextBranch - branch);
+        require(body.find("renderers.Freeze()") != std::string::npos,
+            "a pending performance copy no longer freezes the last presented frame");
+        require(body.find("renderers.Stop()") == std::string::npos,
+            "a pending performance copy destroys the old Renderer and exposes the system wallpaper");
+    }
+
     void playback_capability_only_degrades_software_devices()
     {
         require(!motion::agent::uses_software_playback("auto", true),
             "automatic playback downgraded a physical video device");
+        require(motion::agent::uses_software_playback("auto", true, false),
+            "automatic playback ignored a source codec/profile the GPU cannot decode");
         require(motion::agent::uses_software_playback("auto", false) &&
             motion::agent::uses_software_playback("software", true),
             "WARP-only or explicitly software playback missed the CPU profile");
-        require(!motion::agent::uses_software_playback("hardware", false),
+        require(!motion::agent::uses_software_playback("hardware", false, false),
             "strict hardware mode silently changed into software playback");
+        require(motion::agent::automatic_decode_failure_requires_cpu_smooth(
+                "auto", "software-fallback", "no-d3d11-video-support", true) &&
+            motion::agent::automatic_decode_failure_requires_cpu_smooth(
+                "auto", "unavailable", "automatic-media-startup", true) &&
+            motion::agent::automatic_decode_failure_requires_cpu_smooth(
+                "auto", "unavailable", "automatic-first-frame-timeout", true),
+            "a real automatic-decoder startup failure did not select cpu-smooth");
+        require(!motion::agent::automatic_decode_failure_requires_cpu_smooth(
+                "hardware", "unavailable", "automatic-media-startup", true) &&
+            !motion::agent::automatic_decode_failure_requires_cpu_smooth(
+                "auto", "unavailable", "automatic-media-startup", false) &&
+            !motion::agent::automatic_decode_failure_requires_cpu_smooth(
+                "auto", "unavailable", "device-lost-after-playback", true),
+            "runtime fallback escaped its automatic, adapter-specific startup scope");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream optimizerFile(sourceRoot / L"MotionWallpaper.Agent" / L"VideoOptimizer.cpp",
+            std::ios::binary);
+        std::ifstream agentFile(sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(optimizerFile) && static_cast<bool>(agentFile),
+            "codec-aware playback source files were not found");
+        std::string optimizer((std::istreambuf_iterator<char>(optimizerFile)), {});
+        std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        require(optimizer.find("GetVideoDecoderConfigCount") != std::string::npos &&
+            optimizer.find("D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10") != std::string::npos &&
+            optimizer.find("D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2") != std::string::npos &&
+            optimizer.find("D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0") != std::string::npos,
+            "automatic playback no longer checks source-specific D3D11 decoder configurations");
+        require(agent.find("SourceHardwareDecodeAdapter(") != std::string::npos &&
+            agent.find("output.decodeAdapter") != std::string::npos &&
+            agent.find("routesWithoutHardwareDecode") != std::string::npos &&
+            agent.find("AutoDecodeRouteRejected(") != std::string::npos &&
+            agent.find("RememberAutoDecodeFailure(") != std::string::npos,
+            "the Agent no longer routes unsupported automatic media to cpu-smooth");
+        auto resolvedPlayback = agent.find(
+            "bool waitingForPerformanceCopy = resolveVideoOutputs()");
+        auto resolvedProbe = agent.find(
+            "auto unsupportedRoutes = assignDecodeAdapters(outputs)", resolvedPlayback);
+        auto cpuResolve = agent.find("waitingForPerformanceCopy = resolveVideoOutputs(true)",
+            resolvedProbe);
+        require(resolvedPlayback != std::string::npos && resolvedProbe != std::string::npos &&
+            cpuResolve != std::string::npos && resolvedPlayback < resolvedProbe &&
+            resolvedProbe < cpuResolve,
+            "automatic playback probes the source instead of the resolved variant, or does not re-resolve cpu-smooth");
+        require(agent.find("std::find(route.monitorDevices.begin(), route.monitorDevices.end(),") !=
+                std::string::npos &&
+            agent.find("value.deviceName) != route.monitorDevices.end()") != std::string::npos,
+            "a multi-GPU route can inherit another display adapter's decoder LUID");
+        require(agent.find("std::vector<size_t> routesWithoutHardwareDecode") != std::string::npos &&
+            agent.find("output.softwarePlaybackTarget = true") != std::string::npos &&
+            agent.find("output.playbackFrameRateCap") != std::string::npos &&
+            agent.find("routeFrameRateCap") != std::string::npos &&
+            agent.find("primaryOnly ? \"primary\" : \"monitor\", routeFrameRateCap") !=
+                std::string::npos &&
+            agent.find("auto cpuOutputs = display_media_targets") != std::string::npos &&
+            agent.find("for (auto index : unsupportedRoutes)") != std::string::npos,
+            "one weak decode route still globally degrades media or frame-rate policy");
+        std::ifstream rendererFile(sourceRoot / L"MotionWallpaper.Renderer" / L"Renderer.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(rendererFile), "Renderer source file was not found");
+        std::string renderer((std::istreambuf_iterator<char>(rendererFile)), {});
+        require(renderer.find("AdapterKey(description) != requiredAdapter") != std::string::npos &&
+            renderer.find("requestedDecodeAdapter") != std::string::npos,
+            "the probed decoder adapter LUID is not enforced by Renderer");
+        require(renderer.find("report_decode_status(\"automatic\", \"first-frame-presented\")") !=
+                std::string::npos &&
+            renderer.find("report_decode_status(\"unavailable\", \"automatic-media-startup\")") !=
+                std::string::npos &&
+            agent.find("automatic-first-frame-timeout") != std::string::npos,
+            "automatic decode success is still reported before a real frame or startup failures are not fed back");
 
         auto strong = motion::agent::software_playback_profile(true, 16, 2560, 1600, 165);
         require(strong.enabled && strong.width == 1728 && strong.height == 1080 && strong.frameRate == 60,
@@ -417,35 +1589,53 @@ namespace
         auto shared = motion::agent::renderer_media_key(L"C:\\wallpapers\\valley.mp4", "video");
         auto other = motion::agent::renderer_media_key(L"C:\\wallpapers\\beach.mp4", "video");
         std::vector<motion::agent::RendererRoute> routes{
-            { shared, L"\\\\.\\DISPLAY1" },
-            { shared, L"\\\\.\\DISPLAY2" }
+            { shared, L"\\\\.\\DISPLAY1", L"adapter-a", 1920ull * 1080 },
+            { shared, L"\\\\.\\DISPLAY2", L"adapter-a", 2560ull * 1440 }
         };
         auto grouped = motion::agent::group_renderer_routes(routes, true);
-        require(grouped.size() == 1 && grouped.front().monitorDevices.size() == 2,
+        require(grouped.size() == 1 && grouped.front().monitorDevices.size() == 2 &&
+            grouped.front().aggregateOutputPixels == 1920ull * 1080 + 2560ull * 1440,
             "the same wallpaper no longer shares one Renderer across displays");
 
-        routes.push_back({ other, L"\\\\.\\DISPLAY3" });
+        routes.push_back({ other, L"\\\\.\\DISPLAY3", L"adapter-a", 3840ull * 2160 });
         grouped = motion::agent::group_renderer_routes(routes, true);
         require(grouped.size() == 2, "different wallpapers were incorrectly forced through one Renderer");
 
-        routes.push_back({ shared, L"\\\\.\\DISPLAY4", L"other-adapter" });
+        routes.push_back({ shared, L"\\\\.\\DISPLAY4", L"other-adapter", 3840ull * 2160 });
         grouped = motion::agent::group_renderer_routes(routes, true);
-        require(grouped.size() == 3,
+        auto alternateAdapter = std::find_if(grouped.begin(), grouped.end(), [](auto const& route) {
+            return route.adapterKey == L"other-adapter";
+        });
+        require(grouped.size() == 3 && alternateAdapter != grouped.end() &&
+            alternateAdapter->aggregateOutputPixels == 3840ull * 2160,
             "the same wallpaper was incorrectly shared across display adapters");
+
+        auto saturated = motion::agent::group_renderer_routes({
+            { shared, L"\\\\.\\DISPLAY1", L"adapter-a", (std::numeric_limits<uint64_t>::max)() },
+            { shared, L"\\\\.\\DISPLAY2", L"adapter-a", 1 }
+        }, true);
+        require(saturated.size() == 1 &&
+            saturated.front().aggregateOutputPixels == (std::numeric_limits<uint64_t>::max)(),
+            "aggregate display load overflowed instead of saturating");
 
         auto firstUnknown = motion::agent::renderer_adapter_key({}, L"\\\\.\\DISPLAY5");
         auto secondUnknown = motion::agent::renderer_adapter_key({}, L"\\\\.\\DISPLAY6");
         require(!firstUnknown.empty() && firstUnknown != secondUnknown,
             "unknown indirect-display adapters collapse into one Renderer route");
 
-        grouped = motion::agent::group_renderer_routes({ { shared, {} } }, false);
-        require(grouped.size() == 1 && grouped.front().monitorDevices.empty(),
-            "primary-only rendering unexpectedly retained a monitor route");
+        grouped = motion::agent::group_renderer_routes({
+            { shared, L"\\\\.\\DISPLAY1", {}, 1920ull * 1080 },
+            { shared, L"\\\\.\\DISPLAY2", {}, 1280ull * 720 }
+        }, false);
+        require(grouped.size() == 1 && grouped.front().monitorDevices.empty() &&
+            grouped.front().aggregateOutputPixels == 1920ull * 1080 + 1280ull * 720,
+            "primary-only routing lost output load or unexpectedly retained monitor routes");
     }
 
     void video_variant_policy_preserves_quality_priority()
     {
         using motion::agent::VideoSourceCodec;
+        using motion::agent::VideoHardwareDecodeProfile;
         require(motion::agent::video_software_fallback_allowed(VideoSourceCodec::Hevc, true, 1),
             "8-bit HEVC Main unexpectedly lost the bounded software fallback");
         require(!motion::agent::video_software_fallback_allowed(VideoSourceCodec::Hevc, true, 2),
@@ -454,22 +1644,52 @@ namespace
             "unknown HEVC bit depth was treated as safe for 8-bit software encoding");
         require(!motion::agent::video_software_fallback_allowed(VideoSourceCodec::H264, true, 100, true),
             "HDR transfer metadata was ignored by the software fallback guard");
+        require(!motion::agent::video_software_fallback_allowed(VideoSourceCodec::Unknown, false, 0) &&
+            !motion::agent::video_software_fallback_allowed(VideoSourceCodec::Vp9, true, 2) &&
+            !motion::agent::video_software_fallback_allowed(VideoSourceCodec::Av1, true, 0),
+            "unknown or potentially high-bit-depth codecs were flattened into H.264");
         require(!motion::agent::video_software_fallback_allowed(VideoSourceCodec::Unknown, false, 0, false, true),
             "BT.2020 primaries were ignored by the software fallback guard");
+        require(motion::agent::video_hardware_decode_profile(
+                VideoSourceCodec::H264, true, 100) == VideoHardwareDecodeProfile::H264 &&
+            motion::agent::video_hardware_decode_profile(
+                VideoSourceCodec::Hevc, true, 2) == VideoHardwareDecodeProfile::HevcMain10 &&
+            motion::agent::video_hardware_decode_profile(
+                VideoSourceCodec::Vp9, true, 2) == VideoHardwareDecodeProfile::Vp9Profile2 &&
+            motion::agent::video_hardware_decode_profile(
+                VideoSourceCodec::Av1, true, 0) == VideoHardwareDecodeProfile::Av1Profile0 &&
+            motion::agent::video_hardware_decode_profile(
+                VideoSourceCodec::Av1, false, 0) == VideoHardwareDecodeProfile::Unsupported,
+            "source codec/profile metadata no longer maps conservatively to D3D11 decoder profiles");
         require(motion::agent::video_cpu_conversion_allowed(false, false) &&
             !motion::agent::video_cpu_conversion_allowed(true, false) &&
             !motion::agent::video_cpu_conversion_allowed(false, true),
             "CPU compatibility copies no longer distinguish SDR Main10 from HDR/BT.2020");
+        require(motion::agent::video_variant_color_metadata_matches(
+                true, 16, true, 16, true, 9, true, 9) &&
+            !motion::agent::video_variant_color_metadata_matches(
+                true, 16, false, 0, true, 9, true, 9) &&
+            !motion::agent::video_variant_color_metadata_matches(
+                true, 16, true, 1, true, 9, true, 9) &&
+            !motion::agent::video_variant_color_metadata_matches(
+                true, 16, true, 16, true, 9, true, 1) &&
+            motion::agent::video_variant_color_metadata_matches(
+                false, 0, false, 0, false, 0, false, 0),
+            "a performance copy can lose or change known transfer/primaries metadata");
+        require(motion::agent::video_variant_is_hevc_main10(true, 2) &&
+            !motion::agent::video_variant_is_hevc_main10(true, 1) &&
+            !motion::agent::video_variant_is_hevc_main10(false, 2),
+            "HEVC performance-copy validation does not require a known Main10 profile");
         auto original = motion::agent::video_variant_decision("original");
         require(!original.targetFps && original.fileName.empty(), "original mode unexpectedly requested a proxy");
         auto balanced = motion::agent::video_variant_decision("balanced", 2560, 1440, 240, 1, 165);
-        require(balanced.targetFps == 120 && balanced.fileName == L"balanced-120-2560x1440-v4.mp4",
+        require(balanced.targetFps == 120 && balanced.fileName == L"balanced-120-2560x1440-v5.mp4",
             "balanced mode no longer targets the high-quality 120 FPS proxy");
         auto sixtyHertz = motion::agent::video_variant_decision("balanced", 2560, 1440, 240, 1, 60);
-        require(sixtyHertz.targetFps == 60 && sixtyHertz.fileName == L"balanced-60-2560x1440-v4.mp4",
+        require(sixtyHertz.targetFps == 60 && sixtyHertz.fileName == L"balanced-60-2560x1440-v5.mp4",
             "balanced mode generated frames the display cannot present");
         auto powerSaver = motion::agent::video_variant_decision("power-saver", 2560, 1440, 240, 1, 165);
-        require(powerSaver.targetFps == 60 && powerSaver.fileName == L"power-saver-60-2560x1440-v4.mp4",
+        require(powerSaver.targetFps == 60 && powerSaver.fileName == L"power-saver-60-2560x1440-v5.mp4",
             "power saver did not retain its explicit 60 FPS policy");
         auto cpuSmooth = motion::agent::video_variant_decision("cpu-smooth", 1280, 720, 240, 1, 60);
         require(cpuSmooth.targetFps == 60 && cpuSmooth.fileName == L"cpu-smooth-60-1280x720-v5.mp4",
@@ -484,6 +1704,14 @@ namespace
             "valid HEVC coding-block padding was rejected");
         require(!motion::agent::video_variant_dimensions_match(1'920, 1'080, 3'840, 2'160),
             "a different visible resolution passed variant validation");
+        constexpr uint64_t second = 10'000'000;
+        require(motion::agent::video_variant_duration_matches(598 * second, 600 * second, 60),
+            "normal CFR/container duration drift was rejected");
+        require(!motion::agent::video_variant_duration_matches(590 * second, 600 * second, 60),
+            "a materially truncated variant passed duration validation");
+        require(!motion::agent::video_variant_duration_matches(0, 600 * second, 60) &&
+            motion::agent::video_variant_duration_matches(2 * second, 0, 60),
+            "unknown and empty duration handling is not fail-safe");
         require(motion::agent::video_needs_variant(240, 1, 120), "240 FPS source was not optimized");
         require(!motion::agent::video_needs_variant(120, 1, 120), "120 FPS source was unnecessarily transcoded");
         require(motion::agent::video_needs_variant(60, 1, 60, 3840, 2160, 2560, 1440),
@@ -509,6 +1737,7 @@ namespace
 
         require(motion::request_variant_generation(mediaDirectory, "balanced"),
             "balanced request could not be persisted");
+        auto obsoleteBalanced = motion::read_variant_generation_request(mediaDirectory);
         require(motion::request_variant_generation(mediaDirectory, "power-saver"),
             "newer power-saver request could not replace balanced");
         require(motion::pause_variant_generation(mediaDirectory) &&
@@ -517,25 +1746,29 @@ namespace
         require(motion::resume_variant_generation(mediaDirectory) &&
             !motion::inspect_variant_cache(mediaDirectory).paused,
             "a paused optimization request could not be resumed");
-        motion::complete_variant_generation(mediaDirectory, "balanced");
+        require(!motion::complete_variant_generation(mediaDirectory, obsoleteBalanced),
+            "an obsolete token unexpectedly completed a newer request");
         require(motion::read_variant_request(mediaDirectory) == "power-saver",
             "an obsolete completion cleared the newer request");
-        motion::fail_variant_generation(mediaDirectory, "balanced");
+        require(!motion::fail_variant_generation(mediaDirectory, obsoleteBalanced),
+            "an obsolete token unexpectedly failed a newer request");
         require(motion::read_variant_request(mediaDirectory) == "power-saver" &&
             !fs::exists(motion::variant_failed_path(mediaDirectory)),
             "an obsolete failure replaced the newer request");
 
-        std::ofstream(mediaDirectory / L"Variants" / L"balanced-120-2560x1440-v4.mp4",
-            std::ios::binary) << "balanced";
+        auto legacyBalanced = mediaDirectory / L"Variants" / L"balanced-120-2560x1440-v4.mp4";
+        auto currentBalanced = mediaDirectory / L"Variants" / L"balanced-120-2560x1440-v5.mp4";
+        std::ofstream(legacyBalanced, std::ios::binary) << "legacy-balanced";
+        std::ofstream(currentBalanced, std::ios::binary) << "balanced";
         std::ofstream(mediaDirectory / L"Variants" / L"power-saver-60-2560x1440-v2.mp4",
             std::ios::binary) << "legacy";
         auto status = motion::inspect_variant_cache(mediaDirectory);
-        require(status.requestedMode == "power-saver" && status.entries.size() == 2,
+        require(status.requestedMode == "power-saver" && status.entries.size() == 3,
             "variant status lost the active request or cached files");
-        require(motion::select_variant_file(status, "balanced").starts_with(L"balanced-") &&
-            motion::select_variant_file(status, "original").starts_with(L"balanced-") &&
+        require(motion::select_variant_file(status, "balanced") == currentBalanced.filename().wstring() &&
+            motion::select_variant_file(status, "original") == currentBalanced.filename().wstring() &&
             motion::select_variant_file(status, "power-saver").starts_with(L"power-saver-"),
-            "retained variant selection no longer honors profile priority and original fallback");
+            "retained variant selection no longer prefers v5 within the requested profile");
         auto balanced = std::find_if(status.entries.begin(), status.entries.end(), [](auto const& entry) {
             return entry.mode == "balanced";
         });
@@ -545,7 +1778,7 @@ namespace
         require(balanced != status.entries.end() && powerSaver != status.entries.end(),
             "performance cache files were assigned to the wrong profile");
 
-        auto currentPowerSaver = mediaDirectory / L"Variants" / L"power-saver-60-2560x1440-v4.mp4";
+        auto currentPowerSaver = mediaDirectory / L"Variants" / L"power-saver-60-2560x1440-v5.mp4";
         std::ofstream(currentPowerSaver, std::ios::binary) << "current";
         require(!motion::retain_variant_profile(mediaDirectory, "power-saver", L"missing.mp4") &&
             fs::is_regular_file(mediaDirectory / L"Variants" / L"power-saver-60-2560x1440-v2.mp4"),
@@ -554,13 +1787,13 @@ namespace
             currentPowerSaver.filename().wstring()) &&
             !fs::exists(mediaDirectory / L"Variants" / L"power-saver-60-2560x1440-v2.mp4") &&
             fs::is_regular_file(currentPowerSaver) &&
-            fs::is_regular_file(mediaDirectory / L"Variants" / L"balanced-120-2560x1440-v4.mp4"),
+            fs::is_regular_file(legacyBalanced) && fs::is_regular_file(currentBalanced),
             "profile retention did not remove only the superseded same-tier copy");
 
         auto sharedDirectory = root / L"variant-shared-storage";
         fs::create_directories(sharedDirectory / L"Variants");
-        auto sharedBalanced = sharedDirectory / L"Variants" / L"balanced-60-2560x1440-v4.mp4";
-        auto sharedPowerSaver = sharedDirectory / L"Variants" / L"power-saver-60-2560x1440-v4.mp4";
+        auto sharedBalanced = sharedDirectory / L"Variants" / L"balanced-60-2560x1440-v5.mp4";
+        auto sharedPowerSaver = sharedDirectory / L"Variants" / L"power-saver-60-2560x1440-v5.mp4";
         std::ofstream(sharedBalanced, std::ios::binary) << "shared-copy";
         fs::create_hard_link(sharedBalanced, sharedPowerSaver);
         auto sharedStatus = motion::inspect_variant_cache(sharedDirectory);
@@ -569,14 +1802,18 @@ namespace
             sharedStatus.entries[0].sharedStorage && sharedStatus.entries[1].sharedStorage,
             "hard-linked performance profiles were counted as duplicate physical storage");
 
-        motion::fail_variant_generation(mediaDirectory, "power-saver");
+        auto powerSaverRequest = motion::read_variant_generation_request(mediaDirectory);
+        require(motion::fail_variant_generation(mediaDirectory, powerSaverRequest),
+            "the current tokenized request could not be failed");
         auto failedStatus = motion::inspect_variant_cache(mediaDirectory);
         require(failedStatus.failed && failedStatus.failedMode == "power-saver" &&
             failedStatus.requestedMode.empty(),
             "a failed performance-copy task did not retain its retryable profile identity");
         require(motion::request_variant_generation(mediaDirectory, "power-saver"),
             "a failed performance-copy task could not be retried");
-        motion::complete_variant_generation(mediaDirectory, "power-saver");
+        auto retriedPowerSaver = motion::read_variant_generation_request(mediaDirectory);
+        require(motion::complete_variant_generation(mediaDirectory, retriedPowerSaver),
+            "the retried tokenized request could not be completed");
         require(motion::read_variant_request(mediaDirectory).empty(),
             "the matching completion did not clear its request");
 
@@ -589,6 +1826,48 @@ namespace
             "manual generation did not re-enable a deleted profile");
     }
 
+    void same_mode_variant_retry_rejects_stale_worker(fs::path const& root)
+    {
+        auto mediaDirectory = root / L"variant-same-mode-retry";
+        fs::create_directories(mediaDirectory);
+
+        require(motion::request_variant_generation(mediaDirectory, "balanced"),
+            "the first balanced request could not be persisted");
+        auto first = motion::read_variant_generation_request(mediaDirectory);
+        require(first.mode == "balanced" && !first.requestId.empty(),
+            "the first balanced request has no identity");
+        require(motion::cancel_variant_generation(mediaDirectory),
+            "the first balanced request could not be cancelled");
+        require(motion::request_variant_generation(mediaDirectory, "balanced"),
+            "the same-mode retry could not be persisted");
+        auto retry = motion::read_variant_generation_request(mediaDirectory);
+        require(retry.mode == "balanced" && !retry.requestId.empty() &&
+            retry.requestId != first.requestId,
+            "a same-mode retry reused the cancelled request identity");
+        require(motion::write_variant_progress_if_current(mediaDirectory, retry,
+                motion::VariantProgressState::generating, 7, true) &&
+            !motion::write_variant_progress_if_current(mediaDirectory, first,
+                motion::VariantProgressState::generating, 100, true),
+            "a stale worker could overwrite the retry's progress");
+        motion::clear_variant_progress(mediaDirectory, first);
+        require(!motion::complete_variant_generation(mediaDirectory, first) &&
+            !motion::fail_variant_generation(mediaDirectory, first),
+            "a stale same-mode worker could mutate the retry terminal state");
+        auto status = motion::inspect_variant_cache(mediaDirectory);
+        require(status.requestedMode == "balanced" && status.queued && status.generating &&
+            status.progressKnown && status.progressPercent == 7 && !status.failed,
+            "a stale same-mode worker cleared or replaced the retry state");
+
+        auto legacyDirectory = root / L"variant-legacy-request";
+        fs::create_directories(legacyDirectory);
+        require(motion::write_small_file(motion::variant_request_path(legacyDirectory), "balanced"),
+            "a legacy request marker could not be created");
+        auto legacy = motion::read_variant_generation_request(legacyDirectory);
+        require(legacy.mode == "balanced" && legacy.requestId.empty() &&
+            motion::complete_variant_generation(legacyDirectory, legacy),
+            "a pre-token request marker is no longer compatible");
+    }
+
     void video_transcoder_fails_closed_without_backend(fs::path const& root)
     {
         std::wstring error;
@@ -599,30 +1878,153 @@ namespace
             "missing optimization backend did not safely fall back to the source video");
     }
 
+    void media_foundation_candidate_probe_decodes_a_real_first_frame(fs::path const& root)
+    {
+        require(SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_FULL)),
+            "Media Foundation could not start for the decode-probe integration test");
+        struct MediaFoundationShutdown
+        {
+            ~MediaFoundationShutdown() { MFShutdown(); }
+        } shutdown;
+
+        constexpr UINT32 width = 64;
+        constexpr UINT32 height = 64;
+        constexpr UINT32 fps = 30;
+        auto samplePath = root / L"decode-probe-h264.mp4";
+        Microsoft::WRL::ComPtr<IMFSinkWriter> writer;
+        require(SUCCEEDED(MFCreateSinkWriterFromURL(
+            samplePath.c_str(), nullptr, nullptr, &writer)),
+            "the H.264 integration sample writer could not be created");
+
+        Microsoft::WRL::ComPtr<IMFMediaType> outputType;
+        require(SUCCEEDED(MFCreateMediaType(&outputType)) &&
+            SUCCEEDED(outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) &&
+            SUCCEEDED(outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264)) &&
+            SUCCEEDED(outputType->SetUINT32(MF_MT_AVG_BITRATE, 250'000)) &&
+            SUCCEEDED(outputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive)) &&
+            SUCCEEDED(MFSetAttributeSize(outputType.Get(), MF_MT_FRAME_SIZE, width, height)) &&
+            SUCCEEDED(MFSetAttributeRatio(outputType.Get(), MF_MT_FRAME_RATE, fps, 1)) &&
+            SUCCEEDED(MFSetAttributeRatio(outputType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1)),
+            "the H.264 integration output type could not be configured");
+        DWORD stream{};
+        require(SUCCEEDED(writer->AddStream(outputType.Get(), &stream)),
+            "the H.264 integration output stream could not be added");
+
+        Microsoft::WRL::ComPtr<IMFMediaType> inputType;
+        require(SUCCEEDED(MFCreateMediaType(&inputType)) &&
+            SUCCEEDED(inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) &&
+            SUCCEEDED(inputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12)) &&
+            SUCCEEDED(inputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive)) &&
+            SUCCEEDED(MFSetAttributeSize(inputType.Get(), MF_MT_FRAME_SIZE, width, height)) &&
+            SUCCEEDED(MFSetAttributeRatio(inputType.Get(), MF_MT_FRAME_RATE, fps, 1)) &&
+            SUCCEEDED(MFSetAttributeRatio(inputType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1)) &&
+            SUCCEEDED(writer->SetInputMediaType(stream, inputType.Get(), nullptr)) &&
+            SUCCEEDED(writer->BeginWriting()),
+            "the H.264 integration input type could not be configured");
+
+        constexpr DWORD frameBytes = width * height * 3 / 2;
+        constexpr LONGLONG frameDuration = 10'000'000 / fps;
+        for (LONGLONG frame = 0; frame < fps; ++frame) {
+            Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
+            require(SUCCEEDED(MFCreateMemoryBuffer(frameBytes, &buffer)),
+                "the H.264 integration frame buffer could not be allocated");
+            BYTE* bytes{};
+            DWORD capacity{};
+            require(SUCCEEDED(buffer->Lock(&bytes, &capacity, nullptr)) && capacity >= frameBytes,
+                "the H.264 integration frame buffer could not be locked");
+            std::fill_n(bytes, width * height, static_cast<BYTE>(16 + frame % 180));
+            std::fill_n(bytes + width * height, width * height / 2, static_cast<BYTE>(128));
+            buffer->Unlock();
+            require(SUCCEEDED(buffer->SetCurrentLength(frameBytes)),
+                "the H.264 integration frame length could not be set");
+
+            Microsoft::WRL::ComPtr<IMFSample> sample;
+            require(SUCCEEDED(MFCreateSample(&sample)) &&
+                SUCCEEDED(sample->AddBuffer(buffer.Get())) &&
+                SUCCEEDED(sample->SetSampleTime(frame * frameDuration)) &&
+                SUCCEEDED(sample->SetSampleDuration(frameDuration)) &&
+                SUCCEEDED(writer->WriteSample(stream, sample.Get())),
+                "the H.264 integration frame could not be encoded");
+        }
+        require(SUCCEEDED(writer->Finalize()) && fs::is_regular_file(samplePath),
+            "the H.264 integration sample could not be finalized");
+        writer.Reset();
+        require(motion::agent::video_candidate_decodes_first_frame(samplePath),
+            "a valid local H.264 sample failed the real first-frame decode probe");
+
+        auto invalidPath = root / L"decode-probe-invalid.mp4";
+        std::ofstream(invalidPath, std::ios::binary) << "not a compressed video";
+        require(!motion::agent::video_candidate_decodes_first_frame(invalidPath),
+            "an invalid compressed sample passed the first-frame decode probe");
+    }
+
     void video_transcoder_orders_vendor_backends_and_bounds_software_fallback()
     {
         using motion::agent::VideoTranscodeAdapter;
         using motion::agent::VideoTranscodeBackend;
+        using motion::agent::VideoTranscodeCodec;
+        require(motion::agent::video_transcode_backend_codec(
+            VideoTranscodeBackend::nvidiaNvenc, true) == VideoTranscodeCodec::H264 &&
+            motion::agent::video_transcode_backend_codec(
+                VideoTranscodeBackend::nvidiaNvenc, false) == VideoTranscodeCodec::HevcMain10 &&
+            motion::agent::video_transcode_backend_codec(
+                VideoTranscodeBackend::softwareOpenH264, false) == VideoTranscodeCodec::H264,
+            "safe SDR and protected HDR work no longer select distinct output codecs");
+
+        auto unboundedHevc = motion::agent::video_transcode_rate_control(
+            2560, 1440, 60, VideoTranscodeCodec::HevcMain10);
+        auto boundedHevc = motion::agent::video_transcode_rate_control(
+            2560, 1440, 60, VideoTranscodeCodec::HevcMain10,
+            130'000'000, 843'600'000);
+        auto boundedH264 = motion::agent::video_transcode_rate_control(
+            2560, 1440, 60, VideoTranscodeCodec::H264,
+            130'000'000, 843'600'000);
+        require(unboundedHevc.averageKbps == 14'377 &&
+            unboundedHevc.maximumKbps == 21'565 &&
+            unboundedHevc.maximumOutputBytes == 0,
+            "the quality-oriented HEVC rate target changed unexpectedly");
+        require(boundedHevc.averageKbps == 14'377 &&
+            boundedHevc.maximumKbps == 17'822 &&
+            boundedHevc.maximumOutputBytes == 194'000'000,
+            "known source size/duration did not pre-bound HEVC max-rate to the acceptance budget");
+        require(boundedH264.averageKbps == 16'040 &&
+            boundedH264.maximumKbps == 17'822 &&
+            boundedH264.maximumOutputBytes == boundedHevc.maximumOutputBytes &&
+            boundedH264.bufferKbps == boundedH264.averageKbps * 2,
+            "H.264 rate control can still encode a complete oversized file before rejection");
         auto hybrid = motion::agent::video_transcode_backend_order({
-            VideoTranscodeAdapter{ 0x8086, 512ULL * 1024 * 1024 },
-            VideoTranscodeAdapter{ 0x10de, 8ULL * 1024 * 1024 * 1024 }
+            VideoTranscodeAdapter{ 0x8086, 512ULL * 1024 * 1024, 1, 10, 11, true },
+            VideoTranscodeAdapter{ 0x10de, 8ULL * 1024 * 1024 * 1024, 0, 20, 21, true }
         }, 2560, 1440, 120);
-        require(hybrid.size() == 3 &&
-            hybrid[0] == VideoTranscodeBackend::nvidiaCudaNvenc &&
-            hybrid[1] == VideoTranscodeBackend::nvidiaNvenc &&
-            hybrid[2] == VideoTranscodeBackend::intelQsv,
+        require(hybrid.size() == 2 &&
+            hybrid[0].backend == VideoTranscodeBackend::nvidiaNvenc &&
+            hybrid[0].adapter.dxgiAdapterIndex == 0 && hybrid[0].adapter.luidHigh == 20 &&
+            hybrid[1].backend == VideoTranscodeBackend::intelQsv &&
+            hybrid[1].adapter.dxgiAdapterIndex == 1 && hybrid[1].adapter.luidHigh == 10,
             "hybrid GPU transcode order did not prefer the discrete adapter or bounded software work");
 
+        auto dualNvidia = motion::agent::video_transcode_backend_order({
+            VideoTranscodeAdapter{ 0x10de, 4ULL * 1024 * 1024 * 1024, 3, 30, 31, true },
+            VideoTranscodeAdapter{ 0x10de, 12ULL * 1024 * 1024 * 1024, 2, 40, 41, true }
+        }, 3840, 2160, 60);
+        require(dualNvidia.size() == 2 &&
+            dualNvidia[0].adapter.dxgiAdapterIndex == 2 &&
+            dualNvidia[1].adapter.dxgiAdapterIndex == 3 &&
+            dualNvidia[0].adapter.luidLow != dualNvidia[1].adapter.luidLow,
+            "same-vendor GPUs collapsed into one unbound NVENC attempt");
+
         auto amd = motion::agent::video_transcode_backend_order({
-            VideoTranscodeAdapter{ 0x1002, 4ULL * 1024 * 1024 * 1024 }
+            VideoTranscodeAdapter{ 0x1002, 4ULL * 1024 * 1024 * 1024, 4, 50, 51, true }
         }, 2560, 1440, 60);
-        require(amd.size() == 2 && amd[0] == VideoTranscodeBackend::amdAmf &&
-            amd[1] == VideoTranscodeBackend::softwareKvazaar,
-            "AMD hardware encoding did not retain a safe software fallback");
+        require(amd.size() == 2 && amd[0].backend == VideoTranscodeBackend::amdAmf &&
+            amd[0].adapter.dxgiAdapterIndex == 4 &&
+            amd[1].backend == VideoTranscodeBackend::softwareOpenH264,
+            "AMD hardware encoding did not retain a broadly decodable software fallback");
 
         auto cpuOnly = motion::agent::video_transcode_backend_order({}, 1920, 1080, 60);
-        require(cpuOnly.size() == 1 && cpuOnly[0] == VideoTranscodeBackend::softwareKvazaar,
-            "CPU-only systems lost their bounded software encoder fallback");
+        require(cpuOnly.size() == 1 &&
+            cpuOnly[0].backend == VideoTranscodeBackend::softwareOpenH264,
+            "CPU-only systems lost their bounded H.264 software encoder fallback");
         require(motion::agent::video_transcode_backend_order({}, 1920, 1080, 60, true, false).empty(),
             "an HDR or high-bit-depth source was allowed through the 8-bit software encoder");
         require(motion::agent::video_transcode_backend_order({}, 3840, 2160, 60).empty(),
@@ -630,19 +2032,51 @@ namespace
 
         auto cpuPlayback = motion::agent::video_transcode_backend_order(
             {}, 1920, 1080, 60, true, true, true);
-        require(cpuPlayback.size() == 1 && cpuPlayback[0] == VideoTranscodeBackend::softwareOpenH264,
+        require(cpuPlayback.size() == 1 &&
+            cpuPlayback[0].backend == VideoTranscodeBackend::softwareOpenH264,
             "CPU playback copy did not force the broadly decodable H.264 encoder");
         require(motion::agent::video_transcode_backend_order(
             {}, 1920, 1080, 60, true, false, true).empty(),
             "HDR or high-bit-depth video was destructively converted for CPU playback");
 
         auto unknownProbe = motion::agent::video_transcode_backend_order({}, 2560, 1440, 120, false);
-        require(unknownProbe.size() == 4 &&
-            unknownProbe[0] == VideoTranscodeBackend::nvidiaCudaNvenc &&
-            unknownProbe[1] == VideoTranscodeBackend::nvidiaNvenc &&
-            unknownProbe[2] == VideoTranscodeBackend::intelQsv &&
-            unknownProbe[3] == VideoTranscodeBackend::amdAmf,
-            "a failed adapter probe did not preserve hardware encoder discovery by execution");
+        require(unknownProbe.empty(),
+            "a failed LUID probe still guesses an unbound NVENC/QSV/AMF device");
+
+        auto unknownSafeCpu = motion::agent::video_transcode_backend_order(
+            {}, 1920, 1080, 60, false);
+        require(unknownSafeCpu.size() == 1 &&
+            unknownSafeCpu[0].backend == VideoTranscodeBackend::softwareOpenH264,
+            "a failed LUID probe did not conservatively retain the bounded CPU fallback");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream transcoderFile(sourceRoot / L"MotionWallpaper.Agent" / L"VideoTranscoder.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(transcoderFile), "VideoTranscoder source file was not found");
+        std::string transcoder((std::istreambuf_iterator<char>(transcoderFile)), {});
+        require(transcoder.find("L\"-init_hw_device\"") != std::string::npos &&
+            transcoder.find("candidate.adapter.dxgiAdapterIndex") != std::string::npos &&
+            transcoder.find("L\":,child_device=\"") != std::string::npos &&
+            transcoder.find("child_device_type=d3d11va") != std::string::npos &&
+            transcoder.find("current_dxgi_adapter_index(candidate.adapter)") !=
+                std::string::npos &&
+            transcoder.find("if (!adapter.identityKnown) return") != std::string::npos,
+            "hardware candidates no longer bind FFmpeg to their concrete DXGI identity");
+        require(transcoder.find("L\"-hwaccel\"") != std::string::npos &&
+            transcoder.find("L\"-hwaccel_device\", deviceName") != std::string::npos &&
+            transcoder.find("L\"-hwaccel_output_format\"") != std::string::npos &&
+            transcoder.find("L\",hwdownload,format=\" + format") != std::string::npos &&
+            transcoder.find("decodeAttempts = hardwareEncoder ? 2u : 1u") != std::string::npos,
+            "bound hardware decode or its compatibility-decode retry was removed");
+        require(transcoder.find("L\"-threads:v\", L\"4\"") != std::string::npos &&
+            transcoder.find("L\"-filter_threads\", L\"2\"") != std::string::npos,
+            "background software decode/scale parallelism is no longer bounded");
+        require(transcoder.find("FurthestProcessedMicroseconds") != std::string::npos &&
+            transcoder.find("lastPipeActivity") != std::string::npos &&
+            transcoder.find("lastTimelineAdvance") != std::string::npos &&
+            transcoder.find("stopAndConfirm(ERROR_TIMEOUT)") != std::string::npos &&
+            transcoder.find("if (stalled) break") != std::string::npos,
+            "a stalled hardware backend can once again block all fallback candidates forever");
     }
 
     struct FrameSchedulerProbe
@@ -743,8 +2177,27 @@ namespace
             "4K60 video no longer receives the throughput-first adapter policy");
         require(motion::renderer::prefer_high_performance_adapter(3840, 2160, 240'000, 1'001),
             "high-frame-rate 4K video was assigned to the power-saving adapter");
+        require(motion::renderer::prefer_high_performance_adapter(
+            1920, 1080, 30, 1, 2ULL * 3840 * 2160),
+            "multi-display composition pressure did not select the throughput adapter");
         require(!motion::renderer::prefer_high_performance_adapter(0, 2160, 60, 1),
             "invalid media metadata selected the high-performance adapter");
+        require(motion::renderer::prefer_high_performance_adapter(
+            1, 1, 60, 1, (std::numeric_limits<uint64_t>::max)() / 60 + 1),
+            "extreme aggregate display load wrapped around to the low-power adapter policy");
+
+        using motion::renderer::AdapterCandidate;
+        AdapterCandidate discrete{ 0, 2, 8ULL * 1024 * 1024 * 1024 };
+        AdapterCandidate integratedDisplay{ 1, 0, 0 };
+        require(motion::renderer::adapter_candidate_precedes(
+            discrete, integratedDisplay, true, true),
+            "DXGI high-performance order was overridden by a muxless display attachment");
+        require(motion::renderer::adapter_candidate_precedes(
+            integratedDisplay, discrete, false, true),
+            "a light workload unnecessarily selected the discrete GPU");
+        require(motion::renderer::adapter_candidate_precedes(
+            discrete, integratedDisplay, true, false),
+            "legacy DXGI did not use dedicated memory as its vendor-neutral performance fallback");
     }
 
     void renderer_ack_channels_are_isolated()
@@ -781,6 +2234,16 @@ namespace
             !motion::renderer::allows_software_device_fallback(DecodePath::Hardware) &&
             !motion::renderer::allows_software_device_fallback(DecodePath::Software),
             "software-device fallback is no longer restricted to automatic decode");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream rendererFile(sourceRoot / L"MotionWallpaper.Renderer" / L"Renderer.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(rendererFile), "Renderer source file was not found");
+        std::string renderer((std::istreambuf_iterator<char>(rendererFile)), {});
+        require(renderer.find("MF_MEDIA_ENGINE_DXGI_MANAGER") != std::string::npos,
+            "video playback no longer supplies Media Engine with a DXGI device manager");
+        require(renderer.find("MFTEnumEx(") == std::string::npos,
+            "hardware-MFT enumeration was incorrectly reused as a DXVA capability probe");
     }
 
     std::string read_protocol_line(HANDLE pipe, std::chrono::milliseconds timeout)
@@ -1006,6 +2469,223 @@ namespace
         require(!motion::try_load_media(metadata, media), "corrupt media metadata escaped resilient loading");
     }
 
+    void media_library_mutations_revalidate_persistent_identity(fs::path const& root)
+    {
+        auto libraryRoot = fs::absolute(root / L"guarded-media-library");
+        create_owned_library_root(libraryRoot, testLibraryId);
+        auto identity = motion::capture_media_library_trust(libraryRoot);
+        require(identity.has_value(), "guarded media library identity could not be captured");
+        motion::app::MediaLibrary library(root / L"guarded-app-data",
+            motion::app::DeleteMode::Permanent, libraryRoot, *identity);
+        auto group = library.CreateGroup(L"guarded", {});
+        auto sentinel = libraryRoot / L"Groups" / motion::utf8_to_wide(group.id) / L"keep.txt";
+        std::ofstream(sentinel, std::ios::binary) << "replacement data";
+
+        fs::remove(libraryRoot / motion::media_library_ownership_marker_name);
+        std::ofstream(libraryRoot / motion::media_library_ownership_marker_name, std::ios::binary)
+            << motion::media_library_ownership_marker_prefix << replacementLibraryId << '\n';
+        bool deleteRejected{};
+        try { library.DeleteGroup(group); }
+        catch (...) { deleteRejected = true; }
+        require(deleteRejected && fs::is_regular_file(sentinel),
+            "MediaLibrary deleted through a path after its persisted identity changed");
+
+        auto importRoot = fs::absolute(root / L"guarded-import-library");
+        create_owned_library_root(importRoot, testLibraryId);
+        auto importIdentity = motion::capture_media_library_trust(importRoot);
+        require(importIdentity.has_value(), "guarded import identity could not be captured");
+        motion::app::MediaLibrary importLibrary(root / L"guarded-import-data",
+            motion::app::DeleteMode::Permanent, importRoot, *importIdentity);
+        auto importGroup = importLibrary.CreateGroup(L"import", {});
+        auto source = root / L"guarded-import-source.bmp";
+        write_test_bitmap(source);
+        bool identityChanged{};
+        bool importRejected{};
+        fs::path replacementSentinel;
+        try {
+            (void)importLibrary.Import(source, "image", importGroup.id,
+                [&](uint64_t, uint64_t) {
+                    if (identityChanged) return;
+                    auto videos = importRoot / L"Groups" /
+                        motion::utf8_to_wide(importGroup.id) / L"Videos";
+                    for (auto const& entry : fs::directory_iterator(videos)) {
+                        if (!entry.is_directory()) continue;
+                        replacementSentinel = entry.path() / L"replacement-sentinel.txt";
+                        std::ofstream(replacementSentinel, std::ios::binary) << "do not clean by path";
+                        break;
+                    }
+                    fs::remove(importRoot / motion::media_library_ownership_marker_name);
+                    std::ofstream(importRoot / motion::media_library_ownership_marker_name,
+                        std::ios::binary) << motion::media_library_ownership_marker_prefix
+                        << replacementLibraryId << '\n';
+                    identityChanged = true;
+                });
+        } catch (...) {
+            importRejected = true;
+        }
+        require(identityChanged && importRejected && !replacementSentinel.empty() &&
+            fs::is_regular_file(replacementSentinel),
+            "Import published or path-cleaned staging after the external library identity changed");
+    }
+
+    void interrupted_variant_deletion_is_recovered(fs::path const& root)
+    {
+        auto libraryRoot = fs::absolute(root / L"vdr");
+        create_owned_library_root(libraryRoot, testLibraryId);
+        auto identity = motion::capture_media_library_trust(libraryRoot);
+        require(identity.has_value(), "variant recovery library identity could not be captured");
+        motion::app::MediaLibrary library(root / L"vdd",
+            motion::app::DeleteMode::Permanent, libraryRoot, *identity);
+        auto group = library.CreateGroup(L"recovery", {});
+
+        motion::MediaMetadata media;
+        media.id = "aaaaaaaa";
+        media.groupId = group.id;
+        media.name = L"recoverable";
+        media.originalName = L"source.mp4";
+        media.fileName = L"source.mp4";
+        media.kind = "video";
+        media.importedAt = media.updatedAt = motion::timestamp_utc();
+        auto mediaDirectory = libraryRoot / L"Groups" / motion::utf8_to_wide(group.id) /
+            L"Videos" / motion::utf8_to_wide(media.id);
+        auto tombstone = mediaDirectory / L"Variants" /
+            L".deleting-bbbbbbbb";
+        fs::create_directories(tombstone);
+        std::ofstream(mediaDirectory / media.fileName, std::ios::binary) << "source";
+        motion::save_media(mediaDirectory / L"metadata.json", media);
+        auto variantName = L"balanced-60-1280x720-v5.mp4";
+        std::ofstream(tombstone / variantName, std::ios::binary) << "retained variant";
+
+        auto status = library.VariantStatus(media);
+        require(fs::is_regular_file(mediaDirectory / L"Variants" / variantName) &&
+            !fs::exists(tombstone) && status.entries.size() == 1 &&
+            status.entries.front().fileName == variantName,
+            "an interrupted pre-suppression variant deletion remained hidden after recovery");
+
+        auto variants = mediaDirectory / L"Variants";
+        auto duplicateTombstone = variants / L".deleting-cccccccc";
+        fs::create_directory(duplicateTombstone);
+        std::ofstream(duplicateTombstone / variantName, std::ios::binary)
+            << "retained variant";
+        auto duplicateStatus = library.VariantStatus(media);
+        require(!fs::exists(duplicateTombstone) &&
+            fs::is_regular_file(variants / variantName) &&
+            duplicateStatus.entries.size() == 1,
+            "an identical staged duplicate was not safely collapsed during recovery");
+
+        auto conflictTombstone = variants / L".deleting-dddddddd";
+        auto conflictDirectory = variants / L".conflict-dddddddd";
+        fs::create_directory(conflictTombstone);
+        std::ofstream(conflictTombstone / variantName, std::ios::binary)
+            << "different staged variant";
+        auto firstConflictStatus = library.VariantStatus(media);
+        require(firstConflictStatus.entries.empty() && !fs::exists(conflictTombstone) &&
+            fs::is_regular_file(conflictDirectory / variantName),
+            "a differing staged duplicate was not quarantined for manual recovery");
+
+        auto readSmallFile = [](fs::path const& path) {
+            std::ifstream input(path, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(input)), {});
+        };
+        require(readSmallFile(variants / variantName) == "retained variant" &&
+            readSmallFile(conflictDirectory / variantName) == "different staged variant",
+            "variant-conflict recovery overwrote one of the distinct copies");
+        auto secondConflictStatus = library.VariantStatus(media);
+        require(secondConflictStatus.entries.size() == 1 &&
+            fs::is_regular_file(conflictDirectory / variantName),
+            "a quarantined variant conflict was retried or re-reported indefinitely");
+    }
+
+    void interrupted_library_transactions_recover_without_overwrite(
+        fs::path const& root)
+    {
+        auto libraryRoot = fs::absolute(root / L"transaction-recovery-library");
+        create_owned_library_root(libraryRoot, testLibraryId);
+        auto identity = motion::capture_media_library_trust(libraryRoot);
+        require(identity.has_value(), "transaction recovery identity was not captured");
+        motion::app::MediaLibrary setup(root / L"transaction-recovery-data",
+            motion::app::DeleteMode::Permanent, libraryRoot, *identity);
+        auto sourceGroup = setup.CreateGroup(L"source", {});
+        auto targetGroup = setup.CreateGroup(L"target", { sourceGroup });
+
+        motion::MediaMetadata media;
+        media.id = "aaaaaaaa";
+        media.groupId = sourceGroup.id;
+        media.name = media.originalName = L"source.mp4";
+        media.fileName = L"source.mp4";
+        media.kind = "video";
+        media.revision = 1;
+        media.importedAt = media.updatedAt = motion::timestamp_utc();
+        auto source = libraryRoot / L"Groups" /
+            motion::utf8_to_wide(sourceGroup.id) / L"Videos" /
+            motion::utf8_to_wide(media.id);
+        auto targetVideos = libraryRoot / L"Groups" /
+            motion::utf8_to_wide(targetGroup.id) / L"Videos";
+        fs::create_directories(source);
+        fs::create_directories(targetVideos);
+        motion::save_media(source / L"metadata.json", media);
+        std::ofstream(source / media.fileName, std::ios::binary) << "source";
+
+        constexpr wchar_t moveToken[] = L"0123456789abcdef0123";
+        auto moveStage = targetVideos / (std::wstring(L".mw-moving-") + moveToken);
+        auto moveRecord = targetVideos / (std::wstring(L".mw-move-") + moveToken);
+        std::ofstream(moveRecord, std::ios::binary)
+            << "MotionWallpaper.Move/v1\n" << testLibraryId << '\n'
+            << media.id << '\n' << sourceGroup.id << '\n' << targetGroup.id << '\n';
+        fs::rename(source, moveStage);
+        {
+            motion::app::MediaLibrary recovery(root / L"transaction-recovery-data",
+                motion::app::DeleteMode::Permanent, libraryRoot, *identity);
+            (void)recovery.LoadGroups();
+        }
+        auto restored = motion::load_media(source / L"metadata.json");
+        require(restored && restored->groupId == sourceGroup.id &&
+            !fs::exists(moveStage) && !fs::exists(moveRecord),
+            "an interrupted group move was not deterministically rolled back");
+
+        constexpr wchar_t conflictToken[] = L"fedcba9876543210fedc";
+        auto conflictStage = targetVideos /
+            (std::wstring(L".mw-moving-") + conflictToken);
+        auto conflictRecord = targetVideos /
+            (std::wstring(L".mw-move-") + conflictToken);
+        fs::create_directories(conflictStage);
+        motion::save_media(conflictStage / L"metadata.json", media);
+        std::ofstream(conflictRecord, std::ios::binary)
+            << "MotionWallpaper.Move/v1\n" << testLibraryId << '\n'
+            << media.id << '\n' << sourceGroup.id << '\n' << targetGroup.id << '\n';
+        {
+            motion::app::MediaLibrary recovery(root / L"transaction-recovery-data",
+                motion::app::DeleteMode::Permanent, libraryRoot, *identity);
+            (void)recovery.LoadGroups();
+            (void)recovery.LoadGroups();
+        }
+        require(fs::is_directory(source) &&
+            fs::is_directory(targetVideos /
+                (std::wstring(L".mw-move-conflict-") + conflictToken)) &&
+            fs::is_regular_file(targetVideos /
+                (std::wstring(L".mw-move-conflict-") + conflictToken + L".record")) &&
+            !fs::exists(conflictRecord),
+            "a move collision overwrote data or remained in an automatic retry loop");
+
+        constexpr wchar_t deleteToken[] = L"00112233445566778899";
+        auto original = source / L"recover-me.bin";
+        auto deleteStage = source / (std::wstring(L".mw-delete-") + deleteToken);
+        auto deleteRecord = source / (std::wstring(L".mw-restore-") + deleteToken);
+        std::ofstream(original, std::ios::binary) << "recover";
+        std::ofstream(deleteRecord, std::ios::binary)
+            << "MotionWallpaper.Delete/v1\n" << testLibraryId
+            << "\nrecover-me.bin\n";
+        fs::rename(original, deleteStage);
+        {
+            motion::app::MediaLibrary recovery(root / L"transaction-recovery-data",
+                motion::app::DeleteMode::Permanent, libraryRoot, *identity);
+            (void)recovery.LoadGroups();
+        }
+        require(fs::is_regular_file(original) && !fs::exists(deleteStage) &&
+            !fs::exists(deleteRecord),
+            "an interrupted stable-path recycle transaction was not restored");
+    }
+
     void media_library_operations_are_safe(fs::path const& root)
     {
         char const* phase = "initialize";
@@ -1031,6 +2711,16 @@ namespace
             auto mediaId = library.Import(source, "image", first.id);
             auto imported = library.LoadMedia(first.id);
             require(imported.size() == 1 && imported.front().id == mediaId, "media import did not round-trip");
+            require(imported.front().coverFileName.empty(),
+                "an image import exposed the full-resolution source as a UI thumbnail");
+            phase = "lightweight image cover";
+            require(library.EnsureCover(imported.front()),
+                "a bounded image cover could not be generated");
+            imported = library.LoadMedia(first.id);
+            require(imported.size() == 1 && imported.front().coverFileName == L"poster.png" &&
+                imported.front().coverFileName != imported.front().fileName &&
+                fs::is_regular_file(library.MediaDirectory(imported.front()) / L"poster.png"),
+                "the image source was not separated from its lightweight UI cover");
             phase = "concurrent cover and rename";
             fs::copy_file(source, library.MediaDirectory(imported.front()) / L"poster.png",
                 fs::copy_options::overwrite_existing);
@@ -1118,9 +2808,9 @@ namespace
                 "multi-profile deletion damaged the source or left selected copies behind");
             phase = "source-only delete";
             fs::create_directories(mediaDirectory / L"Variants");
-            std::ofstream(mediaDirectory / L"Variants" / L"balanced-60-1280x720-v4.mp4",
+            std::ofstream(mediaDirectory / L"Variants" / L"balanced-60-1280x720-v5.mp4",
                 std::ios::binary) << "balanced-copy";
-            std::ofstream(mediaDirectory / L"Variants" / L"power-saver-60-1280x720-v4.mp4",
+            std::ofstream(mediaDirectory / L"Variants" / L"power-saver-60-1280x720-v5.mp4",
                 std::ios::binary) << "power-copy";
             auto metadata = motion::load_media(mediaDirectory / L"metadata.json");
             require(metadata.has_value(), "source-delete fixture lost its metadata");
@@ -1186,6 +2876,10 @@ namespace
         }
         require(cpp.find("SelectWallpaperForTarget(media.groupId, media.id, selectedDisplayId)") != std::string::npos,
             "wallpaper card selection no longer updates the persisted selection");
+        require(cpp.find("profileContext + L\"，保留选择\"") != std::string::npos &&
+            cpp.find("profileContext + L\"，\" + actionLabel") != std::string::npos &&
+            cpp.find("item.media.name + L\"，源文件，保留选择\"") != std::string::npos,
+            "performance-copy controls no longer expose per-media accessible names");
         require(cpp.find("motion::try_load_runtime(path, runtime)") != std::string::npos,
             "wallpaper UI no longer consumes the Agent's acknowledged runtime selection");
         require(xaml.find("x:Name=\"VariantsPage\"") != std::string::npos &&
@@ -1198,13 +2892,63 @@ namespace
             "page navigation state was duplicated in the implementation file");
         require(agent.find("save_settings(") == std::string::npos,
             "Agent became a second writer of the user settings file");
-        require(agent.find("if (targetReady)") != std::string::npos &&
+        require(agent.find("runtime_selection_can_publish(") != std::string::npos &&
             agent.find("publishRuntime(groupId, mediaId, decode.path, decode.reason)") != std::string::npos,
             "wallpaper runtime state is published before the Renderer ACK");
         require(agent.find("RendererPool") != std::string::npos && agent.find("display_media_targets") != std::string::npos,
             "per-display renderer routing is no longer active");
         require(agent.find("EnumWindows(") != std::string::npos && agent.find("desktop_covered()") != std::string::npos,
             "fullscreen coverage regressed to foreground-window-only detection");
+    }
+
+    void destructive_ui_waits_for_agent_quiescence()
+    {
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream windowFile(sourceRoot / L"MotionWallpaper.App" / L"MainWindow.xaml.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(windowFile), "MainWindow source file was not found");
+        std::string window((std::istreambuf_iterator<char>(windowFile)), {});
+        auto slice = [&](char const* begin, char const* end) {
+            auto first = window.find(begin);
+            auto last = window.find(end, first);
+            require(first != std::string::npos && last != std::string::npos && first < last,
+                "destructive coroutine source boundaries were not found");
+            return window.substr(first, last - first);
+        };
+        auto group = slice("MainWindow::DeleteGroup(", "MainWindow::ImportVideo_Click(");
+        auto variants = slice("MainWindow::DeleteVariantProfiles(", "MainWindow::DeleteSource(");
+        auto source = slice("MainWindow::DeleteSource(", "MainWindow::DeleteMedia_Click(");
+        auto media = slice("MainWindow::DeleteMedia(", "MainWindow::OpenLibrary_Click(");
+        auto move = slice("MainWindow::MoveMedia(", "MainWindow::RandomInterval_Changed(");
+        auto coordinated = [](std::string const& body, char const* destructiveCall) {
+            auto request = body.find("RequestAndWait(std::chrono::seconds(20))");
+            auto destructive = body.find(destructiveCall);
+            auto resume = body.find("ResumeAndWait(std::chrono::seconds(20))");
+            return request != std::string::npos && destructive != std::string::npos &&
+                resume != std::string::npos && request < destructive && destructive < resume;
+        };
+        require(coordinated(group, "library->DeleteGroup(group)") &&
+            coordinated(variants, "library->DeleteVariantProfiles(media, modes)") &&
+            coordinated(source, "library->DeleteSource(media)") &&
+            coordinated(media, "library->Delete(media)") &&
+            coordinated(move, "library->Move(media, targetId)"),
+            "a destructive or path-changing UI flow can mutate before the Agent acknowledges quiescence");
+        require(group.find("activeLibraryMigrationPause = agentPause") != std::string::npos &&
+            group.find("SetLibraryMigrationUi(true)") != std::string::npos &&
+            group.find("if (!deleted)") != std::string::npos &&
+            group.find("settings = std::move(previousSettings)") != std::string::npos,
+            "group deletion does not gate concurrent UI work or roll settings back after failure");
+        require(variants.find("SuppressOptimization(media") == std::string::npos &&
+            window.find("resume_after(std::chrono::milliseconds(1200))") == std::string::npos,
+            "variant deletion still pre-suppresses files or relies on a fixed sleep");
+        auto migrationUi = slice("MainWindow::SetLibraryMigrationUi(", "MainWindow::LoadGroups(");
+        require(migrationUi.find("Content().as<FrameworkElement>().IsHitTestVisible(!migrating)") != std::string::npos &&
+            migrationUi.find("SettingsPage().IsEnabled(!migrating)") != std::string::npos &&
+            migrationUi.find("VariantsPage().IsEnabled(!migrating)") != std::string::npos &&
+            migrationUi.find("WallpaperPage().IsEnabled(!migrating)") != std::string::npos &&
+            migrationUi.find("SettingsNavButton().IsEnabled(!migrating)") != std::string::npos &&
+            migrationUi.find("VariantsNavButton().IsEnabled(!migrating)") != std::string::npos,
+            "an Agent-quiesced operation leaves a settings page or navigation path interactive");
     }
 
     void windows_app_sdk_dependencies_are_release_safe()
@@ -1278,15 +3022,39 @@ namespace
 int wmain(int argc, wchar_t** argv)
 {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    if (argc == 5 && std::wstring_view(argv[1]) == L"--leave-library-migration") {
+        auto identity = motion::capture_media_library_trust(argv[2]);
+        if (!identity) return 70;
+        auto transaction = motion::app::LibraryMigrationTransaction::Begin(
+            argv[2], argv[3], *identity);
+        auto phase = std::wstring_view(argv[4]);
+        if (phase == L"copying") {
+            transaction->CopyAndVerify([](uint64_t copied, uint64_t) {
+                if (copied) ExitProcess(71);
+            });
+            return 72;
+        }
+        transaction->CopyAndVerify();
+        if (phase == L"committed") transaction->CommitPreparedTarget();
+        ExitProcess(71);
+    }
     if (argc == 8 && (std::wstring_view(argv[1]) == L"--transcode-video" ||
+        std::wstring_view(argv[1]) == L"--transcode-main10-video" ||
         std::wstring_view(argv[1]) == L"--transcode-cpu-video")) {
         bool cpuPlayback = std::wstring_view(argv[1]) == L"--transcode-cpu-video";
+        bool main10 = std::wstring_view(argv[1]) == L"--transcode-main10-video";
         std::wstring error;
         auto result = motion::agent::transcode_video(
             argv[2], argv[3], argv[4], static_cast<uint32_t>(_wtoi(argv[5])),
             static_cast<uint32_t>(_wtoi(argv[6])), static_cast<uint32_t>(_wtoi(argv[7])),
             [] { return motion::agent::VideoTranscodeControl::running; }, error,
-            nullptr, true, cpuPlayback);
+            nullptr, !main10, cpuPlayback, 0,
+            [](motion::agent::VideoTranscodeProgress const& value) {
+                std::wcout << L"progress attempt=" << value.attempt << L" backend=" <<
+                    static_cast<uint32_t>(value.backend) << L" percent=" << value.percent <<
+                    L" processed_us=" << value.processedMicroseconds << L" duration_us=" <<
+                    value.durationMicroseconds << L" started=" << value.attemptStarted << L'\n';
+            });
         std::wcout << static_cast<int>(result) << L" " << error << L'\n';
         return result == motion::agent::VideoTranscodeResult::succeeded ? 0 : 3;
     }
@@ -1332,6 +3100,11 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(presentation_state_has_explicit_priorities());
         RUN_TEST(identifiers_are_path_safe());
         RUN_TEST(future_settings_are_rejected(root));
+        RUN_TEST(custom_library_settings_require_owned_safe_roots(root));
+        RUN_TEST(persisted_library_identity_rejects_same_path_replacement(root));
+        RUN_TEST(media_library_trust_detects_runtime_replacement(root));
+        RUN_TEST(agent_settings_fail_closed_until_recovery(root));
+        RUN_TEST(migration_owner_channel_recovers_only_orphaned_requests());
         RUN_TEST(media_activity_suspends_idle_time());
         RUN_TEST(audio_allows_screensaver_but_defers_automatic_lock());
         RUN_TEST(external_media_remains_authoritative_during_own_screensaver());
@@ -1340,6 +3113,12 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(normal_pause_keeps_decoder_hot());
         RUN_TEST(stable_agent_states_do_not_poll_at_twenty_hertz());
         RUN_TEST(battery_power_pauses_optional_variant_generation());
+        RUN_TEST(active_playback_waits_for_selected_performance_copy());
+        RUN_TEST(pending_performance_copy_preserves_the_presented_frame());
+        RUN_TEST(variant_progress_round_trips_and_resets(root));
+        RUN_TEST(variant_retention_honors_runtime_leases(root));
+        RUN_TEST(runtime_variant_cleanup_is_lease_safe_and_atomic());
+        RUN_TEST(first_freeze_keeps_its_compaction_surface());
         RUN_TEST(playback_capability_only_degrades_software_devices());
         RUN_TEST(software_presentation_governor_recovers_without_catchup_bursts());
         RUN_TEST(screensaver_pause_returns_window_to_desktop());
@@ -1348,7 +3127,9 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(identical_media_share_one_renderer());
         RUN_TEST(video_variant_policy_preserves_quality_priority());
         RUN_TEST(variant_requests_use_last_writer_wins(root));
+        RUN_TEST(same_mode_variant_retry_rejects_stale_worker(root));
         RUN_TEST(video_transcoder_fails_closed_without_backend(root));
+        RUN_TEST(media_foundation_candidate_probe_decodes_a_real_first_frame(root));
         RUN_TEST(video_transcoder_orders_vendor_backends_and_bounds_software_fallback());
         RUN_TEST(frame_scheduler_uses_real_interval());
         RUN_TEST(adapter_policy_preserves_heavy_video_throughput());
@@ -1360,8 +3141,13 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(automatic_decode_runtime_round_trips(root));
         RUN_TEST(concurrent_settings_writers_never_publish_torn_json(root));
         RUN_TEST(corrupt_files_preserve_last_known_good(root));
+        RUN_TEST(media_library_mutations_revalidate_persistent_identity(root));
+        RUN_TEST(interrupted_variant_deletion_is_recovered(root));
+        RUN_TEST(interrupted_library_transactions_recover_without_overwrite(root));
         RUN_TEST(media_library_operations_are_safe(root));
+        RUN_TEST(library_migration_is_verified_and_ownership_scoped(root));
         RUN_TEST(xaml_events_are_bound_to_handlers());
+        RUN_TEST(destructive_ui_waits_for_agent_quiescence());
         RUN_TEST(windows_app_sdk_dependencies_are_release_safe());
         RUN_TEST(display_topology_uses_physical_pixels());
         RUN_TEST(mixed_resolution_displays_keep_independent_physical_bounds());

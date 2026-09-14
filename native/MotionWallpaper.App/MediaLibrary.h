@@ -20,7 +20,9 @@ namespace motion::app
     class MediaLibrary
     {
     public:
-        explicit MediaLibrary(std::filesystem::path root, DeleteMode deleteMode = DeleteMode::RecycleBin);
+        explicit MediaLibrary(std::filesystem::path root, DeleteMode deleteMode = DeleteMode::RecycleBin,
+            std::filesystem::path wallpapersPath = {},
+            std::optional<motion::MediaLibraryTrustIdentity> expectedIdentity = std::nullopt);
         void EnsureDirectories() const;
         std::filesystem::path WallpapersPath() const;
         GroupLoadResult LoadGroups();
@@ -42,6 +44,8 @@ namespace motion::app
         void CancelOptimization(motion::MediaMetadata const& media);
         void SuppressOptimization(motion::MediaMetadata const& media, std::string const& mode);
         void DeleteVariantProfile(motion::MediaMetadata const& media, std::string const& mode);
+        void DeleteVariantProfiles(motion::MediaMetadata const& media,
+            std::vector<std::string> const& modes);
         void DeleteVariants(motion::MediaMetadata const& media);
         motion::VariantCacheStatus VariantStatus(motion::MediaMetadata const& media) const;
         bool SourceAvailable(motion::MediaMetadata const& media) const;
@@ -50,10 +54,29 @@ namespace motion::app
         void Delete(motion::MediaMetadata const& media);
         std::filesystem::path MediaDirectory(motion::MediaMetadata const& media) const;
     private:
+        [[nodiscard]] bool LibraryTrusted() const noexcept;
+        [[nodiscard]] bool StableLibraryTrusted() const noexcept;
+        void RequireTrustedLibrary() const;
+        std::filesystem::path const& AccessWallpapersPath() const noexcept;
+        std::filesystem::path ConfiguredAliasPath(
+            std::filesystem::path const& accessPath) const;
+        void RecoverInterruptedRecycleDeletes() const;
+        void RecoverInterruptedMoves() const;
+        void RecoverInterruptedVariantDeletions(
+            std::filesystem::path const& mediaDirectory) const;
         void DeletePath(std::filesystem::path const& path) const;
         std::filesystem::path ResolveMediaDirectory(motion::MediaMetadata const& media) const;
         std::filesystem::path root_;
+        std::filesystem::path wallpapersPath_;
+        std::filesystem::path accessWallpapersPath_;
+        std::optional<motion::MediaLibraryTrustIdentity> expectedIdentity_;
+        // A custom path is never implicitly trusted. Keeping an unavailable
+        // instance is useful for reconnect UI, but every operation stays
+        // fail-closed until a captured identity is supplied.
+        bool identityRequired_{};
         DeleteMode deleteMode_;
+        mutable bool recycleRecoveryComplete_{};
+        mutable bool moveRecoveryComplete_{};
         mutable std::mutex mutex_;
     };
 }

@@ -1,7 +1,7 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Version 17
-VisualStudioVersion = 17.0.31903.59
-MinimumVisualStudioVersion = 10.0.40219.1
+# Visual Studio Version 18
+VisualStudioVersion = 18.9.12112.369
+MinimumVisualStudioVersion = 18.0.0.0
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "MotionWallpaper.App", "MotionWallpaper.App\MotionWallpaper.App.vcxproj", "{9BC9DBA9-F20B-4ED0-88B7-0ECAD5396694}"
 EndProject
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "MotionWallpaper.Agent", "MotionWallpaper.Agent\MotionWallpaper.Agent.vcxproj", "{C6CF6730-26A7-4AD0-AE39-F2946F2635C8}"

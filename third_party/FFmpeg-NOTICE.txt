@@ -7,3 +7,8 @@ FFmpeg source and license information: https://ffmpeg.org/
 
 The accompanying FFmpeg libraries are dynamically linked and distributed
 under GNU LGPL v3. See LICENSE-FFmpeg.txt in this directory.
+
+This pinned FFmpeg build enables the OpenH264 encoder. OpenH264 is distributed
+under its BSD license; see LICENSE-OpenH264.txt in this directory. This is a
+third-party FFmpeg build, not Cisco's official precompiled OpenH264 binary, and
+no Cisco patent-license coverage is asserted for it.

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
 #include <fstream>
 #include <iterator>
@@ -30,6 +31,278 @@ namespace
         return !value.empty() && value.size() <= 512 && std::all_of(value.begin(), value.end(), [](unsigned char character) {
             return character >= 0x20 && character != 0x7f;
         });
+    }
+
+    bool direct_directory_no_reparse(fs::path const& path) noexcept
+    {
+        auto attributes = GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+    }
+
+    bool direct_regular_file_no_reparse(fs::path const& path) noexcept
+    {
+        auto attributes = GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+    }
+
+    struct DirectObject
+    {
+        motion::unique_handle handle;
+        motion::FilesystemObjectIdentity identity;
+    };
+
+    std::optional<DirectObject> open_direct_object(
+        fs::path const& path, bool directory, bool protectIdentity) noexcept
+    {
+        DWORD access = FILE_READ_ATTRIBUTES | (directory ? 0 : GENERIC_READ);
+        DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE |
+            (protectIdentity ? 0 : FILE_SHARE_DELETE);
+        if (protectIdentity && !directory) share = FILE_SHARE_READ;
+        DWORD flags = FILE_FLAG_OPEN_REPARSE_POINT |
+            (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0);
+        motion::unique_handle handle(CreateFileW(path.c_str(), access, share, nullptr,
+            OPEN_EXISTING, flags, nullptr));
+        if (!handle) return std::nullopt;
+
+        BY_HANDLE_FILE_INFORMATION information{};
+        if (!GetFileInformationByHandle(handle.get(), &information) ||
+            (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+            (((information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != directory)) {
+            return std::nullopt;
+        }
+
+        motion::FilesystemObjectIdentity identity{};
+        FILE_ID_INFO fileId{};
+        if (GetFileInformationByHandleEx(handle.get(), FileIdInfo, &fileId, sizeof(fileId))) {
+            identity.volumeSerialNumber = fileId.VolumeSerialNumber;
+            std::copy(std::begin(fileId.FileId.Identifier), std::end(fileId.FileId.Identifier),
+                identity.fileId.begin());
+        } else {
+            identity.volumeSerialNumber = information.dwVolumeSerialNumber;
+            uint64_t fallbackId =
+                (static_cast<uint64_t>(information.nFileIndexHigh) << 32) |
+                information.nFileIndexLow;
+            std::memcpy(identity.fileId.data(), &fallbackId, sizeof(fallbackId));
+        }
+        return DirectObject{ std::move(handle), identity };
+    }
+
+    std::optional<std::string> ownership_id_from_handle(HANDLE marker) noexcept
+    {
+        try {
+            LARGE_INTEGER size{};
+            if (!marker || !GetFileSizeEx(marker, &size) || size.QuadPart <= 0 ||
+                size.QuadPart > 256) return std::nullopt;
+            LARGE_INTEGER beginning{};
+            if (!SetFilePointerEx(marker, beginning, nullptr, FILE_BEGIN)) return std::nullopt;
+            std::string value(static_cast<size_t>(size.QuadPart), '\0');
+            DWORD read{};
+            if (!ReadFile(marker, value.data(), static_cast<DWORD>(value.size()), &read, nullptr) ||
+                read != static_cast<DWORD>(value.size())) return std::nullopt;
+            auto prefixLength = std::char_traits<char>::length(
+                motion::media_library_ownership_marker_prefix);
+            if (value.size() <= prefixLength ||
+                !value.starts_with(motion::media_library_ownership_marker_prefix) ||
+                value.back() != '\n') return std::nullopt;
+            auto id = value.substr(prefixLength, value.size() - prefixLength - 1);
+            if (id.empty() || id.size() > 64 ||
+                !std::all_of(id.begin(), id.end(), [](unsigned char character) {
+                    return (character >= '0' && character <= '9') ||
+                        (character >= 'a' && character <= 'f') || character == '-';
+                })) return std::nullopt;
+            return id;
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    std::optional<fs::path> stable_volume_path_from_handle(HANDLE handle) noexcept
+    {
+        try {
+            std::wstring value(512, L'\0');
+            DWORD length{};
+            for (;;) {
+                length = GetFinalPathNameByHandleW(handle, value.data(),
+                    static_cast<DWORD>(value.size()),
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_GUID);
+                if (!length) return std::nullopt;
+                if (length < value.size()) break;
+                if (length >= 32768) return std::nullopt;
+                value.resize(static_cast<size_t>(length) + 1);
+            }
+            value.resize(length);
+            constexpr std::wstring_view prefix = LR"(\\?\Volume{)";
+            if (value.size() <= prefix.size() ||
+                CompareStringOrdinal(value.data(), static_cast<int>(prefix.size()),
+                    prefix.data(), static_cast<int>(prefix.size()), TRUE) != CSTR_EQUAL ||
+                value.find(L"}\\", prefix.size()) == std::wstring::npos) {
+                // VOLUME_NAME_GUID is intentionally mandatory. UNC/provider
+                // aliases have no non-reassignable volume path and therefore
+                // cannot safely support external-library mutation.
+                return std::nullopt;
+            }
+            fs::path stable(value);
+            return stable.is_absolute() && stable.has_filename()
+                ? std::optional<fs::path>(std::move(stable)) : std::nullopt;
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    bool stable_identity_matches(motion::MediaLibraryTrustIdentity const& identity,
+        bool protectIdentity, std::optional<DirectObject>* rootOutput = nullptr,
+        std::optional<DirectObject>* markerOutput = nullptr,
+        std::optional<DirectObject>* groupsOutput = nullptr) noexcept
+    {
+        try {
+            if (identity.stableRoot.empty()) return false;
+            auto root = open_direct_object(identity.stableRoot, true, protectIdentity);
+            auto marker = open_direct_object(
+                identity.stableRoot / motion::media_library_ownership_marker_name,
+                false, protectIdentity);
+            auto groups = open_direct_object(identity.stableRoot / L"Groups", true,
+                protectIdentity);
+            if (!root || !marker || !groups ||
+                root->identity != identity.rootIdentity ||
+                marker->identity != identity.markerIdentity ||
+                groups->identity != identity.groupsIdentity) return false;
+            auto ownershipId = ownership_id_from_handle(marker->handle.get());
+            if (!ownershipId || *ownershipId != identity.ownershipId) return false;
+            if (rootOutput) *rootOutput = std::move(root);
+            if (markerOutput) *markerOutput = std::move(marker);
+            if (groupsOutput) *groupsOutput = std::move(groups);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool safe_default_library(fs::path const& path) noexcept
+    {
+        try {
+            auto attributes = GetFileAttributesW(path.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES) {
+                auto error = GetLastError();
+                // A missing default is the compatible first-start case. The App
+                // may create it only after the settings document is accepted.
+                return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+            }
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
+
+            std::error_code error;
+            for (fs::recursive_directory_iterator entries(path, fs::directory_options::none, error), end;
+                !error && entries != end; entries.increment(error)) {
+                attributes = GetFileAttributesW(entries->path().c_str());
+                if (attributes == INVALID_FILE_ATTRIBUTES ||
+                    (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                    ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+                        !entries->is_regular_file(error))) return false;
+                if (error) return false;
+            }
+            return !error;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    fs::path canonical_path_identity(fs::path const& value)
+    {
+        if (value.empty()) throw std::invalid_argument("empty filesystem path");
+        std::error_code error;
+        auto normalized = fs::weakly_canonical(value, error);
+        if (error) {
+            error.clear();
+            normalized = fs::absolute(value, error).lexically_normal();
+            if (error) throw std::system_error(error);
+        }
+        if (!normalized.is_absolute()) {
+            normalized = fs::absolute(normalized, error).lexically_normal();
+            if (error || !normalized.is_absolute()) throw std::runtime_error("cannot normalize filesystem path");
+        }
+        return normalized.lexically_normal();
+    }
+
+    bool same_path_component(fs::path const& left, fs::path const& right) noexcept
+    {
+        auto leftText = left.native();
+        auto rightText = right.native();
+        if (leftText.size() > INT_MAX || rightText.size() > INT_MAX) return false;
+        return CompareStringOrdinal(leftText.c_str(), static_cast<int>(leftText.size()),
+            rightText.c_str(), static_cast<int>(rightText.size()), TRUE) == CSTR_EQUAL;
+    }
+
+    constexpr uint32_t migrationOwnerMagic = 0x4D574D4F; // MWMO
+    constexpr uint32_t migrationOwnerVersion = 1;
+
+    struct MigrationOwnerRecord
+    {
+        uint32_t magic{};
+        uint32_t version{};
+        uint32_t processId{};
+        uint32_t reserved{};
+        uint64_t processCreationTime{};
+        uint64_t token{};
+    };
+
+    uint64_t file_time_value(FILETIME const& value) noexcept
+    {
+        ULARGE_INTEGER result{};
+        result.LowPart = value.dwLowDateTime;
+        result.HighPart = value.dwHighDateTime;
+        return result.QuadPart;
+    }
+
+    uint64_t process_creation_time(HANDLE process) noexcept
+    {
+        FILETIME created{}, exited{}, kernel{}, user{};
+        return GetProcessTimes(process, &created, &exited, &kernel, &user)
+            ? file_time_value(created) : 0;
+    }
+
+    class migration_owner_lock final
+    {
+    public:
+        explicit migration_owner_lock(HANDLE mutex) noexcept : mutex_(mutex)
+        {
+            auto result = mutex ? WaitForSingleObject(mutex, 1000) : WAIT_FAILED;
+            owns_ = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
+        }
+        ~migration_owner_lock() { if (owns_) ReleaseMutex(mutex_); }
+        explicit operator bool() const noexcept { return owns_; }
+    private:
+        HANDLE mutex_{};
+        bool owns_{};
+    };
+
+    bool migration_owner_is_live(MigrationOwnerRecord const& owner) noexcept
+    {
+        if (owner.magic != migrationOwnerMagic || owner.version != migrationOwnerVersion ||
+            !owner.processId || !owner.processCreationTime || !owner.token) return false;
+        motion::unique_handle process(OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE, owner.processId));
+        if (!process) {
+            // Access denial is treated conservatively as a live owner. App and
+            // Agent normally run as the same user, so stale owners remain
+            // recoverable without risking another session's active request.
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+        auto creationTime = process_creation_time(process.get());
+        if (!creationTime) return true;
+        if (creationTime != owner.processCreationTime) return false;
+        auto wait = WaitForSingleObject(process.get(), 0);
+        return wait == WAIT_TIMEOUT || wait == WAIT_FAILED;
+    }
+
+    bool same_migration_owner(MigrationOwnerRecord const& owner,
+        DWORD processId, uint64_t creationTime, uint64_t token) noexcept
+    {
+        return owner.magic == migrationOwnerMagic && owner.version == migrationOwnerVersion &&
+            owner.processId == processId && owner.processCreationTime == creationTime &&
+            owner.token == token;
     }
 
     std::wstring read_text(fs::path const& path)
@@ -134,6 +407,85 @@ namespace
 
 namespace motion
 {
+    LibraryMigrationOwnerChannel::LibraryMigrationOwnerChannel(
+        wchar_t const* mutexName, wchar_t const* mappingName) noexcept
+        : mutex_(CreateMutexW(nullptr, FALSE, mutexName)),
+          mapping_(CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+              sizeof(MigrationOwnerRecord), mappingName)),
+          processCreationTime_(process_creation_time(GetCurrentProcess()))
+    {
+        if (mapping_) view_ = MapViewOfFile(mapping_.get(), FILE_MAP_READ | FILE_MAP_WRITE,
+            0, 0, sizeof(MigrationOwnerRecord));
+        LARGE_INTEGER counter{};
+        QueryPerformanceCounter(&counter);
+        token_ = static_cast<uint64_t>(counter.QuadPart) ^ GetTickCount64() ^
+            (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this));
+        if (!token_) token_ = 1;
+    }
+
+    LibraryMigrationOwnerChannel::~LibraryMigrationOwnerChannel()
+    {
+        ReleaseClaim();
+        if (view_) UnmapViewOfFile(view_);
+    }
+
+    LibraryMigrationOwnerChannel::operator bool() const noexcept
+    {
+        return mutex_ && mapping_ && view_ && processCreationTime_ && token_;
+    }
+
+    bool LibraryMigrationOwnerChannel::TryClaimAndReset(
+        HANDLE requested, HANDLE quiesced, HANDLE applied) noexcept
+    {
+        if (!*this || !requested || !quiesced || !applied) return false;
+        migration_owner_lock lock(mutex_.get());
+        if (!lock) return false;
+        auto& owner = *static_cast<MigrationOwnerRecord*>(view_);
+        if (migration_owner_is_live(owner)) return false;
+        if (!ResetEvent(requested) || !ResetEvent(quiesced) || !ResetEvent(applied)) return false;
+        owner = { migrationOwnerMagic, migrationOwnerVersion, GetCurrentProcessId(), 0,
+            processCreationTime_, token_ };
+        MemoryBarrier();
+        return true;
+    }
+
+    bool LibraryMigrationOwnerChannel::ResetRequestForClaim(HANDLE requested) noexcept
+    {
+        if (!*this || !requested) return false;
+        migration_owner_lock lock(mutex_.get());
+        if (!lock) return false;
+        auto const& owner = *static_cast<MigrationOwnerRecord*>(view_);
+        return same_migration_owner(owner, GetCurrentProcessId(), processCreationTime_, token_) &&
+            ResetEvent(requested) != FALSE;
+    }
+
+    void LibraryMigrationOwnerChannel::ReleaseClaim() noexcept
+    {
+        if (!*this) return;
+        migration_owner_lock lock(mutex_.get());
+        if (!lock) return;
+        auto& owner = *static_cast<MigrationOwnerRecord*>(view_);
+        if (same_migration_owner(owner, GetCurrentProcessId(), processCreationTime_, token_)) {
+            owner = {};
+            MemoryBarrier();
+        }
+    }
+
+    bool LibraryMigrationOwnerChannel::ClearOrphanedRequest(
+        HANDLE requested, HANDLE quiesced, HANDLE applied) noexcept
+    {
+        if (!*this || !requested || !quiesced || !applied) return false;
+        migration_owner_lock lock(mutex_.get());
+        if (!lock) return false;
+        auto& owner = *static_cast<MigrationOwnerRecord*>(view_);
+        if (migration_owner_is_live(owner)) return false;
+        if (!ResetEvent(requested) || !ResetEvent(quiesced) || !ResetEvent(applied)) return false;
+        owner = {};
+        MemoryBarrier();
+        return true;
+    }
+
     void append_utf8_log(fs::path const& path, std::wstring_view message) noexcept
     {
         try {
@@ -224,6 +576,14 @@ namespace motion
 
     fs::path select_application_data_directory(fs::path const& applicationRoot, fs::path const& localAppDataRoot)
     {
+        auto legacyRoot = localAppDataRoot / L"MotionWallpaper";
+        // The installer writes this only when its verified legacy-data handoff
+        // did not complete. It must override portable/legacy target discovery so
+        // a partial install-tree copy cannot become authoritative.
+        if (!localAppDataRoot.empty() &&
+            direct_regular_file_no_reparse(applicationRoot / legacy_data_fallback_marker_name) &&
+            direct_directory_no_reparse(legacyRoot)) return legacyRoot;
+
         std::error_code error;
         bool portable = fs::is_regular_file(applicationRoot / L"portable.mode", error);
         error.clear();
@@ -232,6 +592,16 @@ namespace motion
         bool legacyLibrary = fs::is_directory(applicationRoot / L"Wallpapers", error);
         if (portable || legacyConfig || legacyLibrary || localAppDataRoot.empty()) return applicationRoot;
         return localAppDataRoot / L"MotionWallpaper";
+    }
+
+    bool legacy_data_conflict_present(fs::path const& applicationRoot) noexcept
+    {
+        try {
+            return direct_regular_file_no_reparse(
+                applicationRoot / legacy_data_conflict_marker_name);
+        } catch (...) {
+            return false;
+        }
     }
 
     fs::path application_data_directory()
@@ -244,6 +614,48 @@ namespace motion
         if (!length || length >= required) return select_application_data_directory(applicationRoot, {});
         value.resize(length);
         return select_application_data_directory(applicationRoot, fs::path(value));
+    }
+
+    fs::path wallpaper_library_directory(fs::path const& dataRoot, std::wstring const& configuredPath)
+    {
+        if (!configuredPath.empty()) {
+            fs::path configured = fs::path(configuredPath).lexically_normal();
+            if (!configured.is_absolute() || !configured.has_filename()) {
+                throw std::invalid_argument("invalid configured media-library path");
+            }
+            return configured;
+        }
+        auto library = (dataRoot / L"Wallpapers").lexically_normal();
+        if (!library.is_absolute() || !library.has_filename() || !safe_default_library(library)) {
+            throw std::invalid_argument("unsafe default media-library path");
+        }
+        return library;
+    }
+
+    bool same_filesystem_path(fs::path const& left, fs::path const& right)
+    {
+        auto normalizedLeft = canonical_path_identity(left);
+        auto normalizedRight = canonical_path_identity(right);
+        auto leftEntry = normalizedLeft.begin();
+        auto rightEntry = normalizedRight.begin();
+        for (; leftEntry != normalizedLeft.end() && rightEntry != normalizedRight.end();
+            ++leftEntry, ++rightEntry) {
+            if (!same_path_component(*leftEntry, *rightEntry)) return false;
+        }
+        return leftEntry == normalizedLeft.end() && rightEntry == normalizedRight.end();
+    }
+
+    bool filesystem_path_is_nested(fs::path const& parent, fs::path const& child)
+    {
+        auto normalizedParent = canonical_path_identity(parent);
+        auto normalizedChild = canonical_path_identity(child);
+        auto parentEntry = normalizedParent.begin();
+        auto childEntry = normalizedChild.begin();
+        for (; parentEntry != normalizedParent.end() && childEntry != normalizedChild.end();
+            ++parentEntry, ++childEntry) {
+            if (!same_path_component(*parentEntry, *childEntry)) return false;
+        }
+        return parentEntry == normalizedParent.end() && childEntry != normalizedChild.end();
     }
 
     fs::path ffmpeg_executable_path(fs::path const& applicationRoot)
@@ -308,9 +720,199 @@ namespace motion
             value != L"." && value != L"..";
     }
 
-    std::optional<Settings> load_settings(fs::path const& path)
+    MediaLibraryTrustLease::MediaLibraryTrustLease(
+        unique_handle root, unique_handle stableRoot,
+        unique_handle marker, unique_handle groups) noexcept
+        : root_(std::move(root)), stableRoot_(std::move(stableRoot)),
+          marker_(std::move(marker)), groups_(std::move(groups))
     {
-        if (!fs::is_regular_file(path)) return std::nullopt;
+    }
+
+    std::optional<std::string> media_library_ownership_id(fs::path const& libraryRoot) noexcept
+    {
+        try {
+            if (!libraryRoot.is_absolute() || !libraryRoot.has_filename() ||
+                !direct_directory_no_reparse(libraryRoot)) return std::nullopt;
+            auto marker = libraryRoot / media_library_ownership_marker_name;
+            auto markerObject = open_direct_object(marker, false, false);
+            return markerObject ? ownership_id_from_handle(markerObject->handle.get()) : std::nullopt;
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    std::optional<MediaLibraryTrustIdentity> capture_media_library_trust(
+        fs::path const& libraryRoot) noexcept
+    {
+        try {
+            auto root = libraryRoot.lexically_normal();
+            if (!root.is_absolute() || !root.has_filename()) return std::nullopt;
+            auto rootObject = open_direct_object(root, true, false);
+            if (!rootObject) return std::nullopt;
+            auto stableRoot = stable_volume_path_from_handle(rootObject->handle.get());
+            if (!stableRoot) return std::nullopt;
+            auto stableRootObject = open_direct_object(*stableRoot, true, false);
+            if (!stableRootObject || stableRootObject->identity != rootObject->identity) {
+                return std::nullopt;
+            }
+            auto markerObject = open_direct_object(
+                *stableRoot / media_library_ownership_marker_name, false, false);
+            auto groupsObject = open_direct_object(*stableRoot / L"Groups", true, false);
+            if (!markerObject || !groupsObject) return std::nullopt;
+            auto ownershipId = ownership_id_from_handle(markerObject->handle.get());
+            if (!ownershipId) return std::nullopt;
+
+            // Close the first root handle only after every child identity has
+            // been captured, then prove the path still resolves to that root.
+            auto rootAgain = open_direct_object(root, true, false);
+            if (!rootAgain || rootAgain->identity != rootObject->identity) return std::nullopt;
+            auto stableAgain = open_direct_object(*stableRoot, true, false);
+            if (!stableAgain || stableAgain->identity != rootObject->identity) return std::nullopt;
+            return MediaLibraryTrustIdentity{ std::move(root), std::move(*stableRoot),
+                std::move(*ownershipId),
+                rootObject->identity, markerObject->identity, groupsObject->identity };
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    std::shared_ptr<MediaLibraryTrustLease> acquire_media_library_trust(
+        MediaLibraryTrustIdentity const& identity) noexcept
+    {
+        try {
+            if (!identity.root.is_absolute() || !identity.root.has_filename() ||
+                identity.stableRoot.empty()) return {};
+            auto root = open_direct_object(identity.root, true, true);
+            std::optional<DirectObject> stableRoot;
+            std::optional<DirectObject> marker;
+            std::optional<DirectObject> groups;
+            if (!root || root->identity != identity.rootIdentity ||
+                !stable_identity_matches(identity, true, &stableRoot, &marker, &groups) ||
+                !stableRoot || stableRoot->identity != root->identity) return {};
+            return std::shared_ptr<MediaLibraryTrustLease>(new MediaLibraryTrustLease(
+                std::move(root->handle), std::move(stableRoot->handle),
+                std::move(marker->handle), std::move(groups->handle)));
+        } catch (...) {
+            return {};
+        }
+    }
+
+    bool revalidate_media_library_trust(MediaLibraryTrustIdentity const& identity) noexcept
+    {
+        return static_cast<bool>(acquire_media_library_trust(identity));
+    }
+
+    bool revalidate_media_library_stable_root(
+        MediaLibraryTrustIdentity const& identity) noexcept
+    {
+        return stable_identity_matches(identity, false);
+    }
+
+    std::optional<fs::path> media_library_stable_path(
+        MediaLibraryTrustIdentity const& identity,
+        fs::path const& configuredPath) noexcept
+    {
+        try {
+            if (identity.root.empty() || identity.stableRoot.empty() ||
+                !identity.root.is_absolute() || !configuredPath.is_absolute()) {
+                return std::nullopt;
+            }
+            auto root = identity.root.lexically_normal();
+            auto path = configuredPath.lexically_normal();
+            auto rootPart = root.begin();
+            auto pathPart = path.begin();
+            for (; rootPart != root.end(); ++rootPart, ++pathPart) {
+                if (pathPart == path.end()) return std::nullopt;
+                auto left = rootPart->native();
+                auto right = pathPart->native();
+                if (CompareStringOrdinal(left.data(), static_cast<int>(left.size()),
+                        right.data(), static_cast<int>(right.size()), TRUE) !=
+                    CSTR_EQUAL) {
+                    return std::nullopt;
+                }
+            }
+            fs::path relative;
+            for (; pathPart != path.end(); ++pathPart) {
+                if (*pathPart == L"." || *pathPart == L".." ||
+                    pathPart->has_root_name() || pathPart->has_root_directory()) {
+                    return std::nullopt;
+                }
+                relative /= *pathPart;
+            }
+            return relative.empty()
+                ? std::optional<fs::path>(identity.stableRoot)
+                : std::optional<fs::path>(identity.stableRoot / relative);
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    bool same_direct_filesystem_object(
+        fs::path const& left, fs::path const& right) noexcept
+    {
+        try {
+            auto leftAttributes = GetFileAttributesW(left.c_str());
+            auto rightAttributes = GetFileAttributesW(right.c_str());
+            if (leftAttributes == INVALID_FILE_ATTRIBUTES ||
+                rightAttributes == INVALID_FILE_ATTRIBUTES ||
+                (leftAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                (rightAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                return false;
+            }
+            bool leftDirectory =
+                (leftAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            bool rightDirectory =
+                (rightAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (leftDirectory != rightDirectory) return false;
+            auto leftObject = open_direct_object(left, leftDirectory, false);
+            auto rightObject = open_direct_object(right, rightDirectory, false);
+            return leftObject && rightObject &&
+                leftObject->identity == rightObject->identity;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool is_owned_media_library(fs::path const& libraryRoot) noexcept
+    {
+        try {
+            if (!media_library_ownership_id(libraryRoot)) return false;
+            auto groups = libraryRoot / L"Groups";
+            if (!direct_directory_no_reparse(groups)) return false;
+
+            std::error_code error;
+            for (fs::directory_iterator entries(libraryRoot, error), end;
+                !error && entries != end; entries.increment(error)) {
+                auto name = entries->path().filename();
+                if (name == media_library_ownership_marker_name &&
+                    direct_regular_file_no_reparse(entries->path())) continue;
+                if (name == L"Groups" && direct_directory_no_reparse(entries->path())) continue;
+                return false;
+            }
+            if (error) return false;
+
+            for (fs::recursive_directory_iterator entries(groups, fs::directory_options::none, error), end;
+                !error && entries != end; entries.increment(error)) {
+                auto attributes = GetFileAttributesW(entries->path().c_str());
+                if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+                    (!(attributes & FILE_ATTRIBUTE_DIRECTORY) && !entries->is_regular_file(error))) {
+                    return false;
+                }
+                if (error) return false;
+            }
+            return !error;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static std::optional<Settings> load_settings_document(
+        fs::path const& path,
+        bool preserveUnavailableLibrary,
+        bool& libraryUnavailable)
+    {
+        libraryUnavailable = false;
+        if (!direct_regular_file_no_reparse(path)) return std::nullopt;
         auto object = parse_object(path);
         Settings settings;
         auto storedVersion = json_int(object, L"version", 1, 0, settings_schema_version + 1);
@@ -346,6 +948,36 @@ namespace motion
         settings.performanceMode = json_string(object, L"performanceMode");
         if (settings.performanceMode != "balanced" && settings.performanceMode != "original" &&
             settings.performanceMode != "power-saver") settings.performanceMode = "balanced";
+        if (storedVersion >= 9 && object.HasKey(L"mediaLibraryPath")) {
+            auto configured = json_wstring(object, L"mediaLibraryPath");
+            fs::path configuredPath(configured);
+            if (!configured.empty()) {
+                if (!configuredPath.is_absolute() || !configuredPath.has_filename()) return std::nullopt;
+                configuredPath = configuredPath.lexically_normal();
+                if (!configuredPath.is_absolute() || !configuredPath.has_filename()) return std::nullopt;
+                settings.mediaLibraryPath = configuredPath.wstring();
+                // Version 10 binds an external path to the durable ownership ID
+                // stored inside that library.  A v9 external path deliberately
+                // stays unavailable: this unpublished schema must not silently
+                // bless whichever valid-looking library currently occupies the
+                // same drive letter and directory.
+                settings.mediaLibraryId = storedVersion >= 10
+                    ? json_string(object, L"mediaLibraryId") : std::string{};
+                auto identity = valid_id(settings.mediaLibraryId)
+                    ? capture_media_library_trust(configuredPath)
+                    : std::optional<MediaLibraryTrustIdentity>{};
+                if (!identity || identity->ownershipId != settings.mediaLibraryId ||
+                    !is_owned_media_library(identity->root) ||
+                    !revalidate_media_library_trust(*identity)) {
+                    if (!preserveUnavailableLibrary) return std::nullopt;
+                    libraryUnavailable = true;
+                }
+            }
+        }
+        if (storedVersion >= 10 && settings.mediaLibraryPath.empty()) {
+            settings.mediaLibraryId = json_string(object, L"mediaLibraryId");
+            if (!settings.mediaLibraryId.empty()) return std::nullopt;
+        }
         settings.selectedGroupId = json_string(object, L"selectedGroupId");
         settings.selectedMediaId = object.HasKey(L"selectedMediaId")
             ? json_string(object, L"selectedMediaId")
@@ -375,6 +1007,12 @@ namespace motion
         return settings;
     }
 
+    std::optional<Settings> load_settings(fs::path const& path)
+    {
+        bool libraryUnavailable{};
+        return load_settings_document(path, false, libraryUnavailable);
+    }
+
     bool try_load_settings(fs::path const& path, Settings& destination) noexcept
     {
         try {
@@ -384,6 +1022,29 @@ namespace motion
             return true;
         } catch (...) {
             return false;
+        }
+    }
+
+    SettingsFileStatus load_settings_file(fs::path const& path, Settings& destination) noexcept
+    {
+        auto attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            auto error = GetLastError();
+            return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+                ? SettingsFileStatus::missing : SettingsFileStatus::invalid;
+        }
+        if (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) {
+            return SettingsFileStatus::invalid;
+        }
+        try {
+            bool libraryUnavailable{};
+            auto loaded = load_settings_document(path, true, libraryUnavailable);
+            if (!loaded) return SettingsFileStatus::invalid;
+            destination = std::move(*loaded);
+            return libraryUnavailable
+                ? SettingsFileStatus::libraryUnavailable : SettingsFileStatus::valid;
+        } catch (...) {
+            return SettingsFileStatus::invalid;
         }
     }
 
@@ -402,6 +1063,8 @@ namespace motion
         object.Insert(L"displayOffAfterLockDelaySeconds", JsonValue::CreateNumberValue(settings.displayOffAfterLockDelaySeconds));
         object.Insert(L"decodeMode", JsonValue::CreateStringValue(utf8_to_wide(settings.decodeMode)));
         object.Insert(L"performanceMode", JsonValue::CreateStringValue(utf8_to_wide(settings.performanceMode)));
+        object.Insert(L"mediaLibraryPath", JsonValue::CreateStringValue(settings.mediaLibraryPath));
+        object.Insert(L"mediaLibraryId", JsonValue::CreateStringValue(utf8_to_wide(settings.mediaLibraryId)));
         object.Insert(L"selectedGroupId", JsonValue::CreateStringValue(utf8_to_wide(settings.selectedGroupId)));
         object.Insert(L"selectedMediaId", JsonValue::CreateStringValue(utf8_to_wide(settings.selectedMediaId)));
         object.Insert(L"randomGroupId", JsonValue::CreateStringValue(utf8_to_wide(settings.randomGroupId)));

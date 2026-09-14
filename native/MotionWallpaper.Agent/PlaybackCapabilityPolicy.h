@@ -17,11 +17,32 @@ namespace motion::agent
     };
 
     [[nodiscard]] constexpr bool uses_software_playback(
-        std::string_view decodeMode, bool physicalVideoDeviceAvailable) noexcept
+        std::string_view decodeMode, bool physicalVideoDeviceAvailable,
+        bool sourceHardwareDecodeAvailable = true) noexcept
     {
         if (decodeMode == "software") return true;
         if (decodeMode == "hardware") return false;
-        return !physicalVideoDeviceAvailable;
+        return !physicalVideoDeviceAvailable || !sourceHardwareDecodeAvailable;
+    }
+
+    // Static decoder-profile probing is necessary but some drivers still
+    // advertise combinations that fail when Media Foundation starts the real
+    // stream. Only automatic routes with a concrete probed adapter may feed
+    // that runtime failure back into cpu-smooth selection. Explicit hardware
+    // mode remains strict, and failures after playback has started remain
+    // ordinary renderer/device recovery events.
+    [[nodiscard]] constexpr bool automatic_decode_failure_requires_cpu_smooth(
+        std::string_view decodeMode,
+        std::string_view path,
+        std::string_view reason,
+        bool hasProbedAdapter) noexcept
+    {
+        if (decodeMode != "auto" || !hasProbedAdapter) return false;
+        if (path == "software-fallback") return true;
+        if (path != "unavailable") return false;
+        return reason == "automatic-media-startup" ||
+            reason == "automatic-first-frame-timeout" ||
+            reason == "no-d3d11-video-device";
     }
 
     [[nodiscard]] constexpr SoftwarePlaybackProfile software_playback_profile(

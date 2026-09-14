@@ -1,3 +1,8 @@
 #include "resource.h"
 
 IDI_MOTIONWALLPAPER ICON "Assets\\motion-logo.ico"
+
+#define MOTION_FILE_DESCRIPTION "MotionWallpaper settings application"
+#define MOTION_INTERNAL_NAME "MotionWallpaper"
+#define MOTION_ORIGINAL_FILENAME "MotionWallpaper.exe"
+#include "..\\MotionWallpaper.Version.rcinc"
