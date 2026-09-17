@@ -44,6 +44,17 @@ namespace motion::agent
             L"display:" + monitorDevice;
     }
 
+    // A static performance preview and a continuously playing sibling must
+    // never collapse into the same Renderer route. This partition is local to
+    // presentation; the real decoder adapter LUID is still passed separately
+    // when the Renderer process is launched.
+    [[nodiscard]] inline std::wstring renderer_preview_adapter_key(
+        std::wstring adapterKey, bool staticPerformancePreview)
+    {
+        if (staticPerformancePreview) adapterKey += L"\nperformance-preview";
+        return adapterKey;
+    }
+
     [[nodiscard]] inline std::vector<SharedRendererRoute> group_renderer_routes(
         std::vector<RendererRoute> const& routes, bool includeMonitorDevices)
     {

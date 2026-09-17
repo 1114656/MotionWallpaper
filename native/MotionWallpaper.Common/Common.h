@@ -16,6 +16,9 @@ namespace motion
 {
     inline constexpr wchar_t settings_event_name[] = L"Local\\MotionWallpaper.SettingsChanged";
     inline constexpr wchar_t app_exit_event_name[] = L"Local\\MotionWallpaper.ExitRequested";
+    inline constexpr wchar_t toggle_playback_event_name[] = L"Local\\MotionWallpaper.TogglePlaybackRequested";
+    inline constexpr wchar_t next_wallpaper_event_name[] = L"Local\\MotionWallpaper.NextWallpaperRequested";
+    inline constexpr wchar_t screensaver_preview_event_name[] = L"Local\\MotionWallpaper.ScreensaverPreviewRequested";
     inline constexpr wchar_t library_migration_request_event_name[] = L"Local\\MotionWallpaper.LibraryMigrationRequested";
     inline constexpr wchar_t library_migration_quiesced_event_name[] = L"Local\\MotionWallpaper.LibraryMigrationQuiesced";
     inline constexpr wchar_t library_migration_applied_event_name[] = L"Local\\MotionWallpaper.LibraryMigrationApplied";
@@ -25,16 +28,48 @@ namespace motion
     inline constexpr wchar_t legacy_data_conflict_marker_name[] = L"legacy-data-conflict.mode";
     inline constexpr wchar_t media_library_ownership_marker_name[] = L".motionwallpaper-library";
     inline constexpr char media_library_ownership_marker_prefix[] = "MotionWallpaper.Library/v1\n";
-    inline constexpr int settings_schema_version = 10;
-    inline constexpr int runtime_schema_version = 1;
+    inline constexpr int settings_schema_version = 11;
+    inline constexpr int runtime_schema_version = 2;
+    inline constexpr int runtime_control_schema_version = 1;
     inline constexpr int group_schema_version = 1;
-    inline constexpr int media_schema_version = 2;
+    inline constexpr int media_schema_version = 3;
+    inline constexpr uint64_t default_optimization_storage_quota_bytes =
+        10ULL * 1024ULL * 1024ULL * 1024ULL;
+    inline constexpr uint64_t maximum_optimization_storage_quota_bytes =
+        16ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL;
 
     struct DisplayAssignment
     {
         std::string displayId;
         std::string groupId;
         std::string mediaId;
+    };
+
+    struct SceneActivationRule
+    {
+        // manual, time-range, battery, or presentation. Automatic rules are
+        // opt-in so upgrading never changes the active wallpaper unexpectedly.
+        std::string trigger{ "manual" };
+        bool enabled{};
+        int startMinute{};
+        int endMinute{};
+        int priority{};
+    };
+
+    struct SceneProfile
+    {
+        std::string id;
+        std::wstring name;
+        // custom, work, night, battery, or presentation.
+        std::string kind{ "custom" };
+        std::string defaultGroupId;
+        std::string defaultMediaId;
+        std::string performanceMode{ "balanced" };
+        std::string displayMode{ "independent" };
+        bool activePlaybackEnabled{ true };
+        bool screensaverEnabled{ true };
+        std::vector<DisplayAssignment> displayAssignments;
+        SceneActivationRule activation;
     };
 
     struct Settings
@@ -51,6 +86,10 @@ namespace motion
         int displayOffAfterLockDelaySeconds{ 30 };
         std::string decodeMode{ "auto" };
         std::string performanceMode{ "balanced" };
+        // 0 means unlimited. This is a durable preference; trimming is
+        // intentionally performed by the optimization service, not by load.
+        uint64_t optimizationStorageQuotaBytes{
+            default_optimization_storage_quota_bytes };
         std::wstring mediaLibraryPath;
         std::string mediaLibraryId;
         std::string selectedGroupId;
@@ -60,6 +99,8 @@ namespace motion
         bool startWithWindows{};
         std::string displayMode{ "independent" };
         std::vector<DisplayAssignment> displayAssignments;
+        std::string activeSceneId;
+        std::vector<SceneProfile> scenes;
     };
 
     struct GroupMetadata
@@ -72,6 +113,24 @@ namespace motion
         std::wstring updatedAt;
     };
 
+    struct DisplayRuntimeState
+    {
+        std::string displayId;
+        std::wstring deviceName;
+        std::wstring displayName;
+        std::string groupId;
+        std::string mediaId;
+        std::string state;
+        std::string reason;
+        std::string decodePath;
+        std::string decodeReason;
+        uint32_t rendererProcessId{};
+        bool canRetry{};
+        bool canRestartRenderer{};
+
+        bool operator==(DisplayRuntimeState const&) const = default;
+    };
+
     struct RuntimeState
     {
         int version{ runtime_schema_version };
@@ -79,7 +138,23 @@ namespace motion
         std::string activeMediaId;
         std::string decodePath;
         std::string decodeReason;
+        std::string agentInstanceId;
+        uint32_t agentProcessId{};
+        std::vector<DisplayRuntimeState> displayStates;
+        std::string lastCommandId;
+        std::string lastCommandAction;
+        bool lastCommandSucceeded{};
+        std::string lastCommandMessage;
         std::wstring updatedAt;
+    };
+
+    struct RuntimeControlRequest
+    {
+        int version{ runtime_control_schema_version };
+        std::string requestId;
+        std::string action;
+        std::string displayId;
+        std::wstring createdAt;
     };
 
     struct MediaMetadata
@@ -94,12 +169,31 @@ namespace motion
         std::wstring coverFileName;
         std::wstring sha256;
         uint64_t sizeBytes{};
+        bool favorite{};
+        std::vector<std::wstring> tags;
         uint64_t revision{};
         std::wstring importedAt;
         std::wstring updatedAt;
     };
 
     enum class DesktopIntent { Off, Play, Freeze, Pause };
+
+    enum class AgentCommand
+    {
+        TogglePlayback,
+        NextWallpaper,
+        PreviewScreensaver
+    };
+
+    [[nodiscard]] constexpr wchar_t const* agent_command_event_name(AgentCommand command) noexcept
+    {
+        switch (command) {
+        case AgentCommand::TogglePlayback: return toggle_playback_event_name;
+        case AgentCommand::NextWallpaper: return next_wallpaper_event_name;
+        case AgentCommand::PreviewScreensaver: return screensaver_preview_event_name;
+        }
+        return nullptr;
+    }
     enum class SettingsFileStatus { missing, valid, libraryUnavailable, invalid };
 
     struct FilesystemObjectIdentity
@@ -238,6 +332,14 @@ namespace motion
     std::optional<RuntimeState> load_runtime(std::filesystem::path const& path);
     bool try_load_runtime(std::filesystem::path const& path, RuntimeState& destination) noexcept;
     void save_runtime(std::filesystem::path const& path, RuntimeState const& runtime);
+    std::optional<RuntimeControlRequest> load_runtime_control_request(
+        std::filesystem::path const& path);
+    bool try_load_runtime_control_request(std::filesystem::path const& path,
+        RuntimeControlRequest& destination) noexcept;
+    void save_runtime_control_request(std::filesystem::path const& path,
+        RuntimeControlRequest const& request);
+    std::optional<std::string> request_runtime_control(std::filesystem::path const& path,
+        std::string const& action, std::string const& displayId = {}) noexcept;
     std::optional<GroupMetadata> load_group(std::filesystem::path const& path);
     void save_group(std::filesystem::path const& path, GroupMetadata const& group);
     std::optional<MediaMetadata> load_media(std::filesystem::path const& path);
@@ -246,4 +348,5 @@ namespace motion
 
     DesktopIntent desktop_intent(Settings const& settings, bool covered, bool hasMedia);
     bool notify_settings_changed();
+    bool notify_agent_command(AgentCommand command) noexcept;
 }

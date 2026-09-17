@@ -1,11 +1,16 @@
 #include "../MotionWallpaper.Common/Common.h"
 #include "../MotionWallpaper.Common/DisplayTopology.h"
+#include "../MotionWallpaper.Common/SceneProfiles.h"
 #include "../MotionWallpaper.Agent/RandomSelectionPolicy.h"
 #include "../MotionWallpaper.Agent/RuntimePolicy.h"
 #include "../MotionWallpaper.Agent/CoveragePolicy.h"
 #include "../MotionWallpaper.Agent/IdlePolicy.h"
 #include "../MotionWallpaper.Agent/PlaybackCapabilityPolicy.h"
+#include "../MotionWallpaper.Agent/RuntimeEventPolicy.h"
+#include "../MotionWallpaper.Agent/RuntimeStatusPolicy.h"
 #include "../MotionWallpaper.Agent/SharedRendererPolicy.h"
+#include "../MotionWallpaper.Agent/TrayControlPolicy.h"
+#include "../MotionWallpaper.Agent/VideoOptimizer.h"
 #include "../MotionWallpaper.Agent/VideoVariantPolicy.h"
 #include "../MotionWallpaper.Agent/VideoTranscoder.h"
 #include "../MotionWallpaper.Renderer/ResidencyPolicy.h"
@@ -19,6 +24,7 @@
 #include "../MotionWallpaper.Protocol/RendererProtocol.h"
 #include "../MotionWallpaper.App/LibraryMigration.h"
 #include "../MotionWallpaper.App/MediaLibrary.h"
+#include "LibraryBackupTests.h"
 
 #include <winrt/base.h>
 
@@ -186,6 +192,75 @@ namespace
             "legacy wallpaper library was detached from its executable");
     }
 
+    void scene_profiles_and_layout_round_trip(fs::path const& root)
+    {
+        constexpr char groupA[] = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        constexpr char mediaA[] = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        constexpr char mediaB[] = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        motion::Settings settings;
+        settings.selectedGroupId = groupA;
+        settings.selectedMediaId = mediaA;
+        settings.displayMode = "primary";
+        settings.displayAssignments.push_back({ "display-right", groupA, mediaB });
+        motion::ensure_builtin_scene_profiles(settings);
+        require(settings.scenes.size() == 4,
+            "the four built-in scene profiles were not added exactly once");
+
+        auto work = motion::find_scene_profile(settings, std::string(motion::work_scene_id));
+        require(work && motion::capture_scene_profile(settings, *work),
+            "the current wallpaper/layout could not be captured into a scene");
+        settings.selectedMediaId = mediaB;
+        settings.performanceMode = "power-saver";
+        settings.displayMode = "independent";
+        settings.activePlaybackEnabled = false;
+        settings.displayAssignments.clear();
+        require(motion::apply_scene_profile(settings, std::string(motion::work_scene_id)) &&
+            settings.selectedMediaId == mediaA && settings.performanceMode == "balanced" &&
+            settings.displayMode == "primary" && settings.activePlaybackEnabled &&
+            settings.displayAssignments.size() == 1 &&
+            settings.activeSceneId == motion::work_scene_id,
+            "applying a scene was partial or did not restore its display assignments");
+
+        auto night = motion::find_scene_profile(settings, std::string(motion::night_scene_id));
+        auto battery = motion::find_scene_profile(settings, std::string(motion::battery_scene_id));
+        auto presentation = motion::find_scene_profile(
+            settings, std::string(motion::presentation_scene_id));
+        require(night && battery && presentation,
+            "one or more automatic scene presets are missing");
+        night->activation.enabled = true;
+        battery->activation.enabled = true;
+        presentation->activation.enabled = true;
+        require(motion::automatic_scene_for_context(settings, { 21 * 60, true, true }) ==
+                std::optional<std::string>(motion::presentation_scene_id) &&
+            motion::automatic_scene_for_context(settings, { 21 * 60, true, false }) ==
+                std::optional<std::string>(motion::battery_scene_id) &&
+            motion::automatic_scene_for_context(settings, { 21 * 60, false, false }) ==
+                std::optional<std::string>(motion::night_scene_id),
+            "automatic scene priority does not prefer presentation, battery, then time range");
+
+        std::vector<motion::DisplayTarget> displays{
+            { "display-left", L"DISPLAY1", L"Left", { -1920, 0, 0, 1080 }, 60, false },
+            { "display-right", L"DISPLAY2", L"Right", { 0, 0, 2560, 1440 }, 120, true }
+        };
+        auto layout = motion::build_display_layout_model(displays, settings.displayAssignments);
+        require(layout.displays.size() == 2 && layout.virtualBounds.left == -1920 &&
+            layout.virtualBounds.right == 2560 && layout.virtualBounds.bottom == 1440 &&
+            !layout.displays[0].assignment && layout.displays[1].assignment &&
+            layout.displays[1].assignment->mediaId == mediaB,
+            "display layout model lost negative coordinates, primary bounds, or assignment data");
+
+        settings.optimizationStorageQuotaBytes = 5ULL * 1024 * 1024 * 1024;
+        auto path = root / L"scene-settings.json";
+        motion::save_settings(path, settings);
+        auto loaded = motion::load_settings(path);
+        require(loaded && loaded->optimizationStorageQuotaBytes ==
+                settings.optimizationStorageQuotaBytes &&
+            loaded->activeSceneId == motion::work_scene_id &&
+            loaded->scenes.size() == 4 &&
+            motion::find_scene_profile(*loaded, std::string(motion::battery_scene_id)),
+            "scene profiles or optimization quota did not survive settings round-trip");
+    }
+
     void legacy_settings_are_migrated(fs::path const& root)
     {
         auto path = root / L"legacy-settings.json";
@@ -266,6 +341,8 @@ namespace
             "session lock must win over playback");
         require(motion::agent::reduce_runtime_action(settings, { true, false, true, true, 30 }) == RuntimeAction::ScreensaverPlay,
             "screen saver must win over coverage");
+        require(motion::agent::reduce_runtime_action(settings, { true, false, false, true, 0 }) == RuntimeAction::DesktopPlay,
+            "mouse or keyboard activity no longer exits screen saver playback");
         require(motion::agent::reduce_runtime_action(settings, { true, false, false, true, 29 }) == RuntimeAction::DesktopPlay,
             "active desktop should play");
         settings.activePlaybackEnabled = false;
@@ -273,6 +350,74 @@ namespace
             "inactive desktop should freeze");
         require(motion::agent::reduce_runtime_action(settings, { true, false, false, false, 60 }) == RuntimeAction::Stopped,
             "missing media should stop");
+    }
+
+    void tray_controls_preview_and_cycle_without_polling()
+    {
+        motion::agent::TrayControlState controls;
+        require(!controls.ManuallyPaused() && !controls.ScreensaverPreviewActive(),
+            "tray controls did not start in the normal playback state");
+        controls.TogglePlayback();
+        require(controls.ManuallyPaused(), "tray pause command did not pause playback");
+
+        controls.RequestScreensaverPreview(10, 20);
+        require(controls.ScreensaverPreviewActive() && controls.ManuallyPaused(),
+            "screen saver preview did not preserve the user's paused state");
+        require(!controls.ObserveInput(10, 20) && controls.ScreensaverPreviewActive(),
+            "screen saver preview dismissed without a new input event");
+        require(controls.ObserveInput(10, 21) && !controls.ScreensaverPreviewActive(),
+            "a raw input event did not dismiss screen saver preview immediately");
+        require(controls.ManuallyPaused(),
+            "leaving screen saver preview unexpectedly resumed a paused wallpaper");
+        controls.TogglePlayback();
+        require(!controls.ManuallyPaused(), "tray resume command did not resume playback");
+
+        std::vector<std::string> ids{ "c", "a", "b", "b" };
+        require(motion::agent::next_media_id(ids, "a") == "b",
+            "tray next command does not follow a stable media order");
+        require(motion::agent::next_media_id(ids, "c") == "a",
+            "tray next command does not wrap at the end of a group");
+        require(motion::agent::next_media_id(ids, "missing") == "a",
+            "tray next command cannot recover from a missing current item");
+        require(std::wstring_view(motion::agent::tray_status_text(
+            motion::agent::TrayStatus::Screensaver)) == L"屏保运行中",
+            "tray current status does not expose screen saver playback");
+        require(std::wstring_view(motion::agent::tray_status_text(
+                motion::agent::TrayStatus::Failed)) == L"失败" &&
+            motion::agent::tray_status_with_renderer_health(
+                motion::agent::TrayStatus::Applying, true) ==
+                motion::agent::TrayStatus::Failed &&
+            motion::agent::tray_status_with_renderer_health(
+                motion::agent::TrayStatus::Playing, false) ==
+                motion::agent::TrayStatus::Playing,
+            "tray status can hide a failed Renderer behind applying or playing");
+        require(motion::agent::tray_next_wallpaper_should_advance(true, false) &&
+            !motion::agent::tray_next_wallpaper_should_advance(true, true) &&
+            !motion::agent::tray_next_wallpaper_should_advance(false, false),
+            "a next-wallpaper request can be delayed across a manual pause");
+
+        require(std::wstring_view(motion::agent_command_event_name(
+            motion::AgentCommand::TogglePlayback)) == motion::toggle_playback_event_name &&
+            std::wstring_view(motion::agent_command_event_name(
+                motion::AgentCommand::NextWallpaper)) == motion::next_wallpaper_event_name &&
+            std::wstring_view(motion::agent_command_event_name(
+                motion::AgentCommand::PreviewScreensaver)) == motion::screensaver_preview_event_name,
+            "app and tray commands no longer share the Agent event contract");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream agentFile(sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(agentFile), "Agent source file was not found");
+        std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        require(agent.find("RegisterRawInputDevices") != std::string::npos &&
+            agent.find("case WM_INPUT:") != std::string::npos &&
+            agent.find("SetScreensaverInputWakeEnabled(screensaverWasActive)") != std::string::npos,
+            "screen saver still relies only on the bounded idle poll for wake-up");
+        require(agent.find("commandTogglePlayback") != std::string::npos &&
+            agent.find("commandNextWallpaper") != std::string::npos &&
+            agent.find("commandPreviewScreensaver") != std::string::npos &&
+            agent.find("SetTrayStatus(trayStatus") != std::string::npos,
+            "tray menu no longer exposes playback, next, screen saver, and current status controls");
     }
 
     void identifiers_are_path_safe()
@@ -336,10 +481,12 @@ namespace
         {
             std::ifstream input(version9Path, std::ios::binary);
             std::string json((std::istreambuf_iterator<char>(input)), {});
-            auto version = json.find("\"version\":10");
+            auto currentVersion = "\"version\":" +
+                std::to_string(motion::settings_schema_version);
+            auto version = json.find(currentVersion);
             require(version != std::string::npos,
                 "current settings did not serialize the expected schema version");
-            json.replace(version, std::string("\"version\":10").size(), "\"version\":9");
+            json.replace(version, currentVersion.size(), "\"version\":9");
             std::ofstream(version9Path, std::ios::binary | std::ios::trunc) << json;
         }
         motion::Settings version9;
@@ -755,16 +902,55 @@ namespace
     void active_playback_waits_for_selected_performance_copy()
     {
         using motion::agent::active_playback_waits_for_performance_copy;
-        require(active_playback_waits_for_performance_copy("balanced", true, true),
-            "balanced source fallback played while its performance copy was pending");
-        require(active_playback_waits_for_performance_copy("power-saver", true, true),
-            "power-saver source fallback played while its performance copy was pending");
-        require(!active_playback_waits_for_performance_copy("balanced", true, false),
+        require(active_playback_waits_for_performance_copy(true, true),
+            "a required balanced, power-saver, or cpu-smooth source fallback kept playing");
+        require(!active_playback_waits_for_performance_copy(true, false),
             "a completed balanced copy was blocked from active playback");
-        require(!active_playback_waits_for_performance_copy("original", true, true),
+        require(!active_playback_waits_for_performance_copy(false, true),
             "original-quality playback was coupled to a derived copy");
-        require(!active_playback_waits_for_performance_copy("balanced", false, true),
-            "a failed, paused, battery-blocked, or otherwise ineligible copy froze active playback");
+        require(motion::agent::performance_copy_preview_required(
+                motion::agent::RuntimeAction::DesktopPlay, true) &&
+            !motion::agent::performance_copy_preview_required(
+                motion::agent::RuntimeAction::DesktopPlay, false) &&
+            !motion::agent::performance_copy_preview_required(
+                motion::agent::RuntimeAction::ScreensaverPlay, true),
+            "static performance previews are not scoped to required desktop routes");
+
+        using motion::agent::optimization_renderer_is_static;
+        using motion::agent::RuntimeAction;
+        require(!optimization_renderer_is_static(RuntimeAction::DesktopPlay,
+                true, false, false, true, true) &&
+            !optimization_renderer_is_static(RuntimeAction::DesktopPlay,
+                true, true, true, true, false) &&
+            optimization_renderer_is_static(RuntimeAction::DesktopPlay,
+                true, true, true, true, true),
+            "desktop optimization can overlap an unfrozen or retiring source route");
+        require(!optimization_renderer_is_static(RuntimeAction::DesktopFrozen,
+                false, true, false, true, true) &&
+            optimization_renderer_is_static(RuntimeAction::DesktopFrozen,
+                false, true, true, true, true) &&
+            !optimization_renderer_is_static(RuntimeAction::DesktopPaused,
+                false, true, true, true, false) &&
+            optimization_renderer_is_static(RuntimeAction::Stopped,
+                false, true, false, false, true) &&
+            !optimization_renderer_is_static(RuntimeAction::Stopped,
+                false, true, false, true, true),
+            "frozen, paused, or stopped playback bypassed its Renderer quiescence gate");
+        require(motion::agent::source_presentation_may_apply(false, false) &&
+            motion::agent::source_presentation_may_apply(true, true) &&
+            !motion::agent::source_presentation_may_apply(true, false),
+            "a source Renderer can start or resume after optimizer quiescence timed out");
+
+        auto playingAdapter = motion::agent::renderer_preview_adapter_key(L"gpu", false);
+        auto previewAdapter = motion::agent::renderer_preview_adapter_key(L"gpu", true);
+        auto grouped = motion::agent::group_renderer_routes({
+            { L"same-media", L"DISPLAY1", playingAdapter, 1920ULL * 1080 },
+            { L"same-media", L"DISPLAY2", previewAdapter, 1920ULL * 1080 }
+        }, true);
+        require(grouped.size() == 2 && playingAdapter != previewAdapter &&
+            grouped[0].monitorDevices.size() == 1 &&
+            grouped[1].monitorDevices.size() == 1,
+            "a pending display still freezes a same-media sibling Renderer route");
         auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
         std::ifstream optimizerFile(sourceRoot / L"MotionWallpaper.Agent" / L"VideoOptimizer.cpp",
             std::ios::binary);
@@ -774,11 +960,30 @@ namespace
             "performance-copy pending sources were not found");
         std::string optimizer((std::istreambuf_iterator<char>(optimizerFile)), {});
         std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
-        require(optimizer.find("performanceCopyPending = selectedPerformanceMode && eligible") !=
-                std::string::npos &&
-            optimizer.find("generationAllowed_ && !battery") != std::string::npos &&
-            agent.find("resolved.performanceCopyPending") != std::string::npos,
-            "Resolve and Agent no longer propagate real-time copy eligibility into freeze policy");
+        auto quiesce = optimizer.find("bool Quiesce(uint32_t timeoutMilliseconds)");
+        auto worker = optimizer.find("void Run(std::stop_token stop)", quiesce);
+        require(quiesce != std::string::npos && worker != std::string::npos,
+            "optimizer quiescence implementation disappeared");
+        auto quiesceBody = optimizer.substr(quiesce, worker - quiesce);
+        auto disable = quiesceBody.find("generationAllowed_ = false");
+        auto invalidate = quiesceBody.find("generation_.fetch_add");
+        auto clearQueue = quiesceBody.find("pending_.clear()");
+        auto waitIdle = quiesceBody.find("condition_.wait_for");
+        auto activeIdle = quiesceBody.find("return !active_");
+        require(disable != std::string::npos && invalidate != std::string::npos &&
+            clearQueue != std::string::npos && waitIdle != std::string::npos &&
+            activeIdle != std::string::npos &&
+            disable < invalidate && invalidate < clearQueue &&
+            clearQueue < waitIdle && waitIdle < activeIdle &&
+            optimizer.find("condition_.notify_all()", worker) != std::string::npos,
+            "Quiesce can return or admit another job before the active worker becomes idle");
+        require(optimizer.find("performanceCopyRequired") != std::string::npos &&
+            optimizer.find("EnsureAutomaticRequest") != std::string::npos &&
+            agent.find("resolved.performanceCopyRequired") != std::string::npos &&
+            agent.find("optimization_renderer_is_static") != std::string::npos &&
+            agent.find("resolveVideoOutputs(false, true)") !=
+                std::string::npos,
+            "Resolve and Agent no longer separate copy necessity from safe generation eligibility");
         require(!motion::agent::runtime_selection_can_publish(true, true) &&
             motion::agent::runtime_selection_can_publish(true, false) &&
             !motion::agent::runtime_selection_can_publish(false, false),
@@ -952,11 +1157,17 @@ namespace
             physicalSubtract < pruneEnd &&
             optimizer.find("total -= candidate.size", prune) >= pruneEnd,
             "hard-linked variant aliases are double-counted or release cache bytes before the last link is removed");
+        require(optimizer.find("storageQuotaBytes_.load", prune) != std::string::npos &&
+            optimizer.find("variantCacheLimit") == std::string::npos,
+            "optimizer pruning still ignores the configured storage quota or uses a hidden fixed limit");
 
         std::ifstream agentFile(
             sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp", std::ios::binary);
         require(static_cast<bool>(agentFile), "Agent source file was not found");
         std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        require(agent.find("SetStorageQuotaBytes(") != std::string::npos &&
+            agent.find("settings.optimizationStorageQuotaBytes") != std::string::npos,
+            "the Agent does not apply the user's optimization storage quota");
         auto rendererLease = agent.find("playbackLease_ = media.playbackLease");
         auto processExit = agent.find("WaitForSingleObject(process_.get(), 1200)");
         auto leaseRelease = agent.find("playbackLease_.reset()", processExit);
@@ -1037,7 +1248,11 @@ namespace
             stablePrune != std::string::npos && stableTranscode != std::string::npos &&
             stableBoundary < stableRevalidation && stableRevalidation < stableMapping,
             "optimizer mutations can still follow a reused configured drive letter");
-        require(optimizer.find("return { destination, std::move(playbackLease) }") != std::string::npos &&
+        auto configuredPathReturn = optimizer.find(
+            "return { destination, std::move(playbackLease)");
+        auto stablePathReturn = optimizer.find("return { destinationAccess->path");
+        require(configuredPathReturn != std::string::npos && configuredPathReturn < prepare &&
+            stablePathReturn == std::string::npos &&
             optimizer.find("destinationAccess->path.c_str()", publish) != std::string::npos,
             "stable internal publishing leaked a volume-GUID path to Renderer/UI");
         auto transcode = optimizer.find("VideoTranscodeResult Transcode(");
@@ -1414,13 +1629,42 @@ namespace
         std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
         auto branch = agent.find("else if (waitingForPerformanceCopy)");
         require(branch != std::string::npos, "performance-copy wait branch disappeared");
-        auto nextBranch = agent.find("} else {", branch);
-        require(nextBranch != std::string::npos, "performance-copy wait branch is malformed");
-        auto body = agent.substr(branch, nextBranch - branch);
-        require(body.find("renderers.Freeze()") != std::string::npos,
-            "a pending performance copy no longer freezes the last presented frame");
-        require(body.find("renderers.Stop()") == std::string::npos,
-            "a pending performance copy destroys the old Renderer and exposes the system wallpaper");
+        auto freezeBarrier = agent.find("renderers.FreezeDisplays(", branch);
+        auto previewApply = agent.find(
+            "renderers.Apply(Renderer::Target::DesktopPlay", freezeBarrier);
+        auto sourceIdleBarrier = agent.rfind(
+            "sourcePresentationMayApply(", previewApply);
+        auto normalPlaybackBranch = agent.find("switch (state)", previewApply);
+        auto retirementBarrier = agent.find("renderers.RetiringRoutesStopped()", previewApply);
+        auto generationGate = agent.find(
+            "videoOptimizer->SetGenerationAllowed(optimizerMayRun)", retirementBarrier);
+        auto currentCopyQueue = agent.find(
+            "resolveVideoOutputs(false, true)", generationGate);
+        require(freezeBarrier != std::string::npos &&
+            previewApply != std::string::npos &&
+            sourceIdleBarrier != std::string::npos &&
+            normalPlaybackBranch != std::string::npos &&
+            retirementBarrier != std::string::npos &&
+            generationGate != std::string::npos &&
+            currentCopyQueue != std::string::npos &&
+            freezeBarrier < sourceIdleBarrier && sourceIdleBarrier < previewApply &&
+            previewApply < retirementBarrier &&
+            retirementBarrier < generationGate &&
+            generationGate < currentCopyQueue,
+            "selected-copy generation can start before route freeze, preview ACK, or old-route retirement");
+        auto waitBody = agent.substr(branch, normalPlaybackBranch - branch);
+        require(agent.find("performanceCopyPreviewOutputs") != std::string::npos &&
+            agent.find("renderer_preview_adapter_key") != std::string::npos &&
+            waitBody.find("renderers.Apply(Renderer::Target::DesktopFreeze") ==
+                std::string::npos,
+            "performance preview still globally freezes unrelated displays");
+        require(agent.find("media_poster_by_id(") != std::string::npos &&
+            agent.find("poster.playbackLease = videoOptimizer->AcquirePlaybackLease(poster.path)") !=
+                std::string::npos,
+            "the optimization preview no longer prefers a trusted static poster");
+        require(agent.find("cloned_or_projected_display_active()") != std::string::npos &&
+            agent.find("QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS") != std::string::npos,
+            "ordinary extended monitors can still be mistaken for presentation projection");
     }
 
     void playback_capability_only_degrades_software_devices()
@@ -1469,11 +1713,10 @@ namespace
             agent.find("AutoDecodeRouteRejected(") != std::string::npos &&
             agent.find("RememberAutoDecodeFailure(") != std::string::npos,
             "the Agent no longer routes unsupported automatic media to cpu-smooth");
-        auto resolvedPlayback = agent.find(
-            "bool waitingForPerformanceCopy = resolveVideoOutputs()");
+        auto resolvedPlayback = agent.find("resolveVideoOutputs();");
         auto resolvedProbe = agent.find(
             "auto unsupportedRoutes = assignDecodeAdapters(outputs)", resolvedPlayback);
-        auto cpuResolve = agent.find("waitingForPerformanceCopy = resolveVideoOutputs(true)",
+        auto cpuResolve = agent.find("resolveVideoOutputs(true);",
             resolvedProbe);
         require(resolvedPlayback != std::string::npos && resolvedProbe != std::string::npos &&
             cpuResolve != std::string::npos && resolvedPlayback < resolvedProbe &&
@@ -1545,6 +1788,10 @@ namespace
     {
         using motion::renderer::Command;
         using motion::renderer::PresentationMode;
+        require(motion::renderer::presentation_hides_cursor(PresentationMode::Screensaver),
+            "screen saver presentation no longer hides the pointer");
+        require(!motion::renderer::presentation_hides_cursor(PresentationMode::Desktop),
+            "desktop wallpaper presentation unexpectedly hides the pointer");
         require(motion::renderer::leaves_screensaver(PresentationMode::Screensaver, Command::Pause),
             "screen saver pause left its topmost window covering the desktop");
         require(motion::renderer::leaves_screensaver(PresentationMode::Screensaver, Command::DesktopPlay),
@@ -1553,6 +1800,27 @@ namespace
             "continuing screen saver playback unexpectedly requested desktop reparenting");
         require(!motion::renderer::leaves_screensaver(PresentationMode::Desktop, Command::Pause),
             "ordinary desktop pause unexpectedly requested reparenting");
+
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream rendererFile(sourceRoot / L"MotionWallpaper.Renderer" / L"Renderer.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(rendererFile), "Renderer source file was not found");
+        std::string renderer((std::istreambuf_iterator<char>(rendererFile)), {});
+        auto cursorMessage = renderer.find("case WM_SETCURSOR:");
+        auto cursorPolicy = renderer.find("presentation_hides_cursor(presentationMode)", cursorMessage);
+        auto cursorRefresh = renderer.find("void refresh_cursor_if_over_renderer()");
+        auto firstFrameShown = renderer.find("visualShown = true;");
+        auto refreshAfterFirstFrame = renderer.find(
+            "refresh_cursor_if_over_renderer()", firstFrameShown);
+        auto modeChanged = renderer.find("presentationMode = requested;");
+        auto refreshAfterModeChange = renderer.find(
+            "refresh_cursor_if_over_renderer()", modeChanged);
+        require(cursorMessage != std::string::npos && cursorPolicy != std::string::npos &&
+            cursorRefresh != std::string::npos && firstFrameShown != std::string::npos &&
+            refreshAfterFirstFrame != std::string::npos && modeChanged != std::string::npos &&
+            refreshAfterModeChange != std::string::npos &&
+            renderer.find("definition.hCursor = nullptr") != std::string::npos,
+            "screen saver cursor hiding is not enforced on movement, first frame, and mode changes");
     }
 
     void desktop_host_must_cover_the_virtual_screen()
@@ -1956,6 +2224,100 @@ namespace
         std::ofstream(invalidPath, std::ios::binary) << "not a compressed video";
         require(!motion::agent::video_candidate_decodes_first_frame(invalidPath),
             "an invalid compressed sample passed the first-frame decode probe");
+
+        // Exercise the real optimizer with a decodable source. Generation is
+        // globally disabled so this test observes the exact policy boundary:
+        // the selected copy remains required/static, while its durable UI
+        // request is visible and stable without a source+transcode overlap.
+        // Keep this policy fixture below the legacy Win32 path boundary. The
+        // marker writer adds a per-process/thread suffix, and long-path I/O is
+        // unrelated to the optimizer state transitions exercised here.
+        auto optimizerRoot = root / L"optimizer-policy";
+        auto mediaDirectory = optimizerRoot / L"Groups" /
+            L"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" / L"Videos" /
+            L"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        fs::create_directories(mediaDirectory);
+        auto optimizerSource = mediaDirectory / L"source.mp4";
+        require(fs::copy_file(samplePath, optimizerSource,
+                fs::copy_options::overwrite_existing),
+            "the optimizer integration source could not be staged");
+        motion::agent::VideoOptimizer optimizer(optimizerRoot,
+            root / L"optimizer-policy-log", root / L"missing-application");
+        optimizer.SetGenerationAllowed(false);
+
+        auto balanced = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 32, 32, 30, false, true);
+        auto automaticRequest =
+            motion::read_variant_generation_request(mediaDirectory);
+        auto automaticStatus = motion::inspect_variant_cache(mediaDirectory);
+        require(balanced.path == optimizerSource &&
+            balanced.performanceCopyRequired &&
+            !balanced.performanceCopyPending &&
+            automaticRequest.mode == "balanced" &&
+            !automaticRequest.requestId.empty() &&
+            automaticStatus.queued && !automaticStatus.generating,
+            "a blocked selected copy played its source or failed to publish durable progress");
+        auto repeated = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 32, 32, 30, false, true);
+        require(repeated.performanceCopyRequired &&
+            motion::read_variant_generation_request(mediaDirectory) == automaticRequest,
+            "Resolve recreated the automatic request on every policy pass");
+        auto original = optimizer.ResolveWithLease(
+            optimizerSource, "original", 32, 32, 30, false, true);
+        auto cpuSmooth = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 32, 32, 30, true, true);
+        require(!original.performanceCopyRequired &&
+            cpuSmooth.performanceCopyRequired &&
+            !cpuSmooth.performanceCopyPending,
+            "original or cpu-smooth playback lost its distinct copy requirement");
+
+        require(motion::pause_variant_generation(mediaDirectory),
+            "the optimizer's automatic request could not be paused");
+        auto paused = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 32, 32, 30, false, true);
+        require(paused.performanceCopyRequired &&
+            !paused.performanceCopyPending &&
+            motion::read_variant_generation_request(mediaDirectory) == automaticRequest &&
+            motion::variant_generation_paused(mediaDirectory),
+            "Resolve ignored or replaced a paused automatic request");
+        require(motion::resume_variant_generation(mediaDirectory) &&
+            motion::cancel_variant_generation(mediaDirectory),
+            "the automatic request could not be resumed and cancelled");
+        auto cancelled = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 32, 32, 30, false, true);
+        require(cancelled.performanceCopyRequired &&
+            !cancelled.performanceCopyPending &&
+            !motion::read_variant_generation_request(mediaDirectory) &&
+            fs::is_regular_file(motion::variant_cancelled_path(mediaDirectory)),
+            "Resolve recreated a user-cancelled automatic request");
+
+        require(motion::request_variant_generation(mediaDirectory, "balanced"),
+            "the suppression-state integration request could not be created");
+        require(motion::suppress_variant_generation(mediaDirectory, "balanced"),
+            "the integration request could not be suppressed");
+        auto suppressed = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 32, 32, 30, false, true);
+        require(suppressed.performanceCopyRequired &&
+            !motion::read_variant_generation_request(mediaDirectory) &&
+            motion::variant_generation_suppressed(mediaDirectory, "balanced"),
+            "Resolve recreated a suppressed automatic request");
+        motion::unsuppress_variant_generation(mediaDirectory, "balanced");
+        require(motion::request_variant_generation(mediaDirectory, "balanced"),
+            "the failure-state integration request could not be created");
+        auto failedRequest =
+            motion::read_variant_generation_request(mediaDirectory);
+        require(motion::fail_variant_generation(mediaDirectory, failedRequest),
+            "the failure-state integration request could not be failed");
+        auto failed = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 32, 32, 30, false, true);
+        require(failed.performanceCopyRequired &&
+            !failed.performanceCopyPending &&
+            !motion::read_variant_generation_request(mediaDirectory) &&
+            fs::is_regular_file(motion::variant_failed_path(mediaDirectory)),
+            "Resolve recreated a failed automatic request");
+        optimizer.SetGenerationAllowed(true);
+        require(optimizer.Quiesce(100),
+            "an idle optimizer could not acknowledge the source-playback barrier");
     }
 
     void video_transcoder_orders_vendor_backends_and_bounds_software_fallback()
@@ -2304,6 +2666,7 @@ namespace
         motion::unique_handle process;
         motion::unique_handle input;
         motion::unique_handle output;
+        DWORD id{};
 
         void Send(std::string const& value) const
         {
@@ -2316,6 +2679,11 @@ namespace
     RendererProcess launch_hidden_image_renderer(fs::path const& root, std::wstring const& name)
     {
         auto renderer = motion::executable_directory().parent_path() / L"MotionWallpaper.App" / L"motionwallpaper-renderer.exe";
+        if (!fs::is_regular_file(renderer)) {
+            auto nativeRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+            renderer = nativeRoot / L"MotionWallpaper.Renderer" / L"x64" / L"Release" /
+                L"MotionWallpaper.App" / L"motionwallpaper-renderer.exe";
+        }
         require(fs::is_regular_file(renderer), "renderer executable was not built before integration tests");
         auto image = root / name;
         write_test_bitmap(image);
@@ -2329,7 +2697,7 @@ namespace
         SetHandleInformation(inputWrite.get(), HANDLE_FLAG_INHERIT, 0);
         SetHandleInformation(outputRead.get(), HANDLE_FLAG_INHERIT, 0);
 
-        auto command = motion::build_command_line({ renderer.wstring(), L"-hidden", L"-protocol-test", L"-video", image.wstring(),
+        auto command = motion::build_command_line({ renderer.wstring(), L"-hidden", L"-video", image.wstring(),
             L"-kind", L"image", L"-decode", L"auto", L"-display", L"primary" });
         STARTUPINFOW startup{ sizeof(startup) };
         startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
@@ -2343,7 +2711,239 @@ namespace
         motion::unique_handle process(created.hProcess), processThread(created.hThread);
         inputRead.reset();
         outputWrite.reset();
-        return { std::move(process), std::move(inputWrite), std::move(outputRead) };
+        return { std::move(process), std::move(inputWrite), std::move(outputRead), created.dwProcessId };
+    }
+
+    void stop_renderer(RendererProcess& renderer, uint64_t revision)
+    {
+        renderer.Send("stop " + std::to_string(revision) + "\n");
+        auto control = read_typed_ack(renderer.output.get(), std::chrono::seconds(2));
+        require(control.channel == motion::protocol::AckChannel::Control &&
+            control.revision == revision, "renderer did not acknowledge a clean integration-test stop");
+        require(WaitForSingleObject(renderer.process.get(), 3000) == WAIT_OBJECT_0,
+            "renderer integration process did not stop");
+    }
+
+    struct RendererWindowQuery
+    {
+        DWORD processId{};
+        HWND window{};
+    };
+
+    BOOL CALLBACK find_renderer_window(HWND window, LPARAM parameter)
+    {
+        auto query = reinterpret_cast<RendererWindowQuery*>(parameter);
+        DWORD processId{};
+        GetWindowThreadProcessId(window, &processId);
+        if (processId != query->processId) return TRUE;
+        wchar_t className[128]{};
+        if (GetClassNameW(window, className, ARRAYSIZE(className)) &&
+            !_wcsicmp(className, L"MotionWallpaper.Native.Renderer")) {
+            query->window = window;
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    HWND wait_for_renderer_window(DWORD processId, std::chrono::milliseconds timeout)
+    {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        do {
+            RendererWindowQuery query{ processId };
+            EnumWindows(find_renderer_window, reinterpret_cast<LPARAM>(&query));
+            if (query.window) return query.window;
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            Sleep(10);
+        } while (true);
+        return nullptr;
+    }
+
+    motion::protocol::Ack apply_and_wait_for_first_frame(
+        RendererProcess const& renderer, std::string_view target, uint64_t revision)
+    {
+        auto started = std::chrono::steady_clock::now();
+        renderer.Send(std::string(target) + " " + std::to_string(revision) + "\n");
+        auto ack = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
+        auto elapsed = std::chrono::steady_clock::now() - started;
+        require(ack.channel == motion::protocol::AckChannel::Target &&
+            ack.revision == revision && ack.state == "playing",
+            "selected media did not reach a real Renderer first-frame ACK");
+        require(elapsed < std::chrono::seconds(5),
+            "selected media first-frame ACK exceeded the integration-test deadline");
+        return ack;
+    }
+
+    void selected_media_reaches_real_renderer_first_frame(fs::path const& root)
+    {
+        auto renderer = launch_hidden_image_renderer(root, L"selection-first-frame.bmp");
+        (void)apply_and_wait_for_first_frame(renderer, "desktop-play", 101);
+        stop_renderer(renderer, 102);
+    }
+
+    void renderer_crash_recovery_reaches_first_frame_again(fs::path const& root)
+    {
+        auto crashed = launch_hidden_image_renderer(root, L"crash-recovery.bmp");
+        (void)apply_and_wait_for_first_frame(crashed, "desktop-play", 201);
+        auto crashedProcessId = crashed.id;
+        require(TerminateProcess(crashed.process.get(), 0xDEAD) != FALSE,
+            "test-owned Renderer could not be crashed");
+        require(WaitForSingleObject(crashed.process.get(), 3000) == WAIT_OBJECT_0,
+            "crashed Renderer did not terminate");
+        crashed.input.reset();
+        crashed.output.reset();
+
+        auto recovered = launch_hidden_image_renderer(root, L"crash-recovery.bmp");
+        require(recovered.id != crashedProcessId,
+            "Renderer recovery reused the terminated process unexpectedly");
+        (void)apply_and_wait_for_first_frame(recovered, "desktop-play", 202);
+        stop_renderer(recovered, 203);
+    }
+
+    void renderer_display_change_exit_and_relaunch_is_cross_process(fs::path const& root)
+    {
+        auto beforeChange = launch_hidden_image_renderer(root, L"display-change.bmp");
+        (void)apply_and_wait_for_first_frame(beforeChange, "desktop-play", 301);
+        auto window = wait_for_renderer_window(beforeChange.id, std::chrono::seconds(3));
+        require(window != nullptr, "real Renderer window was not discoverable for display-change injection");
+        require(PostMessageW(window, WM_DISPLAYCHANGE, 32, MAKELPARAM(1920, 1080)) != FALSE,
+            "display-change message could not be delivered to the real Renderer");
+        require(WaitForSingleObject(beforeChange.process.get(), 3000) == WAIT_OBJECT_0,
+            "Renderer did not retire its stale display route after WM_DISPLAYCHANGE");
+        beforeChange.input.reset();
+        beforeChange.output.reset();
+
+        auto afterChange = launch_hidden_image_renderer(root, L"display-change.bmp");
+        (void)apply_and_wait_for_first_frame(afterChange, "desktop-play", 302);
+        stop_renderer(afterChange, 303);
+    }
+
+    void real_renderer_enters_screensaver_and_returns_on_wake(fs::path const& root)
+    {
+        auto renderer = launch_hidden_image_renderer(root, L"screensaver-wake.bmp");
+        renderer.Send("pause 400\n");
+        auto desktopReady = read_typed_ack(renderer.output.get(), std::chrono::seconds(2));
+        require(desktopReady.channel == motion::protocol::AckChannel::Target &&
+            desktopReady.revision == 400 && desktopReady.state == "paused",
+            "real Renderer did not establish its desktop state before screen-saver entry");
+        (void)apply_and_wait_for_first_frame(renderer, "screensaver-play", 401);
+
+        // The Agent maps the first raw input event to the desktop pause target;
+        // use the real cross-process target transition after the event-policy
+        // test below has verified that raw input increments the wake revision.
+        renderer.Send("pause 402\n");
+        auto wake = read_typed_ack(renderer.output.get(), std::chrono::seconds(2));
+        require(wake.channel == motion::protocol::AckChannel::Target &&
+            wake.revision == 402 && wake.state == "paused",
+            "screen saver did not acknowledge its immediate wake target");
+        stop_renderer(renderer, 403);
+    }
+
+    struct RuntimeEventMessageProbe
+    {
+        uint32_t taskbarCreated{};
+        uint64_t topologyRevision{};
+        uint64_t inputRevision{};
+        uint32_t shellRestarts{};
+        bool displayOn{};
+        bool rawInputWakeEnabled{};
+
+        static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+        {
+            auto self = reinterpret_cast<RuntimeEventMessageProbe*>(
+                GetWindowLongPtrW(window, GWLP_USERDATA));
+            if (message == WM_NCCREATE) {
+                auto create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+                self = static_cast<RuntimeEventMessageProbe*>(create->lpCreateParams);
+                SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+            }
+            if (!self) return DefWindowProcW(window, message, wParam, lParam);
+            auto effect = motion::agent::runtime_system_event_effect(
+                message, wParam, self->taskbarCreated, self->rawInputWakeEnabled);
+            motion::agent::apply_runtime_system_event_effect(effect,
+                self->topologyRevision, self->inputRevision, self->displayOn);
+            if (effect.shellRestarted) ++self->shellRestarts;
+            if (effect.handled || message == WM_INPUT) return 0;
+            return DefWindowProcW(window, message, wParam, lParam);
+        }
+    };
+
+    void safe_agent_system_event_messages_trigger_recovery()
+    {
+        WNDCLASSW definition{};
+        definition.lpfnWndProc = RuntimeEventMessageProbe::WindowProc;
+        definition.hInstance = GetModuleHandleW(nullptr);
+        definition.lpszClassName = L"MotionWallpaper.Tests.RuntimeEvents";
+        require(RegisterClassW(&definition) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS,
+            "runtime-event simulation window class failed");
+
+        RuntimeEventMessageProbe probe;
+        probe.taskbarCreated = RegisterWindowMessageW(
+            L"MotionWallpaper.Tests.TaskbarCreated.Resilience");
+        require(probe.taskbarCreated != 0, "Explorer-restart simulation message was not registered");
+        HWND window = CreateWindowExW(0, definition.lpszClassName, L"", 0,
+            0, 0, 0, 0, HWND_MESSAGE, nullptr, definition.hInstance, &probe);
+        require(window != nullptr, "runtime-event simulation window failed");
+
+        SendMessageW(window, WM_INPUT, 0, 0);
+        require(probe.inputRevision == 0,
+            "raw input woke a screen saver while event wake was disabled");
+        probe.rawInputWakeEnabled = true;
+        SendMessageW(window, WM_INPUT, 0, 0);
+        require(probe.inputRevision == 1,
+            "enabled raw input did not synchronously advance the wake revision");
+
+        probe.displayOn = false;
+        SendMessageW(window, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
+        require(probe.displayOn && probe.topologyRevision == 1,
+            "automatic sleep resume did not restore display state and invalidate Renderer routes");
+        SendMessageW(window, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0);
+        require(probe.topologyRevision == 2,
+            "interactive sleep resume did not invalidate Renderer routes");
+
+        SendMessageW(window, probe.taskbarCreated, 0, 0);
+        require(probe.topologyRevision == 3 && probe.shellRestarts == 1,
+            "Explorer restart did not recreate the tray/topology generation");
+        SendMessageW(window, WM_DISPLAYCHANGE, 32, MAKELPARAM(2560, 1440));
+        require(probe.topologyRevision == 4,
+            "display hot-plug did not invalidate Renderer routes");
+        DestroyWindow(window);
+    }
+
+    void screensaver_input_wake_is_immediate_in_runtime_state_machine()
+    {
+        motion::Settings settings;
+        settings.screensaverEnabled = true;
+        settings.idleTimeoutSeconds = 30;
+        settings.desktopPlayback = true;
+        settings.activePlaybackEnabled = true;
+        motion::IdleTimer idle;
+        auto screenSaverIdle = idle.Update(std::chrono::seconds(60), 100,
+            std::chrono::seconds(30), false);
+        require(motion::agent::reduce_runtime_action(settings,
+            { true, false, false, true, screenSaverIdle.count() / 1000 }) ==
+                motion::agent::RuntimeAction::ScreensaverPlay,
+            "idle state did not enter the screen saver at its configured boundary");
+
+        motion::agent::TrayControlState preview;
+        preview.RequestScreensaverPreview(100, 0);
+        uint64_t topologyRevision{};
+        uint64_t inputRevision{};
+        bool displayOn = true;
+        auto rawInput = motion::agent::runtime_system_event_effect(
+            WM_INPUT, 0, 0, true);
+        motion::agent::apply_runtime_system_event_effect(rawInput,
+            topologyRevision, inputRevision, displayOn);
+        require(preview.ObserveInput(100, inputRevision) &&
+            !preview.ScreensaverPreviewActive(),
+            "raw input did not end instant screen-saver preview in the same event turn");
+
+        auto activeIdle = idle.Update(std::chrono::seconds(60) +
+            std::chrono::milliseconds(1), 101, std::chrono::milliseconds::zero(), false);
+        require(activeIdle == std::chrono::milliseconds::zero() &&
+            motion::agent::reduce_runtime_action(settings,
+                { true, false, false, true, activeIdle.count() / 1000 }) ==
+                    motion::agent::RuntimeAction::DesktopPlay,
+            "mouse activity did not transition the screen saver directly back to desktop playback");
     }
 
     void renderer_process_uses_typed_acks(fs::path const& root)
@@ -2388,6 +2988,43 @@ namespace
         return motion::unique_handle(created.hProcess);
     }
 
+    void performance_copy_queue_is_observable_across_processes(fs::path const& root)
+    {
+        auto mediaDirectory = root / L"performance-copy-cross-process";
+        fs::create_directories(mediaDirectory);
+        require(motion::request_variant_generation(mediaDirectory, "balanced"),
+            "selected wallpaper could not enqueue a durable performance copy");
+        auto expected = motion::read_variant_generation_request(mediaDirectory);
+        require(expected && !expected.requestId.empty(),
+            "performance-copy queue did not publish an ABA-safe request");
+
+        auto worker = launch_writer_process(L"--run-variant-worker", mediaDirectory);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        motion::VariantCacheStatus status;
+        do {
+            status = motion::inspect_variant_cache(mediaDirectory);
+            if (status.generating && status.progressKnown) break;
+            require(WaitForSingleObject(worker.get(), 0) == WAIT_TIMEOUT,
+                "performance-copy worker exited before publishing progress");
+            Sleep(10);
+        } while (std::chrono::steady_clock::now() < deadline);
+        require(status.queued && status.generating && status.progressKnown &&
+            status.progressPercent == 35 && status.estimatedRemainingKnown &&
+            status.estimatedRemainingSeconds == 4,
+            "another process could not observe honest performance-copy progress and ETA");
+        require(motion::write_small_file(mediaDirectory / L".test-worker-continue", "continue"),
+            "performance-copy test worker could not be released");
+        require(WaitForSingleObject(worker.get(), 5000) == WAIT_OBJECT_0,
+            "performance-copy worker did not complete its queued request");
+        DWORD exitCode{};
+        require(GetExitCodeProcess(worker.get(), &exitCode) && exitCode == 0,
+            "performance-copy worker rejected the durable queue request");
+        status = motion::inspect_variant_cache(mediaDirectory);
+        require(!status.queued && !status.generating &&
+            !fs::exists(motion::variant_progress_path(mediaDirectory)),
+            "completed performance-copy work remained queued or exposed stale progress");
+    }
+
     void settings_and_runtime_have_single_writers(fs::path const& root)
     {
         auto settingsPath = root / L"single-writer" / L"settings.json";
@@ -2428,6 +3065,103 @@ namespace
         require(loaded && loaded->decodePath == "automatic" &&
             loaded->decodeReason == "dxgi-manager-enabled",
             "automatic DXGI decode status did not survive runtime publication");
+    }
+
+    void display_runtime_status_and_control_round_trip(fs::path const& root)
+    {
+        auto runtimePath = root / L"display-runtime" / L"runtime.json";
+        motion::RuntimeState runtime;
+        runtime.activeGroupId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        runtime.activeMediaId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        runtime.decodePath = "software-fallback";
+        runtime.decodeReason = "fallback-no-hardware-decoder";
+        runtime.agentInstanceId = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+        runtime.agentProcessId = 4321;
+        runtime.displayStates = {
+            { "DISPLAY#ONE", L"\\\\.\\DISPLAY1", L"Internal display",
+                runtime.activeGroupId, runtime.activeMediaId, "degraded",
+                "fallback-no-hardware-decoder", "software-fallback",
+                "fallback-no-hardware-decoder", 1234, false, true },
+            { "DISPLAY#TWO", L"\\\\.\\DISPLAY2", L"External display",
+                runtime.activeGroupId, runtime.activeMediaId, "optimizing",
+                "performance-copy-pending", "probing", "detecting", 2345, false, true }
+        };
+        runtime.lastCommandId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        runtime.lastCommandAction = "restart-renderer";
+        runtime.lastCommandSucceeded = true;
+        runtime.lastCommandMessage = "renderer-restart-scheduled";
+        motion::save_runtime(runtimePath, runtime);
+
+        auto loaded = motion::load_runtime(runtimePath);
+        require(loaded && loaded->version == motion::runtime_schema_version &&
+            loaded->displayStates == runtime.displayStates &&
+            loaded->agentInstanceId == runtime.agentInstanceId &&
+            loaded->agentProcessId == runtime.agentProcessId &&
+            loaded->lastCommandId == runtime.lastCommandId &&
+            loaded->lastCommandAction == "restart-renderer" &&
+            loaded->lastCommandSucceeded &&
+            loaded->lastCommandMessage == "renderer-restart-scheduled",
+            "per-display runtime status or Renderer command acknowledgement did not round-trip");
+
+        auto legacyPath = root / L"display-runtime" / L"legacy-runtime.json";
+        std::ofstream(legacyPath, std::ios::binary | std::ios::trunc) <<
+            R"({"version":1,"activeGroupId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","activeMediaId":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","decodePath":"hardware","decodeReason":"","updatedAt":""})";
+        auto legacy = motion::load_runtime(legacyPath);
+        require(legacy && legacy->version == motion::runtime_schema_version &&
+            legacy->displayStates.empty() && legacy->lastCommandId.empty(),
+            "runtime v1 compatibility was lost when per-display status was added");
+
+        auto controlPath = root / L"display-runtime" / L"runtime-command.json";
+        auto requestId = motion::request_runtime_control(
+            controlPath, "retry", "DISPLAY#TWO");
+        auto request = motion::load_runtime_control_request(controlPath);
+        require(requestId && request && request->requestId == *requestId &&
+            request->action == "retry" && request->displayId == "DISPLAY#TWO" &&
+            !request->createdAt.empty(),
+            "a targeted Renderer retry request was not durably published");
+        require(!motion::request_runtime_control(controlPath, "delete-renderer", {}) &&
+            motion::load_runtime_control_request(controlPath)->requestId == *requestId,
+            "an invalid runtime command was accepted or replaced a valid request");
+    }
+
+    void display_runtime_status_has_trustworthy_precedence()
+    {
+        using motion::agent::DisplayRuntimeSignals;
+        using motion::agent::display_runtime_state;
+        require(display_runtime_state({}) == "applying",
+            "a Renderer without a first-frame acknowledgement appeared applied");
+        require(display_runtime_state({ false, false, false, true, false }) == "applied",
+            "an acknowledged Renderer did not appear applied");
+        require(display_runtime_state({ false, false, false, true, true }) == "degraded",
+            "a live compatibility fallback was not surfaced as degraded");
+        require(display_runtime_state({ false, true, false, true, true }) == "optimizing",
+            "selected-media optimization was hidden behind the old playback route");
+        require(display_runtime_state({ false, true, false, false, true }) == "applying",
+            "cold-start optimization appeared active before the first-frame acknowledgement");
+        require(display_runtime_state({ false, false, true, true, false }) == "paused",
+            "an intentional playback pause was not distinguishable from applying");
+        require(display_runtime_state({ false, false, true, false, false }) == "applying",
+            "a pause was published before Renderer acknowledged its target");
+        require(display_runtime_state({ true, true, false, false, false }) == "failed",
+            "a Renderer failure was hidden behind optimization progress");
+        require(motion::agent::desktop_pause_reason(true) == "manual-pause" &&
+            motion::agent::desktop_pause_reason(false) == "desktop-covered",
+            "manual pause is still reported as desktop coverage");
+    }
+
+    void agent_consumes_renderer_recovery_commands()
+    {
+        auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
+        std::ifstream agentFile(sourceRoot / L"MotionWallpaper.Agent" / L"Agent.cpp",
+            std::ios::binary);
+        require(static_cast<bool>(agentFile), "Agent source file was not found");
+        std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
+        require(agent.find("try_load_runtime_control_request(") != std::string::npos &&
+            agent.find("renderers.Retry(controlRequest.displayId)") != std::string::npos &&
+            agent.find("renderers.Restart(controlRequest.displayId)") != std::string::npos &&
+            agent.find("RuntimeStates(displays, outputs") != std::string::npos &&
+            agent.find("lastCommandSucceeded = succeeded") != std::string::npos,
+            "Agent no longer consumes, targets, and acknowledges Renderer recovery commands");
     }
 
     void concurrent_settings_writers_never_publish_torn_json(fs::path const& root)
@@ -2851,6 +3585,150 @@ namespace
         }
     }
 
+    void media_catalog_and_optimization_storage_are_manageable(fs::path const& root)
+    {
+        auto libraryRoot = root / L"catalog-library";
+        motion::app::MediaLibrary library(
+            libraryRoot, motion::app::DeleteMode::Permanent);
+        library.EnsureDirectories();
+        auto beachGroup = library.CreateGroup(L"海滩", {});
+        auto nightGroup = library.CreateGroup(L"夜间", { beachGroup });
+
+        auto createMedia = [&](motion::GroupMetadata const& group,
+            std::wstring name, std::wstring hash, std::string kind = "video") {
+            motion::MediaMetadata media;
+            media.id = motion::new_id();
+            media.groupId = group.id;
+            media.name = std::move(name);
+            media.originalName = media.name + (kind == "video" ? L".mp4" : L".png");
+            media.fileName = kind == "video" ? L"source.mp4" : L"source.png";
+            media.kind = std::move(kind);
+            media.sha256 = std::move(hash);
+            media.sizeBytes = 6;
+            media.revision = 1;
+            media.importedAt = media.updatedAt = motion::timestamp_utc();
+            auto directory = library.MediaDirectory(media);
+            fs::create_directories(directory);
+            std::ofstream(directory / media.fileName, std::ios::binary) << "source";
+            motion::save_media(directory / L"metadata.json", media);
+            return media;
+        };
+
+        constexpr wchar_t sourceSha256[] =
+            L"41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d";
+        auto beach = createMedia(beachGroup, L"夏日海滩", sourceSha256);
+        auto duplicate = createMedia(nightGroup, L"海边副本", sourceSha256);
+        auto city = createMedia(nightGroup, L"城市灯光", L"bbbbbbbb");
+        library.SetFavorite(std::vector<motion::MediaMetadata>{ beach, city }, true);
+        library.AddTags({ beach, duplicate }, { L" 海滩 ", L"夜间", L"海滩" });
+        library.SetTags(city, { L"城市", L"工作" });
+
+        motion::app::MediaQuery query;
+        query.text = L"夏日";
+        query.favoritesOnly = true;
+        auto favoriteNight = library.QueryMedia(query);
+        require(favoriteNight.size() == 1 && favoriteNight.front().media.id == beach.id &&
+            favoriteNight.front().media.tags.size() == 2,
+            "catalog text/favorite search or normalized tag persistence failed");
+        query = {};
+        query.groupId = nightGroup.id;
+        query.tags = { L"海滩" };
+        auto taggedInGroup = library.QueryMedia(query);
+        require(taggedInGroup.size() == 1 && taggedInGroup.front().media.id == duplicate.id,
+            "cross-field catalog filtering ignored its group or tag constraint");
+
+        library.SetFavorite(duplicate, true);
+        library.AddTags({ duplicate }, { L"收藏" });
+        auto duplicates = library.FindDuplicateMedia();
+        require(duplicates.size() == 1 && duplicates.front().items.size() == 2,
+            "identical content across groups was not reported as a repairable duplicate");
+        auto merged = library.MergeDuplicateMedia(beach, duplicate);
+        require(merged.favorite && merged.tags.size() == 3 &&
+            library.QueryMedia().size() == 2 && library.FindDuplicateMedia().empty(),
+            "duplicate repair did not merge user metadata or remove only the duplicate");
+
+        auto refreshed = library.QueryMedia();
+        auto refreshedBeach = std::find_if(refreshed.begin(), refreshed.end(),
+            [&](auto const& item) { return item.media.id == beach.id; });
+        auto refreshedCity = std::find_if(refreshed.begin(), refreshed.end(),
+            [&](auto const& item) { return item.media.id == city.id; });
+        require(refreshedBeach != refreshed.end() && refreshedCity != refreshed.end(),
+            "catalog refresh lost a non-duplicate item");
+        beach = refreshedBeach->media;
+        city = refreshedCity->media;
+
+        auto addVariant = [&](motion::MediaMetadata const& media,
+            std::wstring const& name, size_t bytes) {
+            auto variants = library.MediaDirectory(media) / L"Variants";
+            fs::create_directories(variants);
+            std::ofstream output(variants / name, std::ios::binary);
+            output << std::string(bytes, 'v');
+        };
+        addVariant(beach, L"balanced-test.mp4", 11);
+        addVariant(city, L"power-saver-test.mp4", 9);
+        auto sourceLess = createMedia(nightGroup, L"仅优化版本", L"cccccccc");
+        addVariant(sourceLess, L"balanced-test.mp4", 7);
+        fs::remove(library.MediaDirectory(sourceLess) / sourceLess.fileName);
+
+        auto storage = library.InspectOptimizationStorage();
+        require(storage.bytes == 27 && storage.files == 3 &&
+            storage.reclaimableBytes == 20,
+            "optimization storage summary did not separate safe reclaimable bytes");
+        auto cleanup = library.ReleaseOptimizationStorage({ beach.id });
+        require(cleanup.cleanedMedia == 1 && cleanup.freedBytes == 9 &&
+            cleanup.skippedProtected == 1 && cleanup.skippedSourceLess == 1 &&
+            cleanup.after.bytes == 18 &&
+            fs::is_regular_file(library.MediaDirectory(beach) / L"Variants" /
+                L"balanced-test.mp4") &&
+            fs::is_regular_file(library.MediaDirectory(sourceLess) / L"Variants" /
+                L"balanced-test.mp4"),
+            "one-click optimization cleanup removed protected or source-less playback data");
+
+        auto legacyDirectory = libraryRoot / L"Groups" /
+            motion::utf8_to_wide(nightGroup.id) / L"Videos" /
+            motion::utf8_to_wide(motion::new_id());
+        fs::create_directories(legacyDirectory);
+        auto legacyId = motion::wide_to_utf8(legacyDirectory.filename().wstring());
+        std::ofstream(legacyDirectory / L"source.png", std::ios::binary) << "legacy";
+        std::ofstream(legacyDirectory / L"metadata.json", std::ios::binary)
+            << "{\"version\":2,\"id\":\"" << legacyId
+            << "\",\"groupId\":\"" << nightGroup.id
+            << "\",\"name\":\"legacy\",\"originalName\":\"legacy.png\","
+               "\"fileName\":\"source.png\",\"kind\":\"image\","
+               "\"coverFileName\":\"\",\"sha256\":\"dddddddd\","
+               "\"sizeBytes\":6,\"revision\":1,\"importedAt\":\"\","
+               "\"updatedAt\":\"\"}";
+        auto legacy = motion::load_media(legacyDirectory / L"metadata.json");
+        require(legacy && legacy->version == motion::media_schema_version &&
+            !legacy->favorite && legacy->tags.empty(),
+            "v2 media metadata did not migrate safely to empty catalog fields");
+    }
+
+    void optimization_eta_round_trips(fs::path const& root)
+    {
+        auto mediaDirectory = root / L"optimization-eta";
+        fs::create_directories(mediaDirectory);
+        require(motion::request_variant_generation(mediaDirectory, "balanced"),
+            "ETA fixture request could not be persisted");
+        auto request = motion::read_variant_generation_request(mediaDirectory);
+        require(motion::write_variant_progress_if_current(mediaDirectory, request,
+                motion::VariantProgressState::generating, 40, true, 125, true),
+            "optimization ETA could not be published for the current request");
+        auto status = motion::inspect_variant_cache(mediaDirectory);
+        require(status.generating && status.progressKnown && status.progressPercent == 40 &&
+            status.estimatedRemainingKnown && status.estimatedRemainingSeconds == 125,
+            "optimization ETA was not exposed through the status model");
+        require(motion::pause_variant_generation(mediaDirectory),
+            "ETA fixture could not be paused");
+        status = motion::inspect_variant_cache(mediaDirectory);
+        require(status.paused && !status.estimatedRemainingKnown,
+            "a paused/restartable optimization retained a stale ETA");
+        auto legacy = motion::parse_variant_progress("v2|balanced|" + request.requestId +
+            "|generating|22");
+        require(legacy && legacy->percent == 22 && !legacy->estimatedRemainingKnown,
+            "the ETA progress extension rejected a valid v2 progress record");
+    }
+
     void xaml_events_are_bound_to_handlers()
     {
         auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
@@ -3086,18 +3964,41 @@ int wmain(int argc, wchar_t** argv)
         for (int index = 0; index < 100; ++index) motion::save_runtime(argv[2], runtime);
         return 0;
     }
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--run-variant-worker") {
+        fs::path mediaDirectory = argv[2];
+        auto request = motion::read_variant_generation_request(mediaDirectory);
+        if (!request || !motion::write_variant_progress_if_current(mediaDirectory,
+            request, motion::VariantProgressState::generating, 35, true, 4, true)) return 80;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        std::error_code markerError;
+        while (!fs::is_regular_file(mediaDirectory / L".test-worker-continue", markerError)) {
+            markerError.clear();
+            if (std::chrono::steady_clock::now() >= deadline) return 81;
+            Sleep(10);
+        }
+        if (!motion::write_variant_progress_if_current(mediaDirectory,
+            request, motion::VariantProgressState::generating, 100, true, 0, true)) return 82;
+        return motion::complete_variant_generation(mediaDirectory, request) ? 0 : 83;
+    }
     auto root = fs::temp_directory_path() / (L"MotionWallpaper.Tests." + motion::utf8_to_wide(motion::new_id()));
     char const* currentTest = "startup";
-#define RUN_TEST(expression) do { currentTest = #expression; expression; } while (false)
+#define RUN_TEST(expression) do { \
+        currentTest = #expression; \
+        std::cerr << "[ RUN      ] " << currentTest << std::endl; \
+        expression; \
+        std::cerr << "[       OK ] " << currentTest << std::endl; \
+    } while (false)
     try {
         fs::create_directories(root);
         RUN_TEST(application_data_location_preserves_portable_and_legacy_libraries(root));
         RUN_TEST(settings_round_trip_clears_empty_values(root));
+        RUN_TEST(scene_profiles_and_layout_round_trip(root));
         RUN_TEST(legacy_settings_are_migrated(root));
         RUN_TEST(coupled_lock_and_display_off_settings_are_migrated(root));
         RUN_TEST(unsafe_media_paths_are_rejected(root));
         RUN_TEST(desktop_state_is_deterministic());
         RUN_TEST(presentation_state_has_explicit_priorities());
+        RUN_TEST(tray_controls_preview_and_cycle_without_polling());
         RUN_TEST(identifiers_are_path_safe());
         RUN_TEST(future_settings_are_rejected(root));
         RUN_TEST(custom_library_settings_require_owned_safe_roots(root));
@@ -3117,6 +4018,9 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(pending_performance_copy_preserves_the_presented_frame());
         RUN_TEST(variant_progress_round_trips_and_resets(root));
         RUN_TEST(variant_retention_honors_runtime_leases(root));
+        RUN_TEST(motion::tests::library_backup_restores_verified_snapshot(root, require));
+        RUN_TEST(motion::tests::library_restore_recovers_every_durable_crash_boundary(root, require));
+        RUN_TEST(motion::tests::library_restore_recovers_offline_library_and_corrupt_settings(root, require));
         RUN_TEST(runtime_variant_cleanup_is_lease_safe_and_atomic());
         RUN_TEST(first_freeze_keeps_its_compaction_surface());
         RUN_TEST(playback_capability_only_degrades_software_devices());
@@ -3135,16 +4039,28 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(adapter_policy_preserves_heavy_video_throughput());
         RUN_TEST(renderer_ack_channels_are_isolated());
         RUN_TEST(decode_modes_have_distinct_fallback_contracts());
+        RUN_TEST(selected_media_reaches_real_renderer_first_frame(root));
+        RUN_TEST(renderer_crash_recovery_reaches_first_frame_again(root));
+        RUN_TEST(renderer_display_change_exit_and_relaunch_is_cross_process(root));
+        RUN_TEST(real_renderer_enters_screensaver_and_returns_on_wake(root));
+        RUN_TEST(safe_agent_system_event_messages_trigger_recovery());
+        RUN_TEST(screensaver_input_wake_is_immediate_in_runtime_state_machine());
         RUN_TEST(renderer_process_uses_typed_acks(root));
         RUN_TEST(renderer_exits_when_agent_pipe_closes(root));
+        RUN_TEST(performance_copy_queue_is_observable_across_processes(root));
         RUN_TEST(settings_and_runtime_have_single_writers(root));
         RUN_TEST(automatic_decode_runtime_round_trips(root));
+        RUN_TEST(display_runtime_status_and_control_round_trip(root));
+        RUN_TEST(display_runtime_status_has_trustworthy_precedence());
+        RUN_TEST(agent_consumes_renderer_recovery_commands());
         RUN_TEST(concurrent_settings_writers_never_publish_torn_json(root));
         RUN_TEST(corrupt_files_preserve_last_known_good(root));
         RUN_TEST(media_library_mutations_revalidate_persistent_identity(root));
         RUN_TEST(interrupted_variant_deletion_is_recovered(root));
         RUN_TEST(interrupted_library_transactions_recover_without_overwrite(root));
         RUN_TEST(media_library_operations_are_safe(root));
+        RUN_TEST(media_catalog_and_optimization_storage_are_manageable(root));
+        RUN_TEST(optimization_eta_round_trips(root));
         RUN_TEST(library_migration_is_verified_and_ownership_scoped(root));
         RUN_TEST(xaml_events_are_bound_to_handlers());
         RUN_TEST(destructive_ui_waits_for_agent_quiescence());

@@ -19,7 +19,18 @@ namespace
 
     std::wstring task_context(motion::app::VariantMediaSummary const& item)
     {
-        return item.media.name + L"，" + variant_mode_label(item.status.requestedMode) + L"性能副本";
+        return item.media.name + L"，" + variant_mode_label(item.status.requestedMode) + L"优化版本";
+    }
+
+    std::wstring eta_label(uint64_t seconds)
+    {
+        if (seconds < 60) return L"预计不到 1 分钟";
+        auto minutes = (seconds + 59) / 60;
+        if (minutes < 60) return L"预计约 " + std::to_wstring(minutes) + L" 分钟";
+        auto hours = minutes / 60;
+        auto remainder = minutes % 60;
+        return L"预计约 " + std::to_wstring(hours) + L" 小时" +
+            (remainder ? L" " + std::to_wstring(remainder) + L" 分钟" : L"");
     }
 }
 
@@ -32,11 +43,14 @@ namespace motion::app
             (waitingForPower && !item.status.generating);
         std::wstring stateLabel;
         if (item.status.paused) stateLabel = L"已暂停";
-        else if (item.status.generating) stateLabel = L"正在生成";
+        else if (item.status.generating) stateLabel = L"正在优化";
         else if (taskWaitingForPower) stateLabel = L"等待接通电源";
-        else stateLabel = L"等待生成";
+        else stateLabel = L"等待优化";
         if (item.status.progressKnown) {
             stateLabel += L" · " + std::to_wstring(item.status.progressPercent) + L"%";
+        }
+        if (item.status.generating && item.status.estimatedRemainingKnown) {
+            stateLabel += L" · " + eta_label(item.status.estimatedRemainingSeconds);
         }
 
         auto context = task_context(item);
@@ -61,11 +75,11 @@ namespace motion::app
             // the state that existed when the card was first constructed.
             card.pause.Tag(box_value(item.status.paused));
             Automation::AutomationProperties::SetName(
-                card.pause, hstring(context + L"，" + actionLabel + L"生成"));
+                card.pause, hstring(context + L"，" + actionLabel + L"优化"));
         }
         if (card.cancel) {
             Automation::AutomationProperties::SetName(
-                card.cancel, hstring(context + L"，取消生成"));
+                card.cancel, hstring(context + L"，取消优化"));
         }
     }
 

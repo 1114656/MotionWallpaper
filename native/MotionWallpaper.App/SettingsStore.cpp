@@ -3,7 +3,7 @@
 
 namespace motion::app
 {
-    bool SettingsStore::ApplyStartup(bool enabled) const noexcept
+    bool SettingsStore::ApplyStartupPreference(bool enabled) const noexcept
     {
         constexpr wchar_t key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
         if (!enabled) {
@@ -35,21 +35,21 @@ namespace motion::app
             }
             if (status == motion::SettingsFileStatus::libraryUnavailable) {
                 if (mediaLibraryAvailable) *mediaLibraryAvailable = false;
-                ApplyStartup(settings.startWithWindows);
+                ApplyStartupPreference(settings.startWithWindows);
                 return settings;
             }
         }
         // Create the first-run document or canonicalize a schema version that
         // this binary successfully parsed and migrated in memory.
         motion::save_settings(path_, settings);
-        ApplyStartup(settings.startWithWindows);
+        ApplyStartupPreference(settings.startWithWindows);
         return settings;
     }
 
     bool SettingsStore::Save(motion::Settings const& settings) const
     {
         motion::save_settings(path_, settings);
-        ApplyStartup(settings.startWithWindows);
+        ApplyStartupPreference(settings.startWithWindows);
         return motion::notify_settings_changed();
     }
 }

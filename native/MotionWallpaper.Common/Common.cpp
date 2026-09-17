@@ -1,4 +1,5 @@
 #include "Common.h"
+#include "SceneProfiles.h"
 #include "TextEncoding.h"
 #include "UniqueHandle.h"
 
@@ -26,11 +27,58 @@ using namespace Windows::Data::Json;
 
 namespace
 {
+    constexpr size_t maximumMediaTags = 32;
+    constexpr size_t maximumMediaTagCharacters = 64;
+
     bool safe_display_id(std::string const& value)
     {
         return !value.empty() && value.size() <= 512 && std::all_of(value.begin(), value.end(), [](unsigned char character) {
             return character >= 0x20 && character != 0x7f;
         });
+    }
+
+    bool safe_runtime_text(std::string const& value, size_t maximum = 2048) noexcept
+    {
+        return value.size() <= maximum &&
+            std::all_of(value.begin(), value.end(), [](unsigned char character) {
+                return character >= 0x20 && character != 0x7f;
+            });
+    }
+
+    bool safe_runtime_text(std::wstring const& value, size_t maximum = 512) noexcept
+    {
+        return value.size() <= maximum &&
+            std::all_of(value.begin(), value.end(), [](wchar_t character) {
+                return character >= 0x20 && character != 0x7f;
+            });
+    }
+
+    bool valid_decode_path(std::string const& value) noexcept
+    {
+        return value.empty() || value == "probing" || value == "automatic" ||
+            value == "hardware" || value == "software" ||
+            value == "software-fallback" || value == "unavailable" ||
+            value == "not-applicable";
+    }
+
+    bool valid_runtime_display_state(std::string const& value) noexcept
+    {
+        return value == "applying" || value == "applied" || value == "paused" ||
+            value == "optimizing" || value == "degraded" || value == "failed";
+    }
+
+    bool valid_runtime_control_action(std::string const& value) noexcept
+    {
+        return value == "retry" || value == "restart-renderer";
+    }
+
+    bool safe_media_tag(std::wstring_view value) noexcept
+    {
+        return !value.empty() && value.size() <= maximumMediaTagCharacters &&
+            std::all_of(value.begin(), value.end(), [](wchar_t character) {
+                return character >= 0x20 && character != 0x7f &&
+                    character != L'|' && character != L'\r' && character != L'\n';
+            });
     }
 
     bool direct_directory_no_reparse(fs::path const& path) noexcept
@@ -948,6 +996,11 @@ namespace motion
         settings.performanceMode = json_string(object, L"performanceMode");
         if (settings.performanceMode != "balanced" && settings.performanceMode != "original" &&
             settings.performanceMode != "power-saver") settings.performanceMode = "balanced";
+        if (storedVersion >= 11 && object.HasKey(L"optimizationStorageQuotaBytes")) {
+            settings.optimizationStorageQuotaBytes = (std::min)(
+                json_uint64(object, L"optimizationStorageQuotaBytes"),
+                maximum_optimization_storage_quota_bytes);
+        }
         if (storedVersion >= 9 && object.HasKey(L"mediaLibraryPath")) {
             auto configured = json_wstring(object, L"mediaLibraryPath");
             fs::path configuredPath(configured);
@@ -1003,6 +1056,73 @@ namespace motion
                     [&](auto const& existing) { return existing.displayId == assignment.displayId; });
                 if (duplicate == settings.displayAssignments.end()) settings.displayAssignments.push_back(std::move(assignment));
             }
+        }
+        if (storedVersion >= 11 && object.HasKey(L"scenes")) {
+            auto values = object.GetNamedArray(L"scenes");
+            for (auto const& value : values) {
+                if (settings.scenes.size() >= 64) break;
+                if (value.ValueType() != JsonValueType::Object) continue;
+                auto sceneObject = value.GetObject();
+                SceneProfile scene;
+                scene.id = json_string(sceneObject, L"id");
+                scene.name = json_wstring(sceneObject, L"name");
+                scene.kind = json_string(sceneObject, L"kind");
+                scene.defaultGroupId = json_string(sceneObject, L"defaultGroupId");
+                scene.defaultMediaId = json_string(sceneObject, L"defaultMediaId");
+                scene.performanceMode = json_string(sceneObject, L"performanceMode");
+                scene.displayMode = json_string(sceneObject, L"displayMode");
+                if (scene.displayMode.empty()) scene.displayMode = "independent";
+                scene.activePlaybackEnabled = sceneObject.GetNamedBoolean(
+                    L"activePlaybackEnabled", scene.activePlaybackEnabled);
+                scene.screensaverEnabled = sceneObject.GetNamedBoolean(
+                    L"screensaverEnabled", scene.screensaverEnabled);
+                if (sceneObject.HasKey(L"activation") &&
+                    sceneObject.GetNamedValue(L"activation").ValueType() == JsonValueType::Object) {
+                    auto activation = sceneObject.GetNamedObject(L"activation");
+                    scene.activation.trigger = json_string(activation, L"trigger");
+                    scene.activation.enabled = activation.GetNamedBoolean(
+                        L"enabled", scene.activation.enabled);
+                    scene.activation.startMinute = json_int(
+                        activation, L"startMinute", scene.activation.startMinute, 0, 1439);
+                    scene.activation.endMinute = json_int(
+                        activation, L"endMinute", scene.activation.endMinute, 0, 1439);
+                    scene.activation.priority = json_int(
+                        activation, L"priority", scene.activation.priority, -1000, 1000);
+                }
+                if (sceneObject.HasKey(L"displayAssignments")) {
+                    auto sceneAssignments = sceneObject.GetNamedArray(L"displayAssignments");
+                    for (auto const& assignmentValue : sceneAssignments) {
+                        if (scene.displayAssignments.size() >= 32 ||
+                            assignmentValue.ValueType() != JsonValueType::Object) continue;
+                        auto assignmentObject = assignmentValue.GetObject();
+                        DisplayAssignment assignment{
+                            json_string(assignmentObject, L"displayId"),
+                            json_string(assignmentObject, L"groupId"),
+                            json_string(assignmentObject, L"mediaId")
+                        };
+                        if (!safe_display_id(assignment.displayId) ||
+                            !valid_id(assignment.groupId) || !valid_id(assignment.mediaId)) continue;
+                        auto duplicate = std::find_if(scene.displayAssignments.begin(),
+                            scene.displayAssignments.end(), [&](auto const& existing) {
+                                return existing.displayId == assignment.displayId;
+                            });
+                        if (duplicate == scene.displayAssignments.end()) {
+                            scene.displayAssignments.push_back(std::move(assignment));
+                        }
+                    }
+                }
+                if (!valid_scene_profile(scene)) continue;
+                auto duplicate = std::find_if(settings.scenes.begin(), settings.scenes.end(),
+                    [&](auto const& existing) { return existing.id == scene.id; });
+                if (duplicate == settings.scenes.end()) settings.scenes.push_back(std::move(scene));
+            }
+        }
+        ensure_builtin_scene_profiles(settings);
+        if (storedVersion >= 11) settings.activeSceneId = json_string(object, L"activeSceneId");
+        if (!settings.activeSceneId.empty() &&
+            (!valid_scene_profile_id(settings.activeSceneId) ||
+                !find_scene_profile(settings, settings.activeSceneId))) {
+            settings.activeSceneId.clear();
         }
         return settings;
     }
@@ -1063,6 +1183,9 @@ namespace motion
         object.Insert(L"displayOffAfterLockDelaySeconds", JsonValue::CreateNumberValue(settings.displayOffAfterLockDelaySeconds));
         object.Insert(L"decodeMode", JsonValue::CreateStringValue(utf8_to_wide(settings.decodeMode)));
         object.Insert(L"performanceMode", JsonValue::CreateStringValue(utf8_to_wide(settings.performanceMode)));
+        object.Insert(L"optimizationStorageQuotaBytes", JsonValue::CreateNumberValue(
+            static_cast<double>((std::min)(settings.optimizationStorageQuotaBytes,
+                maximum_optimization_storage_quota_bytes))));
         object.Insert(L"mediaLibraryPath", JsonValue::CreateStringValue(settings.mediaLibraryPath));
         object.Insert(L"mediaLibraryId", JsonValue::CreateStringValue(utf8_to_wide(settings.mediaLibraryId)));
         object.Insert(L"selectedGroupId", JsonValue::CreateStringValue(utf8_to_wide(settings.selectedGroupId)));
@@ -1081,6 +1204,57 @@ namespace motion
             assignments.Append(value);
         }
         object.Insert(L"displayAssignments", assignments);
+        auto activeSceneId = valid_scene_profile_id(settings.activeSceneId) &&
+            find_scene_profile(settings, settings.activeSceneId)
+            ? settings.activeSceneId : std::string{};
+        object.Insert(L"activeSceneId", JsonValue::CreateStringValue(utf8_to_wide(activeSceneId)));
+        JsonArray scenes;
+        size_t sceneCount{};
+        for (auto const& scene : settings.scenes) {
+            if (sceneCount >= 64) break;
+            if (!valid_scene_profile(scene)) continue;
+            JsonObject sceneObject;
+            sceneObject.Insert(L"id", JsonValue::CreateStringValue(utf8_to_wide(scene.id)));
+            sceneObject.Insert(L"name", JsonValue::CreateStringValue(scene.name));
+            sceneObject.Insert(L"kind", JsonValue::CreateStringValue(utf8_to_wide(scene.kind)));
+            sceneObject.Insert(L"defaultGroupId", JsonValue::CreateStringValue(
+                utf8_to_wide(scene.defaultGroupId)));
+            sceneObject.Insert(L"defaultMediaId", JsonValue::CreateStringValue(
+                utf8_to_wide(scene.defaultMediaId)));
+            sceneObject.Insert(L"performanceMode", JsonValue::CreateStringValue(
+                utf8_to_wide(scene.performanceMode)));
+            sceneObject.Insert(L"displayMode", JsonValue::CreateStringValue(
+                utf8_to_wide(scene.displayMode)));
+            sceneObject.Insert(L"activePlaybackEnabled", JsonValue::CreateBooleanValue(
+                scene.activePlaybackEnabled));
+            sceneObject.Insert(L"screensaverEnabled", JsonValue::CreateBooleanValue(
+                scene.screensaverEnabled));
+            JsonObject activation;
+            activation.Insert(L"trigger", JsonValue::CreateStringValue(
+                utf8_to_wide(scene.activation.trigger)));
+            activation.Insert(L"enabled", JsonValue::CreateBooleanValue(scene.activation.enabled));
+            activation.Insert(L"startMinute", JsonValue::CreateNumberValue(scene.activation.startMinute));
+            activation.Insert(L"endMinute", JsonValue::CreateNumberValue(scene.activation.endMinute));
+            activation.Insert(L"priority", JsonValue::CreateNumberValue(scene.activation.priority));
+            sceneObject.Insert(L"activation", activation);
+            JsonArray sceneAssignments;
+            for (auto const& assignment : scene.displayAssignments) {
+                if (!safe_display_id(assignment.displayId) || !valid_id(assignment.groupId) ||
+                    !valid_id(assignment.mediaId)) continue;
+                JsonObject value;
+                value.Insert(L"displayId", JsonValue::CreateStringValue(
+                    utf8_to_wide(assignment.displayId)));
+                value.Insert(L"groupId", JsonValue::CreateStringValue(
+                    utf8_to_wide(assignment.groupId)));
+                value.Insert(L"mediaId", JsonValue::CreateStringValue(
+                    utf8_to_wide(assignment.mediaId)));
+                sceneAssignments.Append(value);
+            }
+            sceneObject.Insert(L"displayAssignments", sceneAssignments);
+            scenes.Append(sceneObject);
+            ++sceneCount;
+        }
+        object.Insert(L"scenes", scenes);
         write_text_atomic(path, object.Stringify().c_str());
     }
 
@@ -1089,8 +1263,9 @@ namespace motion
         if (!fs::is_regular_file(path)) return std::nullopt;
         auto object = parse_object(path);
         RuntimeState runtime;
-        auto version = json_int(object, L"version", runtime_schema_version, 0, runtime_schema_version + 1);
-        if (version != runtime_schema_version) return std::nullopt;
+        auto storedVersion = json_int(object, L"version", 1, 0, runtime_schema_version + 1);
+        if (storedVersion < 1 || storedVersion > runtime_schema_version) return std::nullopt;
+        runtime.version = runtime_schema_version;
         runtime.activeGroupId = json_string(object, L"activeGroupId");
         runtime.activeMediaId = json_string(object, L"activeMediaId");
         runtime.decodePath = json_string(object, L"decodePath");
@@ -1099,10 +1274,67 @@ namespace motion
         if ((!runtime.activeGroupId.empty() && !valid_id(runtime.activeGroupId)) ||
             (!runtime.activeMediaId.empty() && !valid_id(runtime.activeMediaId))) return std::nullopt;
         if (runtime.activeGroupId.empty() != runtime.activeMediaId.empty()) return std::nullopt;
-        if (runtime.decodePath != "" && runtime.decodePath != "probing" &&
-            runtime.decodePath != "automatic" && runtime.decodePath != "hardware" && runtime.decodePath != "software" &&
-            runtime.decodePath != "software-fallback" && runtime.decodePath != "unavailable" &&
-            runtime.decodePath != "not-applicable") return std::nullopt;
+        if (!valid_decode_path(runtime.decodePath) || !safe_runtime_text(runtime.decodeReason)) {
+            return std::nullopt;
+        }
+        if (storedVersion >= 2 && object.HasKey(L"displayStates")) {
+            auto values = object.GetNamedArray(L"displayStates");
+            for (auto const& value : values) {
+                if (value.ValueType() != JsonValueType::Object) return std::nullopt;
+                auto displayObject = value.GetObject();
+                DisplayRuntimeState display{
+                    json_string(displayObject, L"displayId"),
+                    json_wstring(displayObject, L"deviceName"),
+                    json_wstring(displayObject, L"displayName"),
+                    json_string(displayObject, L"groupId"),
+                    json_string(displayObject, L"mediaId"),
+                    json_string(displayObject, L"state"),
+                    json_string(displayObject, L"reason"),
+                    json_string(displayObject, L"decodePath"),
+                    json_string(displayObject, L"decodeReason"),
+                    static_cast<uint32_t>((std::min)(json_uint64(displayObject,
+                        L"rendererProcessId"), static_cast<uint64_t>(UINT32_MAX))),
+                    displayObject.GetNamedBoolean(L"canRetry", false),
+                    displayObject.GetNamedBoolean(L"canRestartRenderer", false)
+                };
+                bool validSelection = display.groupId.empty() == display.mediaId.empty() &&
+                    (display.groupId.empty() ||
+                        (valid_id(display.groupId) && valid_id(display.mediaId)));
+                if (!safe_display_id(display.displayId) ||
+                    !safe_runtime_text(display.deviceName) ||
+                    !safe_runtime_text(display.displayName) || !validSelection ||
+                    !valid_runtime_display_state(display.state) ||
+                    !safe_runtime_text(display.reason) ||
+                    !valid_decode_path(display.decodePath) ||
+                    !safe_runtime_text(display.decodeReason)) {
+                    return std::nullopt;
+                }
+                auto duplicate = std::find_if(runtime.displayStates.begin(),
+                    runtime.displayStates.end(), [&](auto const& existing) {
+                        return existing.displayId == display.displayId;
+                    });
+                if (duplicate != runtime.displayStates.end()) return std::nullopt;
+                runtime.displayStates.push_back(std::move(display));
+            }
+            runtime.agentInstanceId = json_string(object, L"agentInstanceId");
+            runtime.agentProcessId = static_cast<uint32_t>((std::min)(
+                json_uint64(object, L"agentProcessId"),
+                static_cast<uint64_t>(UINT32_MAX)));
+            runtime.lastCommandId = json_string(object, L"lastCommandId");
+            runtime.lastCommandAction = json_string(object, L"lastCommandAction");
+            runtime.lastCommandSucceeded = object.GetNamedBoolean(
+                L"lastCommandSucceeded", false);
+            runtime.lastCommandMessage = json_string(object, L"lastCommandMessage");
+            if ((!runtime.agentInstanceId.empty() &&
+                    !valid_id(runtime.agentInstanceId)) ||
+                (!runtime.lastCommandId.empty() && !valid_id(runtime.lastCommandId)) ||
+                (runtime.lastCommandId.empty() != runtime.lastCommandAction.empty()) ||
+                (!runtime.lastCommandAction.empty() &&
+                    !valid_runtime_control_action(runtime.lastCommandAction)) ||
+                !safe_runtime_text(runtime.lastCommandMessage)) {
+                return std::nullopt;
+            }
+        }
         return runtime;
     }
 
@@ -1122,8 +1354,35 @@ namespace motion
     {
         if ((!runtime.activeGroupId.empty() && !valid_id(runtime.activeGroupId)) ||
             (!runtime.activeMediaId.empty() && !valid_id(runtime.activeMediaId)) ||
-            runtime.activeGroupId.empty() != runtime.activeMediaId.empty()) {
+            runtime.activeGroupId.empty() != runtime.activeMediaId.empty() ||
+            !valid_decode_path(runtime.decodePath) ||
+            !safe_runtime_text(runtime.decodeReason) ||
+            (!runtime.agentInstanceId.empty() && !valid_id(runtime.agentInstanceId)) ||
+            (!runtime.lastCommandId.empty() && !valid_id(runtime.lastCommandId)) ||
+            runtime.lastCommandId.empty() != runtime.lastCommandAction.empty() ||
+            (!runtime.lastCommandAction.empty() &&
+                !valid_runtime_control_action(runtime.lastCommandAction)) ||
+            !safe_runtime_text(runtime.lastCommandMessage)) {
             throw std::runtime_error("invalid runtime state");
+        }
+        for (size_t index = 0; index < runtime.displayStates.size(); ++index) {
+            auto const& display = runtime.displayStates[index];
+            bool validSelection = display.groupId.empty() == display.mediaId.empty() &&
+                (display.groupId.empty() ||
+                    (valid_id(display.groupId) && valid_id(display.mediaId)));
+            if (!safe_display_id(display.displayId) ||
+                !safe_runtime_text(display.deviceName) ||
+                !safe_runtime_text(display.displayName) || !validSelection ||
+                !valid_runtime_display_state(display.state) ||
+                !safe_runtime_text(display.reason) ||
+                !valid_decode_path(display.decodePath) ||
+                !safe_runtime_text(display.decodeReason) ||
+                std::any_of(runtime.displayStates.begin(),
+                    runtime.displayStates.begin() + index, [&](auto const& existing) {
+                        return existing.displayId == display.displayId;
+                    })) {
+                throw std::runtime_error("invalid display runtime state");
+            }
         }
         JsonObject object;
         object.Insert(L"version", JsonValue::CreateNumberValue(runtime_schema_version));
@@ -1131,8 +1390,122 @@ namespace motion
         object.Insert(L"activeMediaId", JsonValue::CreateStringValue(utf8_to_wide(runtime.activeMediaId)));
         object.Insert(L"decodePath", JsonValue::CreateStringValue(utf8_to_wide(runtime.decodePath)));
         object.Insert(L"decodeReason", JsonValue::CreateStringValue(utf8_to_wide(runtime.decodeReason)));
+        JsonArray displayStates;
+        for (auto const& display : runtime.displayStates) {
+            JsonObject displayObject;
+            displayObject.Insert(L"displayId", JsonValue::CreateStringValue(
+                utf8_to_wide(display.displayId)));
+            displayObject.Insert(L"deviceName", JsonValue::CreateStringValue(display.deviceName));
+            displayObject.Insert(L"displayName", JsonValue::CreateStringValue(display.displayName));
+            displayObject.Insert(L"groupId", JsonValue::CreateStringValue(
+                utf8_to_wide(display.groupId)));
+            displayObject.Insert(L"mediaId", JsonValue::CreateStringValue(
+                utf8_to_wide(display.mediaId)));
+            displayObject.Insert(L"state", JsonValue::CreateStringValue(
+                utf8_to_wide(display.state)));
+            displayObject.Insert(L"reason", JsonValue::CreateStringValue(
+                utf8_to_wide(display.reason)));
+            displayObject.Insert(L"decodePath", JsonValue::CreateStringValue(
+                utf8_to_wide(display.decodePath)));
+            displayObject.Insert(L"decodeReason", JsonValue::CreateStringValue(
+                utf8_to_wide(display.decodeReason)));
+            displayObject.Insert(L"rendererProcessId", JsonValue::CreateNumberValue(
+                display.rendererProcessId));
+            displayObject.Insert(L"canRetry", JsonValue::CreateBooleanValue(display.canRetry));
+            displayObject.Insert(L"canRestartRenderer",
+                JsonValue::CreateBooleanValue(display.canRestartRenderer));
+            displayStates.Append(displayObject);
+        }
+        object.Insert(L"displayStates", displayStates);
+        object.Insert(L"agentInstanceId", JsonValue::CreateStringValue(
+            utf8_to_wide(runtime.agentInstanceId)));
+        object.Insert(L"agentProcessId", JsonValue::CreateNumberValue(
+            runtime.agentProcessId));
+        object.Insert(L"lastCommandId", JsonValue::CreateStringValue(
+            utf8_to_wide(runtime.lastCommandId)));
+        object.Insert(L"lastCommandAction", JsonValue::CreateStringValue(
+            utf8_to_wide(runtime.lastCommandAction)));
+        object.Insert(L"lastCommandSucceeded",
+            JsonValue::CreateBooleanValue(runtime.lastCommandSucceeded));
+        object.Insert(L"lastCommandMessage", JsonValue::CreateStringValue(
+            utf8_to_wide(runtime.lastCommandMessage)));
         object.Insert(L"updatedAt", JsonValue::CreateStringValue(runtime.updatedAt));
         write_text_atomic(path, object.Stringify().c_str());
+    }
+
+    std::optional<RuntimeControlRequest> load_runtime_control_request(fs::path const& path)
+    {
+        if (!fs::is_regular_file(path)) return std::nullopt;
+        auto object = parse_object(path);
+        RuntimeControlRequest request;
+        auto version = json_int(object, L"version", runtime_control_schema_version,
+            0, runtime_control_schema_version + 1);
+        if (version != runtime_control_schema_version) return std::nullopt;
+        request.requestId = json_string(object, L"requestId");
+        request.action = json_string(object, L"action");
+        request.displayId = json_string(object, L"displayId");
+        request.createdAt = json_wstring(object, L"createdAt");
+        if (!valid_id(request.requestId) ||
+            !valid_runtime_control_action(request.action) ||
+            (!request.displayId.empty() && !safe_display_id(request.displayId)) ||
+            !safe_runtime_text(request.createdAt)) {
+            return std::nullopt;
+        }
+        return request;
+    }
+
+    bool try_load_runtime_control_request(fs::path const& path,
+        RuntimeControlRequest& destination) noexcept
+    {
+        try {
+            auto loaded = load_runtime_control_request(path);
+            if (!loaded) return false;
+            destination = std::move(*loaded);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void save_runtime_control_request(fs::path const& path,
+        RuntimeControlRequest const& request)
+    {
+        if (!valid_id(request.requestId) ||
+            !valid_runtime_control_action(request.action) ||
+            (!request.displayId.empty() && !safe_display_id(request.displayId)) ||
+            !safe_runtime_text(request.createdAt)) {
+            throw std::runtime_error("invalid runtime control request");
+        }
+        JsonObject object;
+        object.Insert(L"version", JsonValue::CreateNumberValue(
+            runtime_control_schema_version));
+        object.Insert(L"requestId", JsonValue::CreateStringValue(
+            utf8_to_wide(request.requestId)));
+        object.Insert(L"action", JsonValue::CreateStringValue(
+            utf8_to_wide(request.action)));
+        object.Insert(L"displayId", JsonValue::CreateStringValue(
+            utf8_to_wide(request.displayId)));
+        object.Insert(L"createdAt", JsonValue::CreateStringValue(request.createdAt));
+        write_text_atomic(path, object.Stringify().c_str());
+    }
+
+    std::optional<std::string> request_runtime_control(fs::path const& path,
+        std::string const& action, std::string const& displayId) noexcept
+    {
+        try {
+            RuntimeControlRequest request;
+            request.requestId = new_id();
+            request.action = action;
+            request.displayId = displayId;
+            request.createdAt = timestamp_utc();
+            save_runtime_control_request(path, request);
+            // The Agent already waits on this event and also performs a bounded
+            // fallback poll, so control requests need no second IPC channel.
+            notify_settings_changed();
+            return request.requestId;
+        } catch (...) {
+            return std::nullopt;
+        }
     }
 
     std::optional<GroupMetadata> load_group(fs::path const& path)
@@ -1167,7 +1540,10 @@ namespace motion
         if (!fs::is_regular_file(path)) return std::nullopt;
         auto object = parse_object(path);
         MediaMetadata media;
-        media.version = json_int(object, L"version", media_schema_version, 0, media_schema_version + 1);
+        auto storedVersion = json_int(object, L"version", media_schema_version,
+            0, media_schema_version + 1);
+        if (storedVersion < 2 || storedVersion > media_schema_version) return std::nullopt;
+        media.version = media_schema_version;
         media.id = json_string(object, L"id");
         media.groupId = json_string(object, L"groupId");
         media.name = json_wstring(object, L"name");
@@ -1178,10 +1554,27 @@ namespace motion
         media.coverFileName = json_wstring(object, L"coverFileName");
         media.sha256 = json_wstring(object, L"sha256");
         media.sizeBytes = json_uint64(object, L"sizeBytes");
+        if (storedVersion >= 3) {
+            media.favorite = object.GetNamedBoolean(L"favorite", false);
+            if (object.HasKey(L"tags")) {
+                auto tags = object.GetNamedArray(L"tags");
+                if (tags.Size() > maximumMediaTags) return std::nullopt;
+                for (auto const& value : tags) {
+                    if (value.ValueType() != JsonValueType::String) return std::nullopt;
+                    auto tag = std::wstring(value.GetString());
+                    if (!safe_media_tag(tag)) return std::nullopt;
+                    auto duplicate = std::find_if(media.tags.begin(), media.tags.end(),
+                        [&](auto const& existing) {
+                            return _wcsicmp(existing.c_str(), tag.c_str()) == 0;
+                        });
+                    if (duplicate == media.tags.end()) media.tags.push_back(std::move(tag));
+                }
+            }
+        }
         media.revision = json_uint64(object, L"revision");
         media.importedAt = json_wstring(object, L"importedAt");
         media.updatedAt = json_wstring(object, L"updatedAt");
-        if (media.version != media_schema_version || !valid_id(media.id) || !valid_id(media.groupId) || !safe_file_name(media.fileName) ||
+        if (!valid_id(media.id) || !valid_id(media.groupId) || !safe_file_name(media.fileName) ||
             (!media.coverFileName.empty() && !safe_file_name(media.coverFileName)) ||
             (media.kind != "video" && media.kind != "image")) return std::nullopt;
         return media;
@@ -1203,11 +1596,13 @@ namespace motion
     {
         if (!valid_id(media.id) || !valid_id(media.groupId) || !safe_file_name(media.fileName) ||
             (!media.coverFileName.empty() && !safe_file_name(media.coverFileName)) ||
-            (media.kind != "video" && media.kind != "image")) {
+            (media.kind != "video" && media.kind != "image") ||
+            media.tags.size() > maximumMediaTags ||
+            !std::all_of(media.tags.begin(), media.tags.end(), safe_media_tag)) {
             throw std::runtime_error("invalid media metadata");
         }
         JsonObject object;
-        object.Insert(L"version", JsonValue::CreateNumberValue(media.version));
+        object.Insert(L"version", JsonValue::CreateNumberValue(media_schema_version));
         object.Insert(L"id", JsonValue::CreateStringValue(utf8_to_wide(media.id)));
         object.Insert(L"groupId", JsonValue::CreateStringValue(utf8_to_wide(media.groupId)));
         object.Insert(L"name", JsonValue::CreateStringValue(media.name));
@@ -1217,6 +1612,12 @@ namespace motion
         object.Insert(L"coverFileName", JsonValue::CreateStringValue(media.coverFileName));
         object.Insert(L"sha256", JsonValue::CreateStringValue(media.sha256));
         object.Insert(L"sizeBytes", JsonValue::CreateNumberValue(static_cast<double>(media.sizeBytes)));
+        object.Insert(L"favorite", JsonValue::CreateBooleanValue(media.favorite));
+        JsonArray tags;
+        for (auto const& tag : media.tags) {
+            tags.Append(JsonValue::CreateStringValue(tag));
+        }
+        object.Insert(L"tags", tags);
         object.Insert(L"revision", JsonValue::CreateNumberValue(static_cast<double>(media.revision)));
         object.Insert(L"importedAt", JsonValue::CreateStringValue(media.importedAt));
         object.Insert(L"updatedAt", JsonValue::CreateStringValue(media.updatedAt));
@@ -1233,6 +1634,14 @@ namespace motion
     bool notify_settings_changed()
     {
         unique_handle event(OpenEventW(EVENT_MODIFY_STATE, FALSE, settings_event_name));
+        return event && SetEvent(event.get());
+    }
+
+    bool notify_agent_command(AgentCommand command) noexcept
+    {
+        auto eventName = agent_command_event_name(command);
+        if (!eventName) return false;
+        unique_handle event(OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName));
         return event && SetEvent(event.get());
     }
 }

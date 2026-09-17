@@ -33,6 +33,8 @@ namespace motion
         VariantProgressState state{ VariantProgressState::none };
         uint32_t percent{};
         bool determinate{};
+        uint64_t estimatedRemainingSeconds{};
+        bool estimatedRemainingKnown{};
     };
 
     struct VariantGenerationRequest
@@ -66,6 +68,8 @@ namespace motion
         bool waitingForPower{};
         uint32_t progressPercent{};
         bool progressKnown{};
+        uint64_t estimatedRemainingSeconds{};
+        bool estimatedRemainingKnown{};
         bool balancedSuppressed{};
         bool powerSaverSuppressed{};
         uint64_t bytes{};
@@ -382,9 +386,10 @@ namespace motion
     {
         // v1|<mode>|<state>|<0..100 or ?> (legacy request without token)
         // v2|<mode>|<request-id>|<state>|<0..100 or ?>
+        // v3|<mode>|<request-id>|<state>|<0..100 or ?>|<eta-seconds or ?>
         auto view = value;
         std::vector<std::string_view> fields;
-        while (fields.size() != 5) {
+        while (fields.size() != 6) {
             auto separator = view.find('|');
             if (separator == std::string_view::npos) break;
             fields.push_back(view.substr(0, separator));
@@ -392,8 +397,10 @@ namespace motion
         }
         fields.push_back(view);
         bool legacy = fields.size() == 4 && fields[0] == "v1";
-        bool tokenized = fields.size() == 5 && fields[0] == "v2";
-        if ((!legacy && !tokenized) ||
+        bool tokenizedV2 = fields.size() == 5 && fields[0] == "v2";
+        bool tokenizedV3 = fields.size() == 6 && fields[0] == "v3";
+        bool tokenized = tokenizedV2 || tokenizedV3;
+        if ((!legacy && !tokenizedV2 && !tokenizedV3) ||
             (fields[1] != "balanced" && fields[1] != "power-saver" && fields[1] != "cpu-smooth")) {
             return std::nullopt;
         }
@@ -416,6 +423,17 @@ namespace motion
             result.percent = percent;
             result.determinate = true;
         }
+        if (tokenizedV3 && fields[5] != "?") {
+            uint64_t seconds{};
+            auto parsed = std::from_chars(fields[5].data(),
+                fields[5].data() + fields[5].size(), seconds);
+            constexpr uint64_t maximumEtaSeconds = 365ULL * 24 * 60 * 60;
+            if (parsed.ec != std::errc{} ||
+                parsed.ptr != fields[5].data() + fields[5].size() ||
+                seconds > maximumEtaSeconds) return std::nullopt;
+            result.estimatedRemainingSeconds = seconds;
+            result.estimatedRemainingKnown = true;
+        }
         return result;
     }
 
@@ -427,18 +445,29 @@ namespace motion
 
     inline bool write_variant_progress(std::filesystem::path const& mediaDirectory,
         std::string const& mode, VariantProgressState state, uint32_t percent = 0,
-        bool determinate = false, std::string const& requestId = {}) noexcept
+        bool determinate = false, std::string const& requestId = {},
+        uint64_t estimatedRemainingSeconds = 0,
+        bool estimatedRemainingKnown = false) noexcept
     {
         if ((mode != "balanced" && mode != "power-saver" && mode != "cpu-smooth") ||
             state == VariantProgressState::none ||
             (!requestId.empty() && !valid_variant_request_id(requestId))) return false;
         percent = (std::min)(percent, 100u);
+        constexpr uint64_t maximumEtaSeconds = 365ULL * 24 * 60 * 60;
+        estimatedRemainingSeconds = (std::min)(
+            estimatedRemainingSeconds, maximumEtaSeconds);
         std::string value = requestId.empty()
             ? "v1|" + mode + "|"
-            : "v2|" + mode + "|" + requestId + "|";
+            : estimatedRemainingKnown
+                ? "v3|" + mode + "|" + requestId + "|"
+                : "v2|" + mode + "|" + requestId + "|";
         value += variant_progress_state_name(state);
         value.push_back('|');
         value += determinate ? std::to_string(percent) : std::string("?");
+        if (!requestId.empty() && estimatedRemainingKnown) {
+            value.push_back('|');
+            value += std::to_string(estimatedRemainingSeconds);
+        }
         // Prepare() may revisit a durable request once per policy tick while it
         // waits for AC power. Avoid a needless write-through/flush when the
         // externally visible state has not changed.
@@ -448,19 +477,25 @@ namespace motion
 
     inline bool write_variant_progress(std::filesystem::path const& mediaDirectory,
         VariantGenerationRequest const& request, VariantProgressState state,
-        uint32_t percent = 0, bool determinate = false) noexcept
+        uint32_t percent = 0, bool determinate = false,
+        uint64_t estimatedRemainingSeconds = 0,
+        bool estimatedRemainingKnown = false) noexcept
     {
         return write_variant_progress(mediaDirectory, request.mode, state, percent,
-            determinate, request.requestId);
+            determinate, request.requestId, estimatedRemainingSeconds,
+            estimatedRemainingKnown);
     }
 
     inline bool write_variant_progress_if_current(std::filesystem::path const& mediaDirectory,
         VariantGenerationRequest const& request, VariantProgressState state,
-        uint32_t percent = 0, bool determinate = false) noexcept
+        uint32_t percent = 0, bool determinate = false,
+        uint64_t estimatedRemainingSeconds = 0,
+        bool estimatedRemainingKnown = false) noexcept
     {
         auto locked = lock_variant_request(mediaDirectory, request);
         return locked && write_variant_progress(
-            mediaDirectory, request, state, percent, determinate);
+            mediaDirectory, request, state, percent, determinate,
+            estimatedRemainingSeconds, estimatedRemainingKnown);
     }
 
     inline void clear_variant_progress(std::filesystem::path const& mediaDirectory,
@@ -574,6 +609,31 @@ namespace motion
         } catch (...) {}
     }
 
+    // Drop a queued/in-progress request without installing the persistent
+    // "cancelled by user" marker. Callers must first quiesce the Agent. This
+    // is used by cache quota eviction: the files may be regenerated the next
+    // time the wallpaper becomes current, while an existing explicit cancel
+    // marker remains untouched.
+    inline bool abandon_variant_generation_for_cache_eviction(
+        std::filesystem::path const& mediaDirectory) noexcept
+    {
+        try {
+            auto request = read_variant_generation_request(mediaDirectory);
+            if (request) {
+                auto locked = lock_variant_request(mediaDirectory, request);
+                if (!locked || !mark_locked_request_for_deletion(locked.get())) return false;
+                std::error_code ignored;
+                std::filesystem::remove(variant_paused_path(mediaDirectory), ignored);
+                std::filesystem::remove(variant_failed_path(mediaDirectory), ignored);
+                clear_variant_progress(mediaDirectory, request);
+            }
+            remove_variant_partials(mediaDirectory);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     inline bool suppress_variant_generation(std::filesystem::path const& mediaDirectory,
         std::string const& mode) noexcept
     {
@@ -678,6 +738,10 @@ namespace motion
                     progress->state == VariantProgressState::waitingForPower;
                 result.progressPercent = progress->percent;
                 result.progressKnown = progress->determinate;
+                result.estimatedRemainingSeconds =
+                    progress->estimatedRemainingSeconds;
+                result.estimatedRemainingKnown =
+                    progress->estimatedRemainingKnown;
                 result.generating = !result.paused &&
                     progress->state == VariantProgressState::generating;
             }
@@ -710,6 +774,7 @@ namespace motion
                         std::string mode;
                         if (name.starts_with(L"balanced-")) mode = "balanced";
                         else if (name.starts_with(L"power-saver-")) mode = "power-saver";
+                        else if (name.starts_with(L"cpu-smooth-")) mode = "cpu-smooth";
                         if (mode.empty()) continue;
                         result.entries.push_back({ name, std::move(mode), size });
                     }

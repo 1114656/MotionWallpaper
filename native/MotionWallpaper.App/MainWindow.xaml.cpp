@@ -19,12 +19,31 @@ namespace
     constexpr uint8_t variant_balanced = 2;
     constexpr uint8_t variant_power_saver = 4;
 
+    struct MediaReferenceReplacement
+    {
+        std::string oldGroupId;
+        std::string oldMediaId;
+        std::string newGroupId;
+        std::string newMediaId;
+    };
+
     int combo_int(ComboBox const& box, int fallback)
     {
         auto item = box.SelectedItem().try_as<ComboBoxItem>();
         if (!item) return fallback;
         auto value = unbox_value_or<hstring>(item.Tag(), {});
         return value.empty() ? fallback : _wtoi(value.c_str());
+    }
+
+    uint64_t combo_uint64(ComboBox const& box, uint64_t fallback)
+    {
+        auto item = box.SelectedItem().try_as<ComboBoxItem>();
+        if (!item) return fallback;
+        auto value = unbox_value_or<hstring>(item.Tag(), {});
+        if (value.empty()) return fallback;
+        wchar_t* end{};
+        auto parsed = _wcstoui64(value.c_str(), &end, 10);
+        return end && *end == L'\0' ? parsed : fallback;
     }
 
     std::string combo_string(ComboBox const& box, std::string const& fallback)
@@ -56,6 +75,138 @@ namespace
         wchar_t output[64]{};
         swprintf_s(output, unit > 1 ? L"%.1f %s" : L"%.0f %s", value, units[unit]);
         return output;
+    }
+
+    std::wstring runtime_state_label(std::string const& state)
+    {
+        if (state == "applying") return L"正在应用";
+        if (state == "applied") return L"已应用";
+        if (state == "paused") return L"已暂停";
+        if (state == "optimizing") return L"正在优化";
+        if (state == "degraded") return L"降级播放";
+        if (state == "failed") return L"失败";
+        return L"等待状态";
+    }
+
+    std::wstring runtime_reason_label(std::string const& reason)
+    {
+        if (reason.empty()) return {};
+        if (reason == "display-off") return L"显示器已关闭";
+        if (reason == "session-locked") return L"Windows 已锁定";
+        if (reason == "playback-stopped") return L"桌面播放已关闭";
+        if (reason == "desktop-covered") return L"全屏应用正在覆盖桌面";
+        if (reason == "active-playback-disabled") return L"活动时播放已关闭，保留静态画面";
+        if (reason == "not-targeted") return L"当前模式不播放到这块屏幕";
+        if (reason == "no-wallpaper") return L"尚未给这块屏幕分配壁纸";
+        if (reason == "performance-copy-pending") return L"正在准备节能优化版本，暂时显示所选壁纸的静态画面";
+        if (reason == "performance-copy-unavailable") return L"节能优化版本暂不可用，已保留安全播放路径";
+        if (reason == "freezing-previous-route") return L"正在保留上一张已确认画面，等待新壁纸准备完成";
+        if (reason == "media-transaction") return L"媒体文件正在安全整理，暂时保留当前画面";
+        if (reason == "renderer-process-failed") return L"渲染进程意外退出";
+        if (reason == "agent-not-running") return L"后台服务未运行，显示状态可能已过期";
+        if (reason == "compatibility-fallback") return L"当前设备使用兼容播放路径";
+        if (reason == "waiting-for-first-frame") return L"等待渲染器确认首帧";
+        if (reason == "renderer-starting") return L"渲染器正在启动";
+        if (reason == "no-physical-d3d11-adapter") return L"没有可用的物理图形设备";
+        if (reason == "no-d3d11-video-support") return L"当前图形设备不支持所需视频路径";
+        if (reason == "fallback-no-hardware-decoder") return L"硬件解码不可用，已切换到兼容路径";
+        if (reason == "automatic-first-frame-timeout") return L"自动解码未能按时呈现首帧";
+        return motion::utf8_to_wide(reason);
+    }
+
+    std::wstring runtime_command_message(std::string const& message)
+    {
+        if (message == "retry-scheduled") return L"已重新安排渲染，正在等待首帧。";
+        if (message == "no-failed-renderer") return L"当前没有需要重试的失败渲染器。";
+        if (message == "renderer-restart-scheduled") return L"渲染器已重启，正在重新应用壁纸。";
+        if (message == "renderer-not-found-or-stop-failed") return L"无法安全重启渲染器，请稍后重试。";
+        return message.empty() ? std::wstring{} : motion::utf8_to_wide(message);
+    }
+
+    std::wstring scene_description(motion::SceneProfile const& scene)
+    {
+        if (scene.kind == "work") return L"工作：保持活动播放，并使用自动平衡画质。";
+        if (scene.kind == "night") return L"夜间：切换为低功耗画质，减少持续资源占用。";
+        if (scene.kind == "battery") return L"电池：保留静态画面并关闭闲置屏保播放。";
+        if (scene.kind == "presentation") return L"投屏：暂停动态播放与屏保，避免干扰演示。";
+        return L"自定义壁纸、屏幕分配与播放偏好。";
+    }
+
+    std::wstring scene_activation_hint(motion::SceneProfile const& scene)
+    {
+        if (scene.activation.trigger == "time-range") {
+            auto formatMinute = [](int value) {
+                wchar_t output[16]{};
+                swprintf_s(output, L"%02d:%02d", value / 60, value % 60);
+                return std::wstring(output);
+            };
+            return L"可在 " + formatMinute(scene.activation.startMinute) + L"–" +
+                formatMinute(scene.activation.endMinute) + L" 自动切换";
+        }
+        if (scene.activation.trigger == "battery") return L"可在电脑改用电池供电时自动切换";
+        if (scene.activation.trigger == "presentation") return L"可在检测到外接显示器时自动切换";
+        return L"此场景仅手动启用";
+    }
+
+    std::wstring backup_phase_label(motion::app::LibraryBackupPhase phase)
+    {
+        using Phase = motion::app::LibraryBackupPhase;
+        switch (phase) {
+        case Phase::Inspecting: return L"正在检查文件";
+        case Phase::CopyingSettings: return L"正在备份设置";
+        case Phase::CopyingLibrary: return L"正在复制媒体库";
+        case Phase::Verifying: return L"正在逐文件校验";
+        case Phase::PreparingRestore: return L"正在准备恢复副本";
+        case Phase::SwappingLibrary: return L"正在安全切换媒体库";
+        case Phase::CommittingSettings: return L"正在提交恢复设置";
+        case Phase::Completed: return L"操作已完成";
+        default: return L"正在处理";
+        }
+    }
+
+    Windows::UI::Color runtime_state_color(std::string const& state)
+    {
+        if (state == "applied") return Windows::UI::ColorHelper::FromArgb(255, 16, 124, 65);
+        if (state == "failed") return Windows::UI::ColorHelper::FromArgb(255, 196, 43, 28);
+        if (state == "paused" || state == "degraded") {
+            return Windows::UI::ColorHelper::FromArgb(255, 156, 87, 0);
+        }
+        return Windows::UI::ColorHelper::FromArgb(255, 10, 115, 232);
+    }
+
+    bool process_is_running(uint32_t processId) noexcept
+    {
+        if (!processId) return false;
+        motion::unique_handle process(OpenProcess(SYNCHRONIZE, FALSE, processId));
+        return process && WaitForSingleObject(process.get(), 0) == WAIT_TIMEOUT;
+    }
+
+    std::vector<std::wstring> parse_media_tags(std::wstring value)
+    {
+        for (auto& character : value) {
+            if (character == L'，' || character == L';' || character == L'；' ||
+                character == L'#' || character == L'\r' || character == L'\n') {
+                character = L',';
+            }
+        }
+        std::vector<std::wstring> result;
+        size_t start{};
+        while (start <= value.size()) {
+            auto end = value.find(L',', start);
+            auto tag = value.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+            auto first = std::find_if_not(tag.begin(), tag.end(), [](wchar_t c) { return iswspace(c); });
+            auto last = std::find_if_not(tag.rbegin(), tag.rend(), [](wchar_t c) { return iswspace(c); }).base();
+            if (first < last) {
+                tag = std::wstring(first, last);
+                auto duplicate = std::find_if(result.begin(), result.end(), [&](auto const& existing) {
+                    return _wcsicmp(existing.c_str(), tag.c_str()) == 0;
+                });
+                if (duplicate == result.end()) result.push_back(std::move(tag));
+            }
+            if (end == std::wstring::npos) break;
+            start = end + 1;
+        }
+        return result;
     }
 
     std::wstring file_uri(fs::path const& path) { return L"file:///" + path.generic_wstring(); }
@@ -279,6 +430,10 @@ namespace winrt::MotionWallpaper::implementation
         settingsSaveTimer.Interval(std::chrono::milliseconds(350));
         settingsSaveTimer.IsRepeating(false);
         settingsSaveTimer.Tick([this](auto const&, auto const&) { TrySaveSettings(); });
+        catalogSearchTimer = dispatcher.CreateTimer();
+        catalogSearchTimer.Interval(std::chrono::milliseconds(250));
+        catalogSearchTimer.IsRepeating(false);
+        catalogSearchTimer.Tick([this](auto const&, auto const&) { RefreshMedia(); });
         statusHideTimer = dispatcher.CreateTimer();
         statusHideTimer.Interval(std::chrono::seconds(2));
         statusHideTimer.IsRepeating(false);
@@ -288,17 +443,28 @@ namespace winrt::MotionWallpaper::implementation
         settingsReloadTimer.IsRepeating(true);
         settingsReloadTimer.Tick([this](auto const&, auto const&) {
             ReloadExternalSelection();
+            UpdateRuntimeStatus();
             if (optimizationWorkVisible && currentPage == AppPage::Variants) RefreshVariants();
         });
         Closed([this](auto const&, auto const&) {
+            bool migrationActive = activeLibraryMigrationPause ||
+                (libraryAccessGate && libraryAccessGate->MigrationInProgress());
             closing.store(true, std::memory_order_release);
             if (importCancellation) importCancellation->store(true, std::memory_order_release);
             if (libraryMigrationCancellation) libraryMigrationCancellation->store(true, std::memory_order_release);
-            if (activeLibraryMigrationPause) activeLibraryMigrationPause->Cancel();
+            // Do not release the Agent pause from the UI thread while a
+            // background filesystem commit may still be between its final
+            // cancellation check and rename. The operation owns the pause and
+            // will resume it at its next safe boundary; a terminated App is
+            // detected as an orphan by the Agent's owner channel.
             settingsSaveTimer.Stop();
+            catalogSearchTimer.Stop();
             statusHideTimer.Stop();
             settingsReloadTimer.Stop();
-            if (!initializing && settingsStore) TrySaveSettings();
+            // A restore owns settings.json as part of the same commit as the
+            // library swap. Never let the close-time debounce flush overwrite
+            // that transaction with the pre-restore in-memory snapshot.
+            if (!migrationActive && !initializing && settingsStore) TrySaveSettings();
         });
 
         applicationRoot = motion::executable_directory();
@@ -306,9 +472,23 @@ namespace winrt::MotionWallpaper::implementation
         // A migration conflict deliberately has no authoritative side. Keep a
         // path only for UI construction, but do not inspect either data tree.
         root = legacyDataConflict ? applicationRoot : motion::application_data_directory();
+        motion::app::LibraryRestoreRecoveryResult startupRestoreRecovery;
+        if (!legacyDataConflict) {
+            try {
+                startupRestoreRecovery =
+                    motion::app::LibraryBackupService::RecoverPendingRestore(root);
+            } catch (...) {
+                // A malformed journal or an unexpected on-disk identity is an
+                // ambiguous transaction. Do not load, create, or overwrite a
+                // library until a later startup can recover the exact objects.
+                restoreRecoveryBlocked = true;
+            }
+        } else {
+            restoreRecoveryBlocked = true;
+        }
         settingsStore = std::make_unique<motion::app::SettingsStore>(root, applicationRoot);
         try {
-            if (legacyDataConflict) {
+            if (legacyDataConflict || restoreRecoveryBlocked) {
                 settingsWritable = false;
                 mediaLibraryAvailable = false;
             } else {
@@ -319,6 +499,7 @@ namespace winrt::MotionWallpaper::implementation
             mediaLibraryAvailable = false;
             ShowStatus(L"设置文件无法读取，已使用安全默认值；原文件未被覆盖。", true);
         }
+        motion::ensure_builtin_scene_profiles(settings);
         fs::path configuredLibraryPath;
         try {
             configuredLibraryPath = legacyDataConflict
@@ -371,13 +552,11 @@ namespace winrt::MotionWallpaper::implementation
         motion::RuntimeState runtime;
         if (!legacyDataConflict &&
             motion::try_load_runtime(root / L"Config" / L"runtime.json", runtime)) {
-            appliedGroupId = std::move(runtime.activeGroupId);
-            appliedMediaId = std::move(runtime.activeMediaId);
-            actualDecodePath = std::move(runtime.decodePath);
-            actualDecodeReason = std::move(runtime.decodeReason);
-        } else {
-            appliedGroupId = settings.selectedGroupId;
-            appliedMediaId = settings.selectedMediaId;
+            runtimeState = runtime;
+            appliedGroupId = runtime.activeGroupId;
+            appliedMediaId = runtime.activeMediaId;
+            actualDecodePath = runtime.decodePath;
+            actualDecodeReason = runtime.decodeReason;
         }
         std::error_code runtimeTimeError;
         runtimeWriteTime = fs::last_write_time(root / L"Config" / L"runtime.json", runtimeTimeError);
@@ -392,6 +571,14 @@ namespace winrt::MotionWallpaper::implementation
         LibraryPathFull().Text(libraryPath);
         if (legacyDataConflict) {
             ShowStatus(L"安装数据迁移检测到旧库与新库冲突；两侧均未读写，媒体功能已安全停用。请先完成恢复后重启应用。", true);
+        } else if (restoreRecoveryBlocked) {
+            ShowStatus(L"检测到未完成的备份恢复，但磁盘对象身份无法安全确认；已保持只读且未继续切换。请连接原磁盘后重启应用。", true, true);
+        } else if (startupRestoreRecovery.outcome ==
+            motion::app::LibraryRestoreRecoveryOutcome::Completed) {
+            ShowStatus(L"上次中断的备份恢复已根据持久事务记录安全完成。", false, true);
+        } else if (startupRestoreRecovery.outcome ==
+            motion::app::LibraryRestoreRecoveryOutcome::RolledBack) {
+            ShowStatus(L"上次中断的备份恢复已安全回滚，原媒体库保持有效。", false, true);
         } else if (settingsWritable && !mediaLibraryAvailable) {
             ShowStatus(L"自定义媒体库当前不可访问或所有权校验失败；已停用所有媒体读写。连接原磁盘后可重试迁移位置。", true);
         }
@@ -404,7 +591,16 @@ namespace winrt::MotionWallpaper::implementation
         if (!settingsWritable) {
             throw std::runtime_error("settings are read-only after an unsupported or corrupt load");
         }
+        bool sceneInvalidated{};
+        if (!settings.activeSceneId.empty()) {
+            auto activeScene = motion::find_scene_profile(settings, settings.activeSceneId);
+            if (!activeScene || !motion::scene_profile_matches_settings(*activeScene, settings)) {
+                settings.activeSceneId.clear();
+                sceneInvalidated = true;
+            }
+        }
         if (!settingsStore->Save(settings)) StartController();
+        if (sceneInvalidated) LoadScenes();
     }
 
     bool MainWindow::TrySaveSettings() noexcept
@@ -498,15 +694,45 @@ namespace winrt::MotionWallpaper::implementation
         motion::RuntimeState runtime;
         if (!motion::try_load_runtime(path, runtime)) { runtimeWriteTime = {}; return; }
         if (runtime.activeGroupId == appliedGroupId && runtime.activeMediaId == appliedMediaId &&
-            runtime.decodePath == actualDecodePath && runtime.decodeReason == actualDecodeReason) return;
+            runtime.decodePath == actualDecodePath && runtime.decodeReason == actualDecodeReason &&
+            runtime.agentInstanceId == runtimeState.agentInstanceId &&
+            runtime.agentProcessId == runtimeState.agentProcessId &&
+            runtime.displayStates == runtimeState.displayStates &&
+            runtime.lastCommandId == runtimeState.lastCommandId &&
+            runtime.lastCommandAction == runtimeState.lastCommandAction &&
+            runtime.lastCommandSucceeded == runtimeState.lastCommandSucceeded &&
+            runtime.lastCommandMessage == runtimeState.lastCommandMessage) return;
         auto previousGroupId = appliedGroupId;
-        appliedGroupId = std::move(runtime.activeGroupId);
-        appliedMediaId = std::move(runtime.activeMediaId);
-        actualDecodePath = std::move(runtime.decodePath);
-        actualDecodeReason = std::move(runtime.decodeReason);
+        runtimeState = runtime;
+        appliedGroupId = runtime.activeGroupId;
+        appliedMediaId = runtime.activeMediaId;
+        actualDecodePath = runtime.decodePath;
+        actualDecodeReason = runtime.decodeReason;
+        bool pendingSelectionApplied = runtime.activeGroupId == pendingSelectionGroupId &&
+            runtime.activeMediaId == pendingSelectionMediaId;
+        if (!pendingSelectionApplied) {
+            pendingSelectionApplied = std::any_of(runtime.displayStates.begin(),
+                runtime.displayStates.end(), [&](auto const& state) {
+                    return state.groupId == pendingSelectionGroupId &&
+                        state.mediaId == pendingSelectionMediaId &&
+                        (state.state == "applied" || state.state == "degraded" ||
+                            state.state == "optimizing");
+                });
+        }
+        if (pendingSelectionApplied) {
+            pendingSelectionGroupId.clear();
+            pendingSelectionMediaId.clear();
+        }
         auto activeGroupId = ActiveGroupId();
         if (activeGroupId == previousGroupId || activeGroupId == appliedGroupId) SyncMediaSelectionToApplied();
         UpdateStatusSummary();
+        if (!pendingRuntimeCommandId.empty() &&
+            runtime.lastCommandId == pendingRuntimeCommandId) {
+            pendingRuntimeCommandId.clear();
+            pendingRuntimeCommandAt = {};
+            auto message = runtime_command_message(runtime.lastCommandMessage);
+            if (!message.empty()) ShowStatus(message, !runtime.lastCommandSucceeded);
+        }
     }
 
     void MainWindow::ApplySettingsToControls()
@@ -523,8 +749,10 @@ namespace winrt::MotionWallpaper::implementation
         select_tag(DecodeMode(), motion::utf8_to_wide(settings.decodeMode));
         select_tag(PerformanceMode(), motion::utf8_to_wide(settings.performanceMode));
         select_tag(DisplayMode(), motion::utf8_to_wide(settings.displayMode));
+        select_tag(OptimizationQuota(), std::to_wstring(settings.optimizationStorageQuotaBytes));
         bool randomEnabled = !settings.randomGroupId.empty() && settings.randomGroupId == settings.selectedGroupId;
         select_tag(RandomInterval(), randomEnabled ? std::to_wstring(settings.randomIntervalMinutes) : L"-1");
+        LoadScenes();
         UpdateStatusSummary();
     }
 
@@ -562,6 +790,159 @@ namespace winrt::MotionWallpaper::implementation
         DisplayTargetPicker().SelectedIndex(selectedIndex);
         DisplayTargetPicker().IsEnabled(settings.displayMode == "independent" && displays.size() > 1);
         initializing = wasInitializing;
+        RefreshDisplayLayout();
+    }
+
+    void MainWindow::LoadScenes()
+    {
+        motion::ensure_builtin_scene_profiles(settings);
+        auto selectedSceneId = combo_string(ScenePicker(), settings.activeSceneId.empty()
+            ? std::string(motion::work_scene_id) : settings.activeSceneId);
+        bool wasInitializing = initializing;
+        initializing = true;
+        ScenePicker().Items().Clear();
+        int32_t selectedIndex{};
+        for (size_t index = 0; index < settings.scenes.size(); ++index) {
+            auto const& scene = settings.scenes[index];
+            ComboBoxItem item;
+            auto label = scene.name;
+            if (scene.id == settings.activeSceneId) {
+                label += motion::scene_profile_matches_settings(scene, settings)
+                    ? L"（当前）" : L"（已修改）";
+            }
+            item.Content(box_value(label));
+            item.Tag(box_value(motion::utf8_to_wide(scene.id)));
+            ScenePicker().Items().Append(item);
+            if (scene.id == selectedSceneId) selectedIndex = static_cast<int32_t>(index);
+        }
+        if (ScenePicker().Items().Size()) ScenePicker().SelectedIndex(selectedIndex);
+        initializing = wasInitializing;
+        UpdateSceneControls();
+    }
+
+    void MainWindow::UpdateSceneControls()
+    {
+        auto sceneId = combo_string(ScenePicker(), {});
+        auto scene = motion::find_scene_profile(settings, sceneId);
+        if (!scene) {
+            SceneDescription().Text(L"没有可用场景。");
+            SceneAutomationHint().Text(L"");
+            SceneAutoSwitch().IsEnabled(false);
+            return;
+        }
+        SceneDescription().Text(scene_description(*scene));
+        SceneAutomationHint().Text(scene_activation_hint(*scene));
+        bool automatic = scene->activation.trigger != "manual";
+        bool wasInitializing = initializing;
+        initializing = true;
+        SceneAutoSwitch().IsEnabled(automatic);
+        SceneAutoSwitch().IsOn(automatic && scene->activation.enabled);
+        initializing = wasInitializing;
+    }
+
+    void MainWindow::RefreshDisplayLayout()
+    {
+        auto canvas = DisplayLayoutMap();
+        if (!canvas) return;
+        canvas.Children().Clear();
+        auto model = motion::build_display_layout_model(displays, settings.displayAssignments);
+        if (model.displays.empty()) {
+            DisplayLayoutHint().Text(L"当前没有检测到可用显示器。");
+            return;
+        }
+        constexpr double canvasWidth = 500.0;
+        constexpr double canvasHeight = 150.0;
+        constexpr double margin = 10.0;
+        auto virtualWidth = (std::max)(1L,
+            model.virtualBounds.right - model.virtualBounds.left);
+        auto virtualHeight = (std::max)(1L,
+            model.virtualBounds.bottom - model.virtualBounds.top);
+        auto scale = (std::min)((canvasWidth - margin * 2) / virtualWidth,
+            (canvasHeight - margin * 2) / virtualHeight);
+        auto usedWidth = virtualWidth * scale;
+        auto usedHeight = virtualHeight * scale;
+        auto offsetX = (canvasWidth - usedWidth) / 2.0;
+        auto offsetY = (canvasHeight - usedHeight) / 2.0;
+
+        for (size_t index = 0; index < model.displays.size(); ++index) {
+            auto const& display = model.displays[index];
+            Button screen;
+            auto width = (std::max)(64.0,
+                static_cast<double>(display.bounds.right - display.bounds.left) * scale - 5.0);
+            auto height = (std::max)(42.0,
+                static_cast<double>(display.bounds.bottom - display.bounds.top) * scale - 5.0);
+            screen.Width(width);
+            screen.Height(height);
+            screen.Padding(ThicknessHelper::FromLengths(8, 5, 8, 5));
+            screen.HorizontalContentAlignment(HorizontalAlignment::Center);
+            screen.VerticalContentAlignment(VerticalAlignment::Center);
+            screen.Tag(box_value(motion::utf8_to_wide(display.displayId)));
+            if (display.displayId == selectedDisplayId) {
+                screen.Background(Microsoft::UI::Xaml::Media::SolidColorBrush{
+                    Windows::UI::ColorHelper::FromArgb(255, 234, 242, 255) });
+                screen.BorderBrush(Microsoft::UI::Xaml::Media::SolidColorBrush{
+                    Windows::UI::ColorHelper::FromArgb(255, 10, 115, 232) });
+                screen.BorderThickness(ThicknessHelper::FromUniformLength(2));
+            }
+            StackPanel label;
+            label.Spacing(1);
+            TextBlock title;
+            title.Text(L"显示器 " + std::to_wstring(index + 1) +
+                (display.primary ? L" · 主屏" : L""));
+            title.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+            title.TextAlignment(TextAlignment::Center);
+            TextBlock assignment;
+            std::wstring assignmentText = L"继承当前壁纸";
+            if (display.assignment) {
+                auto group = std::find_if(groups.begin(), groups.end(), [&](auto const& value) {
+                    return value.id == display.assignment->groupId;
+                });
+                assignmentText = group == groups.end() ? L"已独立分配" : group->name;
+            }
+            assignment.Text(assignmentText);
+            assignment.FontSize(11);
+            assignment.Foreground(Microsoft::UI::Xaml::Media::SolidColorBrush{
+                Windows::UI::ColorHelper::FromArgb(255, 114, 120, 129) });
+            assignment.TextTrimming(TextTrimming::CharacterEllipsis);
+            assignment.TextAlignment(TextAlignment::Center);
+            label.Children().Append(title);
+            label.Children().Append(assignment);
+            screen.Content(label);
+            Automation::AutomationProperties::SetName(screen,
+                hstring(L"选择显示器 " + std::to_wstring(index + 1) + L" 分配壁纸"));
+            auto displayId = display.displayId;
+            screen.Click([weak = get_weak(), displayId = std::move(displayId)](auto const&, auto const&) {
+                if (auto self = weak.get()) self->SelectDisplayFromLayout(displayId);
+            });
+            Canvas::SetLeft(screen, offsetX +
+                (display.bounds.left - model.virtualBounds.left) * scale);
+            Canvas::SetTop(screen, offsetY +
+                (display.bounds.top - model.virtualBounds.top) * scale);
+            canvas.Children().Append(screen);
+        }
+        DisplayLayoutHint().Text(selectedDisplayId.empty()
+            ? L"点击一块屏幕，再从壁纸库中直接选择要分配的壁纸。"
+            : L"已选择一块屏幕；点击后可立即更换它的独立壁纸。");
+    }
+
+    void MainWindow::SelectDisplayFromLayout(std::string const& displayId)
+    {
+        selectedDisplayId = displayId;
+        bool wasInitializing = initializing;
+        initializing = true;
+        for (uint32_t index = 0; index < DisplayTargetPicker().Items().Size(); ++index) {
+            auto item = DisplayTargetPicker().Items().GetAt(index).try_as<ComboBoxItem>();
+            if (item && motion::wide_to_utf8(
+                    unbox_value_or<hstring>(item.Tag(), {}).c_str()) == displayId) {
+                DisplayTargetPicker().SelectedIndex(static_cast<int32_t>(index));
+                break;
+            }
+        }
+        initializing = wasInitializing;
+        RefreshDisplayLayout();
+        RefreshMedia();
+        ShowWallpaperPage();
+        ShowStatus(L"已选择显示器；现在点击一张壁纸即可直接分配。");
     }
 
     std::pair<std::string, std::string> MainWindow::SelectedWallpaperForTarget() const
@@ -577,12 +958,24 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::SelectWallpaperForTarget(std::string const& groupId, std::string const& mediaId, std::string const& displayId)
     {
+        pendingSelectionGroupId = groupId;
+        pendingSelectionMediaId = mediaId;
         if (displayId.empty()) {
             settings.selectedGroupId = groupId;
             settings.selectedMediaId = mediaId;
             settings.displayAssignments.clear();
             return;
         }
+        // Choosing a concrete screen from the layout is itself an explicit
+        // request for independent per-display playback. Without this switch an
+        // assignment could be saved successfully while the Agent continued to
+        // ignore it in the previous "same wallpaper"/"primary only" mode.
+        settings.displayMode = "independent";
+        bool wasInitializing = initializing;
+        initializing = true;
+        select_tag(DisplayMode(), L"independent");
+        DisplayTargetPicker().IsEnabled(displays.size() > 1);
+        initializing = wasInitializing;
         auto assignment = std::find_if(settings.displayAssignments.begin(), settings.displayAssignments.end(),
             [&](auto const& value) { return value.displayId == displayId; });
         if (assignment == settings.displayAssignments.end()) {
@@ -593,15 +986,255 @@ namespace winrt::MotionWallpaper::implementation
         }
     }
 
-    void MainWindow::RemoveMediaAssignments(std::string const& groupId, std::string const& mediaId)
+    void MainWindow::ReplaceMediaReferences(
+        std::string const& oldGroupId, std::string const& oldMediaId,
+        std::string const& newGroupId, std::string const& newMediaId)
     {
+        auto replace = [&](std::string& groupId, std::string& mediaId) {
+            if (groupId != oldGroupId || mediaId != oldMediaId) return;
+            groupId = newGroupId;
+            mediaId = newMediaId;
+        };
+        replace(settings.selectedGroupId, settings.selectedMediaId);
+        replace(pendingSelectionGroupId, pendingSelectionMediaId);
+        for (auto& assignment : settings.displayAssignments) {
+            replace(assignment.groupId, assignment.mediaId);
+        }
+        for (auto& scene : settings.scenes) {
+            replace(scene.defaultGroupId, scene.defaultMediaId);
+            for (auto& assignment : scene.displayAssignments) {
+                replace(assignment.groupId, assignment.mediaId);
+            }
+        }
+    }
+
+    void MainWindow::RemoveMediaReferences(
+        std::string const& groupId, std::string const& mediaId)
+    {
+        auto clearDefault = [&](std::string& candidateGroupId, std::string& candidateMediaId) {
+            if (candidateGroupId != groupId || candidateMediaId != mediaId) return;
+            candidateGroupId.clear();
+            candidateMediaId.clear();
+        };
+        if (settings.selectedGroupId == groupId && settings.selectedMediaId == mediaId) {
+            settings.selectedMediaId.clear();
+        }
+        clearDefault(pendingSelectionGroupId, pendingSelectionMediaId);
         std::erase_if(settings.displayAssignments, [&](auto const& assignment) {
             return assignment.groupId == groupId && assignment.mediaId == mediaId;
         });
+        for (auto& scene : settings.scenes) {
+            clearDefault(scene.defaultGroupId, scene.defaultMediaId);
+            std::erase_if(scene.displayAssignments, [&](auto const& assignment) {
+                return assignment.groupId == groupId && assignment.mediaId == mediaId;
+            });
+        }
+    }
+
+    void MainWindow::RemoveGroupReferences(std::string const& groupId)
+    {
+        if (settings.selectedGroupId == groupId) {
+            settings.selectedGroupId.clear();
+            settings.selectedMediaId.clear();
+        }
+        if (pendingSelectionGroupId == groupId) {
+            pendingSelectionGroupId.clear();
+            pendingSelectionMediaId.clear();
+        }
+        if (settings.randomGroupId == groupId) settings.randomGroupId.clear();
+        std::erase_if(settings.displayAssignments,
+            [&](auto const& assignment) { return assignment.groupId == groupId; });
+        for (auto& scene : settings.scenes) {
+            if (scene.defaultGroupId == groupId) {
+                scene.defaultGroupId.clear();
+                scene.defaultMediaId.clear();
+            }
+            std::erase_if(scene.displayAssignments,
+                [&](auto const& assignment) { return assignment.groupId == groupId; });
+        }
+    }
+
+    void MainWindow::UpdateRuntimeStatus()
+    {
+        DisplayRuntimeCards().Children().Clear();
+        auto states = runtimeState.displayStates;
+        if (states.empty()) {
+            for (auto const& display : displays) {
+                motion::DisplayRuntimeState state;
+                state.displayId = display.id;
+                state.deviceName = display.deviceName;
+                state.displayName = display.friendlyName;
+                state.groupId = settings.selectedGroupId;
+                state.mediaId = settings.selectedMediaId;
+                if (settings.displayMode == "independent") {
+                    auto assignment = std::find_if(settings.displayAssignments.begin(),
+                        settings.displayAssignments.end(), [&](auto const& value) {
+                            return value.displayId == display.id;
+                        });
+                    if (assignment != settings.displayAssignments.end()) {
+                        state.groupId = assignment->groupId;
+                        state.mediaId = assignment->mediaId;
+                    }
+                }
+                if (!settings.desktopPlayback || state.mediaId.empty()) {
+                    state.state = "paused";
+                    state.reason = settings.desktopPlayback ? "no-wallpaper" : "playback-stopped";
+                } else if (state.groupId == appliedGroupId && state.mediaId == appliedMediaId) {
+                    state.state = settings.activePlaybackEnabled ? "applied" : "paused";
+                    state.reason = settings.activePlaybackEnabled ? "" : "active-playback-disabled";
+                    state.canRestartRenderer = true;
+                } else {
+                    state.state = "applying";
+                    state.reason = "waiting-for-first-frame";
+                }
+                states.push_back(std::move(state));
+            }
+        }
+        bool agentKnownDead = !runtimeState.agentProcessId ||
+            !process_is_running(runtimeState.agentProcessId);
+        for (auto& state : states) {
+            if (agentKnownDead && state.state != "paused") {
+                state.state = "failed";
+                state.reason = "agent-not-running";
+                state.canRetry = true;
+                state.canRestartRenderer = false;
+            } else if (state.rendererProcessId && state.state != "paused" &&
+                !process_is_running(state.rendererProcessId)) {
+                state.state = "failed";
+                state.reason = "renderer-process-failed";
+                state.canRetry = true;
+                // The Agent is still alive and owns the failed route, so both
+                // recovery choices remain meaningful even before its next
+                // runtime publication catches up with the process exit.
+                state.canRestartRenderer = true;
+            }
+        }
+
+        uint32_t applying{}, optimizing{}, paused{}, degraded{}, failed{}, applied{};
+        bool canRetry{}, canRestart{};
+        for (size_t index = 0; index < states.size(); ++index) {
+            auto const& state = states[index];
+            if (state.state == "applying") ++applying;
+            else if (state.state == "optimizing") ++optimizing;
+            else if (state.state == "paused") ++paused;
+            else if (state.state == "degraded") ++degraded;
+            else if (state.state == "failed") ++failed;
+            else if (state.state == "applied") ++applied;
+            canRetry = canRetry || state.canRetry;
+            canRestart = canRestart || state.canRestartRenderer;
+
+            Border card;
+            card.Padding(ThicknessHelper::FromLengths(12, 10, 12, 10));
+            card.CornerRadius(CornerRadiusHelper::FromUniformRadius(9));
+            card.Background(Microsoft::UI::Xaml::Media::SolidColorBrush{
+                Windows::UI::ColorHelper::FromArgb(255, 246, 248, 251) });
+
+            Grid layout;
+            layout.ColumnSpacing(10);
+            ColumnDefinition dotColumn;
+            dotColumn.Width(GridLengthHelper::FromPixels(10));
+            layout.ColumnDefinitions().Append(dotColumn);
+            ColumnDefinition displayColumn;
+            displayColumn.Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
+            layout.ColumnDefinitions().Append(displayColumn);
+            ColumnDefinition stateColumn;
+            stateColumn.Width(GridLengthHelper::Auto());
+            layout.ColumnDefinitions().Append(stateColumn);
+            ColumnDefinition actionColumn;
+            actionColumn.Width(GridLengthHelper::Auto());
+            layout.ColumnDefinitions().Append(actionColumn);
+
+            Border dot;
+            dot.Width(9);
+            dot.Height(9);
+            dot.CornerRadius(CornerRadiusHelper::FromUniformRadius(5));
+            dot.Background(Microsoft::UI::Xaml::Media::SolidColorBrush{
+                runtime_state_color(state.state) });
+            dot.VerticalAlignment(VerticalAlignment::Center);
+            layout.Children().Append(dot);
+
+            StackPanel identity;
+            identity.Spacing(2);
+            auto displayName = state.displayName.empty()
+                ? L"显示器 " + std::to_wstring(index + 1) : state.displayName;
+            TextBlock name;
+            name.Text(displayName);
+            name.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+            identity.Children().Append(name);
+            TextBlock reason;
+            auto reasonText = runtime_reason_label(state.reason);
+            reason.Text(reasonText.empty() ? L"运行正常" : reasonText);
+            reason.FontSize(12);
+            reason.Opacity(0.62);
+            reason.TextWrapping(TextWrapping::Wrap);
+            identity.Children().Append(reason);
+            Grid::SetColumn(identity, 1);
+            layout.Children().Append(identity);
+
+            Border statusChip;
+            statusChip.Padding(ThicknessHelper::FromLengths(9, 4, 9, 4));
+            statusChip.CornerRadius(CornerRadiusHelper::FromUniformRadius(10));
+            auto stateColor = runtime_state_color(state.state);
+            statusChip.Background(Microsoft::UI::Xaml::Media::SolidColorBrush{
+                Windows::UI::ColorHelper::FromArgb(24, stateColor.R, stateColor.G, stateColor.B) });
+            TextBlock status;
+            status.Text(runtime_state_label(state.state));
+            status.FontSize(12);
+            status.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+            status.Foreground(Microsoft::UI::Xaml::Media::SolidColorBrush{ stateColor });
+            statusChip.Child(status);
+            Grid::SetColumn(statusChip, 2);
+            layout.Children().Append(statusChip);
+
+            if (state.canRetry || state.canRestartRenderer) {
+                StackPanel actions;
+                actions.Orientation(Orientation::Horizontal);
+                actions.Spacing(6);
+                if (state.canRetry) {
+                    Button retry;
+                    retry.Content(box_value(L"重试"));
+                    retry.Padding(ThicknessHelper::FromLengths(9, 4, 9, 4));
+                    auto displayId = state.displayId;
+                    retry.Click([weak = get_weak(), displayId = std::move(displayId)](auto const&, auto const&) {
+                        if (auto self = weak.get()) self->SendRuntimeControl("retry", displayId);
+                    });
+                    actions.Children().Append(retry);
+                }
+                if (state.canRestartRenderer) {
+                    Button restart;
+                    restart.Content(box_value(L"重启"));
+                    restart.Padding(ThicknessHelper::FromLengths(9, 4, 9, 4));
+                    auto displayId = state.displayId;
+                    restart.Click([weak = get_weak(), displayId = std::move(displayId)](auto const&, auto const&) {
+                        if (auto self = weak.get()) self->SendRuntimeControl("restart-renderer", displayId);
+                    });
+                    actions.Children().Append(restart);
+                }
+                Grid::SetColumn(actions, 3);
+                layout.Children().Append(actions);
+            }
+
+            Automation::AutomationProperties::SetName(card,
+                hstring(displayName + L"，" + runtime_state_label(state.state) +
+                    (reasonText.empty() ? std::wstring{} : L"，" + reasonText)));
+            card.Child(layout);
+            DisplayRuntimeCards().Children().Append(card);
+        }
+
+        RetryRuntimeButton().IsEnabled(canRetry || failed > 0);
+        RestartRendererButton().IsEnabled(canRestart);
+        if (states.empty()) RuntimeStatusSummary().Text(L"后台服务尚未发布显示器状态");
+        else if (failed) RuntimeStatusSummary().Text(std::to_wstring(failed) + L" 块屏幕应用失败，可重试或重启渲染");
+        else if (optimizing) RuntimeStatusSummary().Text(std::to_wstring(optimizing) + L" 块屏幕正在准备节能优化版本");
+        else if (applying) RuntimeStatusSummary().Text(std::to_wstring(applying) + L" 块屏幕正在等待首帧确认");
+        else if (degraded) RuntimeStatusSummary().Text(std::to_wstring(degraded) + L" 块屏幕正在使用兼容播放路径");
+        else if (paused && !applied) RuntimeStatusSummary().Text(L"所有屏幕均已暂停");
+        else RuntimeStatusSummary().Text(L"所有目标屏幕均已确认应用");
     }
 
     void MainWindow::UpdateStatusSummary()
     {
+        UpdateRuntimeStatus();
         auto writeLease = TryAcquireLibraryWrite(false);
         if (!writeLease) return;
         CurrentWallpaperName().Text(L"尚未选择壁纸");
@@ -613,10 +1246,64 @@ namespace winrt::MotionWallpaper::implementation
         CurrentWallpaperThumb4().Source(nullptr);
         CurrentWallpaperOverflowOverlay().Visibility(Visibility::Collapsed);
         bool currentIsVideo = false;
+        auto summaryGroupId = appliedGroupId;
+        auto summaryMediaId = appliedMediaId;
+        if (!selectedDisplayId.empty()) {
+            auto displayState = std::find_if(runtimeState.displayStates.begin(),
+                runtimeState.displayStates.end(), [&](auto const& state) {
+                    return state.displayId == selectedDisplayId &&
+                        motion::valid_id(state.groupId) && motion::valid_id(state.mediaId);
+                });
+            if (displayState != runtimeState.displayStates.end()) {
+                summaryGroupId = displayState->groupId;
+                summaryMediaId = displayState->mediaId;
+            }
+        } else {
+            // During an all-display transition the Agent intentionally keeps
+            // runtime.active* on the last confirmed route until replacement is
+            // safe. A restarted App has no local pendingSelection marker, so
+            // use the per-display target only when every trustworthy route
+            // agrees and none is still pre-first-frame or failed. This also
+            // preserves tray "next" selections, which exist only in runtime.
+            std::pair<std::string, std::string> consistentTarget;
+            bool sawTarget{};
+            bool trustworthy{ true };
+            for (auto const& state : runtimeState.displayStates) {
+                if (!motion::valid_id(state.groupId) ||
+                    !motion::valid_id(state.mediaId)) continue;
+                if (state.state == "failed" || state.state == "applying") {
+                    trustworthy = false;
+                    break;
+                }
+                if (!sawTarget) {
+                    consistentTarget = { state.groupId, state.mediaId };
+                    sawTarget = true;
+                } else if (consistentTarget.first != state.groupId ||
+                    consistentTarget.second != state.mediaId) {
+                    trustworthy = false;
+                    break;
+                }
+            }
+            if (sawTarget && trustworthy) {
+                summaryGroupId = consistentTarget.first;
+                summaryMediaId = consistentTarget.second;
+            }
+        }
+        auto desired = SelectedWallpaperForTarget();
+        bool selectionPending = motion::valid_id(pendingSelectionGroupId) &&
+            motion::valid_id(pendingSelectionMediaId) &&
+            desired.first == pendingSelectionGroupId && desired.second == pendingSelectionMediaId &&
+            (desired.first != summaryGroupId || desired.second != summaryMediaId);
+        if (selectionPending) {
+            // A click must be visible immediately even while the Agent waits for
+            // the Renderer first-frame ACK or prepares an optimization version.
+            summaryGroupId = desired.first;
+            summaryMediaId = desired.second;
+        }
 
-        if (motion::valid_id(appliedGroupId) && motion::valid_id(appliedMediaId)) {
-            auto media = mediaLibrary->LoadMedia(appliedGroupId);
-            auto selected = std::find_if(media.begin(), media.end(), [&](auto const& item) { return item.id == appliedMediaId; });
+        if (motion::valid_id(summaryGroupId) && motion::valid_id(summaryMediaId)) {
+            auto media = mediaLibrary->LoadMedia(summaryGroupId);
+            auto selected = std::find_if(media.begin(), media.end(), [&](auto const& item) { return item.id == summaryMediaId; });
             if (selected != media.end()) {
                 currentIsVideo = selected->kind == "video";
                 CurrentWallpaperName().Text(selected->name);
@@ -624,7 +1311,7 @@ namespace winrt::MotionWallpaper::implementation
                 CurrentWallpaperDetails().Text(selected->kind == "image"
                     ? L"静态图片 · " + format_size(selected->sizeBytes)
                     : sourceAvailable ? L"视频 · " + format_size(selected->sizeBytes)
-                    : L"视频 · 仅保留性能副本");
+                    : L"视频 · 仅保留优化版本");
                 auto cover = mediaLibrary->MediaDirectory(*selected) / selected->coverFileName;
                 if (!selected->coverFileName.empty() && fs::is_regular_file(cover)) {
                     CurrentWallpaperPreview().Source(Microsoft::UI::Xaml::Media::Imaging::BitmapImage{ Windows::Foundation::Uri(file_uri(cover)) });
@@ -650,9 +1337,24 @@ namespace winrt::MotionWallpaper::implementation
             }
         }
 
-        PlaybackStatusText().Text(!settings.desktopPlayback
-            ? L"已停止"
-            : settings.activePlaybackEnabled ? L"正在播放" : L"已冻结省电");
+        std::string visibleState;
+        auto statusRank = [](std::string const& state) {
+            if (state == "failed") return 6;
+            if (state == "optimizing") return 5;
+            if (state == "applying") return 4;
+            if (state == "degraded") return 3;
+            if (state == "paused") return 2;
+            if (state == "applied") return 1;
+            return 0;
+        };
+        for (auto const& state : runtimeState.displayStates) {
+            if (state.groupId != summaryGroupId || state.mediaId != summaryMediaId) continue;
+            if (statusRank(state.state) > statusRank(visibleState)) visibleState = state.state;
+        }
+        if (selectionPending && visibleState.empty()) visibleState = "applying";
+        if (!settings.desktopPlayback) visibleState = "paused";
+        else if (visibleState.empty()) visibleState = settings.activePlaybackEnabled ? "applied" : "paused";
+        PlaybackStatusText().Text(runtime_state_label(visibleState));
         std::wstring decodeStatus;
         if (actualDecodePath == "automatic") decodeStatus = L"自动解码 · 已启用 DXGI/DXVA 路径";
         else if (actualDecodePath == "hardware") decodeStatus = L"硬件解码 · 已请求 DXGI/DXVA 路径";
@@ -740,6 +1442,7 @@ namespace winrt::MotionWallpaper::implementation
         GroupPicker().SelectedIndex(selected);
         initializing = wasInitializing;
         if (settingsChanged) TrySaveSettings();
+        RefreshDisplayLayout();
     }
 
     std::string MainWindow::ActiveGroupId()
@@ -797,20 +1500,74 @@ namespace winrt::MotionWallpaper::implementation
         });
     }
 
+    bool MainWindow::CatalogQueryActive()
+    {
+        return !MediaSearchBox().Text().empty() ||
+            !MediaTagFilter().Text().empty() ||
+            unbox_value_or<bool>(FavoritesOnlyButton().IsChecked(), false) ||
+            !combo_string(MediaKindFilter(), {}).empty();
+    }
+
+    std::vector<motion::MediaMetadata> MainWindow::SelectedMediaItems()
+    {
+        std::vector<motion::MediaMetadata> result;
+        if (!batchSelectionMode) {
+            auto index = MediaList().SelectedIndex();
+            if (index >= 0 && static_cast<size_t>(index) < filteredMedia.size()) {
+                result.push_back(filteredMedia[static_cast<size_t>(index)]);
+            }
+            return result;
+        }
+        for (auto const& selected : MediaList().SelectedItems()) {
+            uint32_t itemIndex{};
+            if (!MediaList().Items().IndexOf(selected, itemIndex) ||
+                itemIndex >= filteredMedia.size()) continue;
+            result.push_back(filteredMedia[itemIndex]);
+        }
+        return result;
+    }
+
     void MainWindow::RefreshMedia()
     {
         auto writeLease = TryAcquireLibraryWrite(false);
         if (!writeLease) return;
         bool wasInitializing = initializing;
         initializing = true;
-        filteredMedia = allMedia;
         auto sort = combo_string(SortPicker(), "name");
-        std::stable_sort(filteredMedia.begin(), filteredMedia.end(), [&](auto const& left, auto const& right) {
-            if (sort == "newest") return left.importedAt > right.importedAt;
-            if (sort == "size") return left.sizeBytes > right.sizeBytes;
-            if (sort == "kind" && left.kind != right.kind) return left.kind == "video";
-            return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
-        });
+        bool catalogQuery = CatalogQueryActive();
+        mediaGroupNames.clear();
+        if (catalogQuery) {
+            motion::app::MediaQuery query;
+            query.text = MediaSearchBox().Text().c_str();
+            query.tags = parse_media_tags(MediaTagFilter().Text().c_str());
+            query.kind = combo_string(MediaKindFilter(), {});
+            query.favoritesOnly = unbox_value_or<bool>(FavoritesOnlyButton().IsChecked(), false);
+            query.sort = sort == "newest" ? motion::app::MediaCatalogSort::Newest
+                : sort == "size" ? motion::app::MediaCatalogSort::Size
+                : sort == "kind" ? motion::app::MediaCatalogSort::Kind
+                : motion::app::MediaCatalogSort::Name;
+            auto entries = mediaLibrary->QueryMedia(query);
+            filteredMedia.clear();
+            filteredMedia.reserve(entries.size());
+            for (auto& entry : entries) {
+                mediaGroupNames[entry.media.id] = std::move(entry.groupName);
+                filteredMedia.push_back(std::move(entry.media));
+            }
+        } else {
+            filteredMedia = allMedia;
+            auto group = std::find_if(groups.begin(), groups.end(), [&](auto const& value) {
+                return value.id == ActiveGroupId();
+            });
+            for (auto const& media : filteredMedia) {
+                if (group != groups.end()) mediaGroupNames[media.id] = group->name;
+            }
+            std::stable_sort(filteredMedia.begin(), filteredMedia.end(), [&](auto const& left, auto const& right) {
+                if (sort == "newest") return left.importedAt > right.importedAt;
+                if (sort == "size") return left.sizeBytes > right.sizeBytes;
+                if (sort == "kind" && left.kind != right.kind) return left.kind == "video";
+                return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
+            });
+        }
         MediaList().Items().Clear();
         int selected = -1;
         auto selectedWallpaper = SelectedWallpaperForTarget();
@@ -842,18 +1599,37 @@ namespace winrt::MotionWallpaper::implementation
             }
             preview.Child(previewContent);
             TextBlock name;
-            name.Text(media.name);
+            name.Text((media.favorite ? std::wstring(L"★ ") : std::wstring{}) + media.name);
             name.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
             name.TextTrimming(TextTrimming::CharacterEllipsis);
             content.Children().Append(preview);
             content.Children().Append(name);
+            if (catalogQuery || !media.tags.empty()) {
+                TextBlock metadata;
+                std::wstring detail;
+                auto group = mediaGroupNames.find(media.id);
+                if (catalogQuery && group != mediaGroupNames.end()) detail = group->second;
+                if (!media.tags.empty()) {
+                    if (!detail.empty()) detail += L" · ";
+                    for (size_t tagIndex = 0; tagIndex < media.tags.size(); ++tagIndex) {
+                        if (tagIndex) detail += L"  ";
+                        detail += L"#" + media.tags[tagIndex];
+                    }
+                }
+                metadata.Text(detail);
+                metadata.FontSize(12);
+                metadata.Opacity(0.62);
+                metadata.TextTrimming(TextTrimming::CharacterEllipsis);
+                content.Children().Append(metadata);
+            }
             card.Content(content);
             set_media_card_selected(card, isSelected);
             MediaList().Items().Append(card);
             if (isSelected) selected = static_cast<int>(index);
         }
-        MediaCount().Text(std::to_wstring(filteredMedia.size()) + L" 个壁纸");
-        MediaList().SelectedIndex(selected);
+        MediaCount().Text((catalogQuery ? std::wstring(L"全库 ") : std::wstring{}) +
+            std::to_wstring(filteredMedia.size()) + L" 个壁纸");
+        if (!batchSelectionMode) MediaList().SelectedIndex(selected);
         UpdateMediaActionState();
         initializing = wasInitializing;
     }
@@ -888,15 +1664,51 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::UpdateMediaActionState()
     {
-        auto index = MediaList().SelectedIndex();
-        bool valid = index >= 0 && static_cast<size_t>(index) < filteredMedia.size();
-        DeleteMediaButton().IsEnabled(valid);
-        RenameMediaButton().IsEnabled(valid);
-        MoveMediaButton().IsEnabled(valid && groups.size() > 1);
+        auto selected = SelectedMediaItems();
+        bool any = !selected.empty();
+        bool single = selected.size() == 1;
+        DeleteMediaButton().IsEnabled(single);
+        RenameMediaButton().IsEnabled(single);
+        MoveMediaButton().IsEnabled(single && groups.size() > 1);
+        FavoriteMediaButton().IsEnabled(any);
+        TagMediaButton().IsEnabled(any);
 
     }
 
     void MainWindow::Sort_Changed(IInspectable const&, SelectionChangedEventArgs const&) { if (!initializing) RefreshMedia(); }
+
+    void MainWindow::MediaSearch_Changed(IInspectable const&, TextChangedEventArgs const&)
+    {
+        if (initializing) return;
+        catalogSearchTimer.Stop();
+        catalogSearchTimer.Start();
+    }
+
+    void MainWindow::MediaFilter_Changed(IInspectable const&, SelectionChangedEventArgs const&)
+    {
+        if (!initializing) RefreshMedia();
+    }
+
+    void MainWindow::MediaFilter_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        if (!initializing) RefreshMedia();
+    }
+
+    void MainWindow::BatchMode_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        if (initializing) return;
+        batchSelectionMode = unbox_value_or<bool>(BatchModeButton().IsChecked(), false);
+        bool wasInitializing = initializing;
+        initializing = true;
+        MediaList().SelectionMode(batchSelectionMode
+            ? ListViewSelectionMode::Multiple : ListViewSelectionMode::Single);
+        MediaList().SelectedItems().Clear();
+        initializing = wasInitializing;
+        RefreshMedia();
+        ShowStatus(batchSelectionMode
+            ? L"批量管理已开启；可多选后统一收藏或添加标签。"
+            : L"已返回单击应用壁纸模式。");
+    }
 
     void MainWindow::Settings_Changed(IInspectable const&, RoutedEventArgs const&)
     {
@@ -947,6 +1759,208 @@ namespace winrt::MotionWallpaper::implementation
             ShowWallpaperPage();
             return;
         }
+    }
+
+    void MainWindow::RetryRuntime_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        SendRuntimeControl("retry", {});
+    }
+
+    void MainWindow::RestartRenderer_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        SendRuntimeControl("restart-renderer", {});
+    }
+
+    void MainWindow::SendRuntimeControl(
+        std::string const& action, std::string const& displayId)
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (!pendingRuntimeCommandId.empty() &&
+            now - pendingRuntimeCommandAt < std::chrono::seconds(10)) {
+            ShowStatus(L"上一条恢复指令仍在执行，请等待状态确认后再试。", true);
+            return;
+        }
+        pendingRuntimeCommandId.clear();
+        auto requestId = motion::request_runtime_control(
+            root / L"Config" / L"runtime-command.json", action, displayId);
+        if (!requestId) {
+            ShowStatus(action == "retry"
+                ? L"无法发送重试请求；正在尝试重新启动后台服务。"
+                : L"无法发送渲染重启请求；正在尝试重新启动后台服务。", true);
+            StartController();
+            return;
+        }
+        pendingRuntimeCommandId = std::move(*requestId);
+        pendingRuntimeCommandAt = now;
+        if (!runtimeState.agentProcessId || !process_is_running(runtimeState.agentProcessId)) {
+            StartController();
+        }
+        if (action == "retry") {
+            ShowStatus(displayId.empty()
+                ? L"已请求重试所有失败的屏幕。"
+                : L"已请求重试这块屏幕。");
+        } else {
+            ShowStatus(displayId.empty()
+                ? L"正在安全重启所有活动渲染器…"
+                : L"正在安全重启这块屏幕的渲染器…");
+        }
+    }
+
+    void MainWindow::PreviewScreensaver_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        if (!motion::valid_id(settings.selectedGroupId) || !motion::valid_id(settings.selectedMediaId)) {
+            ShowStatus(L"请先选择一张壁纸，再预览屏保。", true);
+            return;
+        }
+        if (!motion::notify_agent_command(motion::AgentCommand::PreviewScreensaver)) {
+            StartController();
+            ShowStatus(L"后台服务正在启动，请稍后再次点击“立即预览”。", true);
+            return;
+        }
+        ShowStatus(L"正在进入屏保预览；移动鼠标或按任意键即可退出。");
+    }
+
+    void MainWindow::ScenePicker_Changed(IInspectable const&, SelectionChangedEventArgs const&)
+    {
+        UpdateSceneControls();
+    }
+
+    void MainWindow::ApplyScene_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        if (initializing) return;
+        auto sceneId = combo_string(ScenePicker(), {});
+        auto previous = settings;
+        if (!motion::apply_scene_profile(settings, sceneId)) {
+            ShowStatus(L"无法应用此场景；场景设置可能已损坏。", true);
+            return;
+        }
+        if (!TrySaveSettings()) {
+            settings = std::move(previous);
+            ApplySettingsToControls();
+            return;
+        }
+        ApplySettingsToControls();
+        LoadDisplayTargets();
+        LoadGroups();
+        LoadMedia();
+        ShowStatus(L"场景已应用；壁纸、屏幕分配和播放偏好已一起切换。");
+    }
+
+    void MainWindow::SaveScene_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        if (initializing) return;
+        auto sceneId = combo_string(ScenePicker(), {});
+        auto scene = motion::find_scene_profile(settings, sceneId);
+        if (!scene) return;
+        ContentDialog dialog;
+        dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
+        dialog.Title(box_value(L"保存到“" + scene->name + L"”场景？"));
+        dialog.Content(box_value(L"将记录当前默认壁纸、每块屏幕的独立分配、性能模式、活动播放和屏保偏好。自动切换规则不会改变。"));
+        dialog.PrimaryButtonText(L"保存场景");
+        dialog.CloseButtonText(L"取消");
+        dialog.DefaultButton(ContentDialogButton::Primary);
+        auto operation = dialog.ShowAsync();
+        operation.Completed([weak = get_weak(), sceneId = std::move(sceneId)](auto const& result,
+            Windows::Foundation::AsyncStatus status) {
+            if (status != Windows::Foundation::AsyncStatus::Completed ||
+                result.GetResults() != ContentDialogResult::Primary) return;
+            if (auto self = weak.get()) {
+                auto previous = self->settings;
+                auto destination = motion::find_scene_profile(self->settings, sceneId);
+                if (!destination || !motion::capture_scene_profile(self->settings, *destination) ||
+                    !self->TrySaveSettings()) {
+                    self->settings = std::move(previous);
+                    self->LoadScenes();
+                    self->ShowStatus(L"无法保存场景设置。", true);
+                    return;
+                }
+                self->LoadScenes();
+                self->ShowStatus(L"当前壁纸与屏幕布局已保存到场景。");
+            }
+        });
+    }
+
+    void MainWindow::SceneAutoSwitch_Changed(IInspectable const&, RoutedEventArgs const&)
+    {
+        if (initializing) return;
+        auto scene = motion::find_scene_profile(settings, combo_string(ScenePicker(), {}));
+        if (!scene || scene->activation.trigger == "manual") return;
+        bool previous = scene->activation.enabled;
+        scene->activation.enabled = SceneAutoSwitch().IsOn();
+        if (!TrySaveSettings()) {
+            scene->activation.enabled = previous;
+            UpdateSceneControls();
+            return;
+        }
+        ShowStatus(scene->activation.enabled
+            ? L"已启用此场景的自动切换规则。"
+            : L"已关闭此场景的自动切换规则。");
+    }
+
+    void MainWindow::ApplyOptimizationQuota_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        auto quota = combo_uint64(OptimizationQuota(), 10ULL * 1024 * 1024 * 1024);
+        settings.optimizationStorageQuotaBytes = quota;
+        if (!TrySaveSettings()) return;
+        if (!quota) {
+            ShowStatus(L"磁盘配额已设为不限制；现有优化版本不会被自动清理。");
+            return;
+        }
+        motion::app::OptimizationStorageSummary summary;
+        try { summary = mediaLibrary->InspectOptimizationStorage(); }
+        catch (...) {
+            ShowStatus(L"无法读取优化存储状态。", true);
+            return;
+        }
+        if (summary.bytes <= quota) {
+            ShowStatus(L"优化版本当前占用未超过所选配额，无需清理。");
+            return;
+        }
+        ContentDialog dialog;
+        dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
+        dialog.Title(box_value(L"按磁盘配额整理？"));
+        dialog.Content(box_value(L"当前优化版本占用 " + format_size(summary.bytes) +
+            L"，将从最久未使用且仍保留源文件的项目开始清理，直到不超过 " +
+            format_size(quota) + L"。当前壁纸和仅剩优化版本的项目会受到保护。"));
+        dialog.PrimaryButtonText(L"开始整理");
+        dialog.CloseButtonText(L"取消");
+        dialog.DefaultButton(ContentDialogButton::Close);
+        auto operation = dialog.ShowAsync();
+        operation.Completed([weak = get_weak(), quota](auto const& result,
+            Windows::Foundation::AsyncStatus status) {
+            if (status != Windows::Foundation::AsyncStatus::Completed ||
+                result.GetResults() != ContentDialogResult::Primary) return;
+            if (auto self = weak.get()) self->TrimOptimizationStorage(quota, false);
+        });
+    }
+
+    void MainWindow::ReleaseOptimizationSpace_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        motion::app::OptimizationStorageSummary summary;
+        try { summary = mediaLibrary->InspectOptimizationStorage(); }
+        catch (...) {
+            ShowStatus(L"无法读取可释放空间。", true);
+            return;
+        }
+        if (!summary.reclaimableBytes) {
+            ShowStatus(L"当前没有可安全释放的优化空间；正在使用或没有源文件的版本已受保护。");
+            return;
+        }
+        ContentDialog dialog;
+        dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
+        dialog.Title(box_value(L"一键释放优化空间？"));
+        dialog.Content(box_value(L"预计可释放 " + format_size(summary.reclaimableBytes) +
+            L"。只删除仍可由源文件重新生成的优化版本；当前正在使用的壁纸和仅剩优化版本的项目不会删除。"));
+        dialog.PrimaryButtonText(L"释放空间");
+        dialog.CloseButtonText(L"取消");
+        dialog.DefaultButton(ContentDialogButton::Close);
+        auto operation = dialog.ShowAsync();
+        operation.Completed([weak = get_weak()](auto const& result,
+            Windows::Foundation::AsyncStatus status) {
+            if (status != Windows::Foundation::AsyncStatus::Completed ||
+                result.GetResults() != ContentDialogResult::Primary) return;
+            if (auto self = weak.get()) self->TrimOptimizationStorage(0, true);
+        });
     }
 
     void MainWindow::OpenNewGroup_Click(IInspectable const&, RoutedEventArgs const&)
@@ -1013,6 +2027,10 @@ namespace winrt::MotionWallpaper::implementation
             optimizationWorkVisible = optimizationWorkVisible || item.status.queued || item.status.generating;
             if (item.status.queued) ++taskCount;
         }
+        auto storage = mediaLibrary->InspectOptimizationStorage();
+        OptimizationStorageText().Text(format_size(storage.bytes) + L" 已使用 · " +
+            format_size(storage.reclaimableBytes) + L" 可安全释放 · " +
+            std::to_wstring(storage.queuedTasks) + L" 个等待任务");
 
         SYSTEM_POWER_STATUS powerStatus{};
         bool waitingForPower = GetSystemPowerStatus(&powerStatus) && powerStatus.ACLineStatus == 0;
@@ -1195,7 +2213,7 @@ namespace winrt::MotionWallpaper::implementation
                 panel.Spacing(5);
                 CheckBox heading;
                 heading.Content(box_value(title));
-                auto profileContext = item.media.name + L"，" + title + L"性能副本";
+                auto profileContext = item.media.name + L"，" + title + L"优化版本";
                 Automation::AutomationProperties::SetName(
                     heading, hstring(profileContext + L"，保留选择"));
                 heading.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
@@ -1392,6 +2410,10 @@ namespace winrt::MotionWallpaper::implementation
     void MainWindow::Media_SelectionChanged(IInspectable const&, SelectionChangedEventArgs const&)
     {
         if (initializing) return;
+        if (batchSelectionMode) {
+            UpdateMediaActionState();
+            return;
+        }
         auto writeLease = TryAcquireLibraryWrite();
         if (!writeLease) return;
         auto index = MediaList().SelectedIndex();
@@ -1419,6 +2441,8 @@ namespace winrt::MotionWallpaper::implementation
             RefreshMedia();
             return;
         }
+        UpdateStatusSummary();
+        RefreshDisplayLayout();
         ShowStatus(selectedDisplayId.empty() ? L"正在应用到所有显示器…" : L"正在应用到所选显示器…");
     }
 
@@ -1427,6 +2451,7 @@ namespace winrt::MotionWallpaper::implementation
         if (initializing) return;
         auto item = DisplayTargetPicker().SelectedItem().try_as<ComboBoxItem>();
         selectedDisplayId = item ? motion::wide_to_utf8(unbox_value_or<hstring>(item.Tag(), {}).c_str()) : std::string{};
+        RefreshDisplayLayout();
         RefreshMedia();
     }
 
@@ -1551,19 +2576,18 @@ namespace winrt::MotionWallpaper::implementation
         auto previousSettings = settings;
         auto previousBrowsingGroup = browsingGroupId;
         try {
-            if (settings.selectedGroupId == group.id) {
-                auto replacement = std::find_if(groups.begin(), groups.end(),
+            bool replacingCurrentGroup = settings.selectedGroupId == group.id;
+            auto replacement = groups.end();
+            if (replacingCurrentGroup) {
+                replacement = std::find_if(groups.begin(), groups.end(),
                     [&](auto const& item) { return item.id != group.id; });
                 if (replacement == groups.end()) {
                     throw std::runtime_error("replacement group not found");
                 }
-                settings.selectedGroupId = replacement->id;
-                settings.selectedMediaId.clear();
             }
+            RemoveGroupReferences(group.id);
+            if (replacingCurrentGroup) settings.selectedGroupId = replacement->id;
             if (browsingGroupId == group.id) browsingGroupId.clear();
-            if (settings.randomGroupId == group.id) settings.randomGroupId.clear();
-            std::erase_if(settings.displayAssignments,
-                [&](auto const& assignment) { return assignment.groupId == group.id; });
             SaveSettings();
         } catch (...) {
             settings = std::move(previousSettings);
@@ -1746,7 +2770,7 @@ namespace winrt::MotionWallpaper::implementation
                     if (!errorMessage.empty()) self->ShowStatus(errorMessage, true);
                     else if (cancelled) self->ShowStatus(completedFiles ? L"导入已取消，已完成的文件已经保留。" : L"导入已取消。");
                     else if (kind == "video") self->ShowStatus(optimizationRequested
-                        ? L"视频与首帧封面已导入，性能副本正在后台生成。"
+                        ? L"视频与首帧封面已导入，节能优化版本正在后台生成。"
                         : L"视频与首帧封面已导入，当前保留原始文件播放。");
                     else self->ShowStatus(L"静态壁纸已导入，并生成轻量封面缓存。");
                 }
@@ -1762,6 +2786,113 @@ namespace winrt::MotionWallpaper::implementation
                 }
             });
         }
+    }
+
+    void MainWindow::ToggleFavorite_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        auto selected = SelectedMediaItems();
+        if (selected.empty()) return;
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) return;
+        bool allFavorite = std::all_of(selected.begin(), selected.end(), [](auto const& media) {
+            return media.favorite;
+        });
+        try {
+            mediaLibrary->SetFavorite(selected, !allFavorite);
+            LoadMedia();
+            ShowStatus(allFavorite ? L"已取消收藏所选壁纸。" : L"已收藏所选壁纸。");
+        } catch (...) {
+            ShowStatus(L"无法更新收藏状态，请检查媒体库是否可写。", true);
+        }
+    }
+
+    void MainWindow::EditTags_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        auto selected = SelectedMediaItems();
+        if (selected.empty()) return;
+        TextBox input;
+        input.PlaceholderText(selected.size() == 1
+            ? L"用逗号分隔；留空可清除全部标签"
+            : L"用逗号分隔；标签会添加到所有选中壁纸");
+        if (selected.size() == 1) {
+            std::wstring existing;
+            for (size_t index = 0; index < selected.front().tags.size(); ++index) {
+                if (index) existing += L", ";
+                existing += selected.front().tags[index];
+            }
+            input.Text(existing);
+            input.SelectAll();
+        }
+        input.MaxLength(320);
+        ContentDialog dialog;
+        dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
+        dialog.Title(box_value(selected.size() == 1 ? L"编辑标签" : L"批量添加标签"));
+        dialog.Content(input);
+        dialog.PrimaryButtonText(L"保存");
+        dialog.CloseButtonText(L"取消");
+        dialog.DefaultButton(ContentDialogButton::Primary);
+        auto operation = dialog.ShowAsync();
+        operation.Completed([weak = get_weak(), selected = std::move(selected), input](auto const& result,
+            Windows::Foundation::AsyncStatus status) {
+            if (status != Windows::Foundation::AsyncStatus::Completed ||
+                result.GetResults() != ContentDialogResult::Primary) return;
+            if (auto self = weak.get()) {
+                auto writeLease = self->TryAcquireLibraryWrite();
+                if (!writeLease) return;
+                try {
+                    auto tags = parse_media_tags(input.Text().c_str());
+                    if (selected.size() == 1) self->mediaLibrary->SetTags(selected.front(), tags);
+                    else if (!tags.empty()) self->mediaLibrary->AddTags(selected, tags);
+                    else {
+                        self->ShowStatus(L"批量添加时请至少输入一个标签。", true);
+                        return;
+                    }
+                    self->LoadMedia();
+                    self->ShowStatus(selected.size() == 1 ? L"壁纸标签已更新。" : L"已为所选壁纸添加标签。");
+                } catch (...) {
+                    self->ShowStatus(L"无法保存标签；每个标签应简短且不包含路径字符。", true);
+                }
+            }
+        });
+    }
+
+    void MainWindow::RepairDuplicates_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) return;
+        std::vector<motion::app::DuplicateMediaSet> duplicates;
+        try {
+            duplicates = mediaLibrary->FindDuplicateMedia();
+        } catch (...) {
+            ShowStatus(L"无法检查重复项目，请确认媒体库当前可访问。", true);
+            return;
+        }
+        if (duplicates.empty()) {
+            ShowStatus(L"没有发现内容完全相同的重复壁纸。");
+            return;
+        }
+        uint32_t duplicateItems{};
+        uint64_t reclaimable{};
+        for (auto const& set : duplicates) {
+            duplicateItems += static_cast<uint32_t>(set.items.size() - 1);
+            reclaimable += set.sizeBytes * (set.items.size() - 1);
+        }
+        ContentDialog dialog;
+        dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
+        dialog.Title(box_value(L"修复重复壁纸？"));
+        dialog.Content(box_value(L"发现 " + std::to_wstring(duplicates.size()) + L" 组、" +
+            std::to_wstring(duplicateItems) + L" 个经过哈希确认的重复项目，预计可释放 " +
+            format_size(reclaimable) + L"。将保留每组第一个项目，合并收藏和标签，并把其余项目移入回收站。"));
+        dialog.PrimaryButtonText(L"安全合并");
+        dialog.CloseButtonText(L"取消");
+        dialog.DefaultButton(ContentDialogButton::Close);
+        auto operation = dialog.ShowAsync();
+        operation.Completed([weak = get_weak(), duplicates = std::move(duplicates)](auto const& result,
+            Windows::Foundation::AsyncStatus status) mutable {
+            if (status != Windows::Foundation::AsyncStatus::Completed ||
+                result.GetResults() != ContentDialogResult::Primary) return;
+            if (auto self = weak.get()) self->RepairDuplicates(std::move(duplicates));
+        });
     }
 
     void MainWindow::RenameMedia_Click(IInspectable const&, RoutedEventArgs const&)
@@ -1847,14 +2978,7 @@ namespace winrt::MotionWallpaper::implementation
         auto dispatcher = DispatcherQueue();
         auto previousSettings = settings;
         try {
-            if (settings.selectedGroupId == media.groupId && settings.selectedMediaId == media.id) {
-                settings.selectedGroupId = targetId;
-            }
-            for (auto& assignment : settings.displayAssignments) {
-                if (assignment.groupId == media.groupId && assignment.mediaId == media.id) {
-                    assignment.groupId = targetId;
-                }
-            }
+            ReplaceMediaReferences(media.groupId, media.id, targetId, media.id);
             SaveSettings();
         } catch (...) {
             settings = std::move(previousSettings);
@@ -1959,7 +3083,7 @@ namespace winrt::MotionWallpaper::implementation
             }
             motion::notify_settings_changed();
             RefreshVariants();
-            ShowStatus(L"已创建性能副本生成任务；完成后可选择是否保留源文件。");
+            ShowStatus(L"已创建存储与节能优化任务；完成后可选择是否保留源文件。");
         } catch (...) {
             ShowStatus(L"无法创建优化任务，请检查媒体库是否可写。", true);
         }
@@ -1975,10 +3099,10 @@ namespace winrt::MotionWallpaper::implementation
             motion::notify_settings_changed();
             RefreshVariants();
             ShowStatus(paused
-                ? L"性能副本任务已暂停；继续时会从头安全生成。"
-                : L"性能副本任务已继续。");
+                ? L"优化任务已暂停；继续时会从头安全生成。"
+                : L"优化任务已继续。");
         } catch (...) {
-            ShowStatus(paused ? L"暂停性能副本任务失败。" : L"继续性能副本任务失败。", true);
+            ShowStatus(paused ? L"暂停优化任务失败。" : L"继续优化任务失败。", true);
         }
     }
 
@@ -2004,14 +3128,14 @@ namespace winrt::MotionWallpaper::implementation
         if (selection & variant_source) {
             auto status = mediaLibrary->VariantStatus(media);
             if (!mediaLibrary->SourceAvailable(media) || status.entries.empty()) {
-                ShowStatus(L"至少需要一个完整的性能副本，才能删除源文件。", true);
+                ShowStatus(L"至少需要一个完整的优化版本，才能删除源文件。", true);
                 return;
             }
             ContentDialog dialog;
             dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
             dialog.Title(box_value(L"删除壁纸源文件？"));
             dialog.Content(box_value(L"将把 " + format_size(media.sizeBytes) +
-                L" 的源媒体移入 Windows 回收站。性能副本、首帧和名称会保留；之后无法选择原画，也无法重新生成性能副本。"));
+                L" 的源媒体移入 Windows 回收站。优化版本、首帧和名称会保留；之后无法选择原画，也无法重新生成优化版本。"));
             dialog.PrimaryButtonText(L"删除源文件");
             dialog.CloseButtonText(L"取消");
             dialog.DefaultButton(ContentDialogButton::Close);
@@ -2047,7 +3171,7 @@ namespace winrt::MotionWallpaper::implementation
         if (!sourceAvailable && selectedFiles >= status.entries.size()) {
             ContentDialog blocked;
             blocked.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
-            blocked.Title(box_value(L"至少保留一个性能副本"));
+            blocked.Title(box_value(L"至少保留一个优化版本"));
             blocked.Content(box_value(L"源文件已经删除，所选项目包含这张壁纸最后的可播放文件。要全部移除，请在“我的壁纸”中删除整张壁纸。"));
             blocked.CloseButtonText(L"知道了");
             blocked.ShowAsync();
@@ -2190,8 +3314,8 @@ namespace winrt::MotionWallpaper::implementation
                     self->ShowStatus(L"副本已删除，但后台服务未及时确认恢复；请重启应用。", true);
                 } else {
                     self->ShowStatus(sourceAvailable
-                        ? L"所选性能副本已删除，源文件和其他副本已保留。"
-                        : L"所选性能副本已删除，剩余副本会继续播放。");
+                        ? L"所选优化版本已删除，源文件和其他版本已保留。"
+                        : L"所选优化版本已删除，剩余版本会继续播放。");
                 }
             }
         });
@@ -2297,7 +3421,7 @@ namespace winrt::MotionWallpaper::implementation
                 } else if (!resumed) {
                     self->ShowStatus(L"源文件已删除，但后台服务未及时确认恢复；请重启应用。", true);
                 } else {
-                    self->ShowStatus(L"源文件已移入回收站；性能副本、首帧和名称已保留。");
+                    self->ShowStatus(L"源文件已移入回收站；优化版本、首帧和名称已保留。");
                 }
             }
         });
@@ -2339,10 +3463,7 @@ namespace winrt::MotionWallpaper::implementation
         auto dispatcher = DispatcherQueue();
         auto previousSettings = settings;
         try {
-            if (settings.selectedGroupId == media.groupId && settings.selectedMediaId == media.id) {
-                settings.selectedMediaId.clear();
-            }
-            RemoveMediaAssignments(media.groupId, media.id);
+            RemoveMediaReferences(media.groupId, media.id);
             SaveSettings();
             motion::notify_settings_changed();
         } catch (...) {
@@ -2415,12 +3536,502 @@ namespace winrt::MotionWallpaper::implementation
         });
     }
 
+    winrt::fire_and_forget MainWindow::RepairDuplicates(
+        std::vector<motion::app::DuplicateMediaSet> duplicates)
+    {
+        if (activeLibraryMigrationPause || duplicates.empty()) {
+            ShowStatus(L"媒体库操作正在等待后台服务，请稍后再试。", true);
+            co_return;
+        }
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) co_return;
+        auto previousSettings = settings;
+        try {
+            for (auto const& set : duplicates) {
+                if (set.items.size() < 2) continue;
+                auto const& keep = set.items.front().media;
+                for (size_t index = 1; index < set.items.size(); ++index) {
+                    auto const& duplicate = set.items[index].media;
+                    ReplaceMediaReferences(
+                        duplicate.groupId, duplicate.id, keep.groupId, keep.id);
+                }
+            }
+            SaveSettings();
+            motion::notify_settings_changed();
+        } catch (...) {
+            settings = std::move(previousSettings);
+            try { SaveSettings(); } catch (...) {}
+            ShowStatus(L"无法安全更新重复项目的壁纸分配；未删除任何文件。", true);
+            co_return;
+        }
+
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
+        try {
+            agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
+        } catch (...) {
+            settings = std::move(previousSettings);
+            try { SaveSettings(); } catch (...) {}
+            ShowStatus(L"无法建立与后台服务的重复项修复通道。", true);
+            co_return;
+        }
+        activeLibraryMigrationPause = agentPause;
+        SetLibraryMigrationUi(true);
+        ShowStatus(L"正在暂停后台播放并安全合并重复项目…", false);
+
+        auto weak = get_weak();
+        auto dispatcher = DispatcherQueue();
+        auto library = mediaLibrary;
+        co_await winrt::resume_background();
+        bool paused = agentPause->RequestAndWait(std::chrono::seconds(20));
+        uint32_t merged{};
+        bool complete = paused;
+        std::vector<MediaReferenceReplacement> mergedReferences;
+        if (paused && !closing.load(std::memory_order_acquire)) {
+            try {
+                for (auto const& set : duplicates) {
+                    if (set.items.size() < 2) continue;
+                    auto keep = set.items.front().media;
+                    for (size_t index = 1; index < set.items.size(); ++index) {
+                        if (!writeLease->RevalidateMediaLibraryTrust()) {
+                            throw std::runtime_error("media library identity changed during duplicate repair");
+                        }
+                        auto const& duplicate = set.items[index].media;
+                        library->CancelOptimization(duplicate);
+                        keep = library->MergeDuplicateMedia(keep, duplicate);
+                        mergedReferences.push_back({ duplicate.groupId, duplicate.id,
+                            keep.groupId, keep.id });
+                        ++merged;
+                    }
+                }
+            } catch (...) {
+                complete = false;
+            }
+        }
+        bool resumed{};
+        if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
+        else agentPause->Cancel();
+
+        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
+            writeLease = std::move(writeLease), previousSettings = std::move(previousSettings),
+            mergedReferences = std::move(mergedReferences), merged, paused, complete, resumed]() mutable {
+            if (auto self = weak.get()) {
+                if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
+                writeLease.reset();
+                self->SetLibraryMigrationUi(false);
+                if (!complete) {
+                    self->settings = std::move(previousSettings);
+                    for (auto const& replacement : mergedReferences) {
+                        self->ReplaceMediaReferences(
+                            replacement.oldGroupId, replacement.oldMediaId,
+                            replacement.newGroupId, replacement.newMediaId);
+                    }
+                    self->ApplySettingsToControls();
+                    try { self->SaveSettings(); } catch (...) {}
+                }
+                self->LoadMedia();
+                self->UpdateStatusSummary();
+                if (!paused) {
+                    self->ShowStatus(L"后台服务未确认暂停；未合并任何重复项目。", true);
+                } else if (!complete) {
+                    self->ShowStatus(L"已安全合并 " + std::to_wstring(merged) +
+                        L" 个项目，其余项目因媒体库状态变化而保留。", true);
+                } else if (!resumed) {
+                    self->ShowStatus(L"重复项目已合并，但后台服务未及时恢复；请重启应用。", true);
+                } else {
+                    self->ShowStatus(L"已安全合并 " + std::to_wstring(merged) +
+                        L" 个重复项目；原项目可从回收站恢复。");
+                }
+            }
+        });
+    }
+
+    winrt::fire_and_forget MainWindow::TrimOptimizationStorage(
+        uint64_t quotaBytes, bool releaseAll)
+    {
+        if (activeLibraryMigrationPause) {
+            ShowStatus(L"媒体库操作正在等待后台服务，请稍后再试。", true);
+            co_return;
+        }
+        auto writeLease = TryAcquireLibraryWrite();
+        if (!writeLease) co_return;
+        std::vector<std::string> protectedMediaIds;
+        auto protect = [&](std::string const& mediaId) {
+            if (!motion::valid_id(mediaId) ||
+                std::find(protectedMediaIds.begin(), protectedMediaIds.end(), mediaId) !=
+                    protectedMediaIds.end()) return;
+            protectedMediaIds.push_back(mediaId);
+        };
+        protect(settings.selectedMediaId);
+        for (auto const& assignment : settings.displayAssignments) {
+            protect(assignment.mediaId);
+        }
+        // Scene activation and the tray's "next" command are intentionally
+        // runtime-only. Protect what the Agent reports as actually visible,
+        // not only the persisted selection, before pruning storage.
+        protect(runtimeState.activeMediaId);
+        for (auto const& state : runtimeState.displayStates) {
+            protect(state.mediaId);
+        }
+
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
+        try { agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>(); }
+        catch (...) {
+            ShowStatus(L"无法建立与后台服务的存储整理通道。", true);
+            co_return;
+        }
+        activeLibraryMigrationPause = agentPause;
+        SetLibraryMigrationUi(true);
+        ShowStatus(releaseAll ? L"正在安全释放优化空间…" : L"正在按配额整理优化空间…", false);
+
+        auto weak = get_weak();
+        auto dispatcher = DispatcherQueue();
+        auto library = mediaLibrary;
+        co_await winrt::resume_background();
+        bool paused = agentPause->RequestAndWait(std::chrono::seconds(20));
+        motion::app::OptimizationCleanupResult cleanup;
+        bool cleaned{};
+        if (paused && !closing.load(std::memory_order_acquire)) {
+            try {
+                if (!writeLease->RevalidateMediaLibraryTrust()) {
+                    throw std::runtime_error("media library identity changed before storage trim");
+                }
+                cleanup = releaseAll
+                    ? library->ReleaseOptimizationStorage(protectedMediaIds)
+                    : library->TrimOptimizationStorage(quotaBytes, protectedMediaIds);
+                cleaned = true;
+            } catch (...) {}
+        }
+        bool resumed{};
+        if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
+        else agentPause->Cancel();
+
+        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
+            writeLease = std::move(writeLease), cleanup, paused, cleaned, resumed]() mutable {
+            if (auto self = weak.get()) {
+                if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
+                writeLease.reset();
+                self->SetLibraryMigrationUi(false);
+                self->RefreshVariants();
+                if (!paused) {
+                    self->ShowStatus(L"后台服务未确认暂停；没有清理任何优化文件。", true);
+                } else if (!cleaned) {
+                    self->ShowStatus(L"存储整理已安全中止；媒体库身份可能发生变化。", true);
+                } else if (!resumed) {
+                    self->ShowStatus(L"已释放 " + format_size(cleanup.freedBytes) +
+                        L"，但后台服务未及时恢复；请重启应用。", true);
+                } else {
+                    auto message = L"已释放 " + format_size(cleanup.freedBytes) + L"，清理 " +
+                        std::to_wstring(cleanup.cleanedMedia) + L" 个项目";
+                    if (cleanup.skippedProtected || cleanup.skippedSourceLess) {
+                        message += L"；受保护项目保持不变";
+                    }
+                    self->ShowStatus(message + L"。");
+                }
+            }
+        });
+    }
+
     void MainWindow::OpenLibrary_Click(IInspectable const&, RoutedEventArgs const&)
     {
         auto access = TryAcquireLibraryWrite();
         if (!access) return;
         auto path = mediaLibrary->WallpapersPath();
         ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    void MainWindow::BackupLibrary_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        if (!settingsWritable || !mediaLibraryAvailable) {
+            ShowStatus(L"媒体库当前不可安全访问，无法创建备份。", true);
+            return;
+        }
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"另一个媒体库操作正在进行，请稍后重试。", true);
+            return;
+        }
+        settingsSaveTimer.Stop();
+        if (!TrySaveSettings()) return;
+        try {
+            HWND window{};
+            auto nativeWindow = this->try_as<::IWindowNative>();
+            check_hresult(nativeWindow->get_WindowHandle(&window));
+            auto destination = select_folder(window, L"选择保存完整备份的位置");
+            if (!destination.empty()) BackupLibrary(std::move(destination));
+        } catch (...) {
+            ShowStatus(L"无法选择备份位置。", true);
+        }
+    }
+
+    void MainWindow::RestoreLibrary_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        if (restoreRecoveryBlocked) {
+            ShowStatus(L"上次恢复事务仍处于安全锁定状态；请连接原磁盘并重启后再试。", true, true);
+            return;
+        }
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"另一个媒体库操作正在进行，请稍后重试。", true);
+            return;
+        }
+        settingsSaveTimer.Stop();
+        // A corrupt/future settings document remains read-only during normal
+        // use, but an explicit restore may safely replace that regular file
+        // after the backup and prepared replacement have both been verified.
+        if (settingsWritable && !TrySaveSettings()) return;
+        try {
+            HWND window{};
+            auto nativeWindow = this->try_as<::IWindowNative>();
+            check_hresult(nativeWindow->get_WindowHandle(&window));
+            auto backupPath = select_folder(window, L"选择 MotionWallpaper 完整备份文件夹");
+            if (!backupPath.empty()) RestoreLibrary(std::move(backupPath));
+        } catch (...) {
+            ShowStatus(L"无法选择备份文件夹。", true);
+        }
+    }
+
+    winrt::fire_and_forget MainWindow::BackupLibrary(fs::path destination)
+    {
+        auto weak = get_weak();
+        auto dispatcher = DispatcherQueue();
+        auto dataRoot = root;
+        auto libraryPath = mediaLibrary->WallpapersPath();
+        auto identity = motion::capture_media_library_trust(libraryPath);
+        if (!identity) {
+            ShowStatus(L"媒体库身份验证失败，未开始备份。", true);
+            co_return;
+        }
+        auto migrationLease = libraryAccessGate->TryBeginMigration();
+        if (!migrationLease) {
+            ShowStatus(L"仍有导入、优化或文件操作正在使用媒体库，请完成后再备份。", true);
+            co_return;
+        }
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
+        try {
+            agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
+        } catch (...) {
+            ShowStatus(L"无法建立与后台服务的备份协调通道。", true);
+            co_return;
+        }
+        auto cancellation = std::make_shared<std::atomic_bool>();
+        activeLibraryMigrationPause = agentPause;
+        libraryMigrationCancellation = cancellation;
+        SetLibraryMigrationUi(true);
+        ShowStatus(L"正在安全暂停壁纸服务并创建完整备份…", false, true);
+
+        bool paused{};
+        bool created{};
+        bool resumed{};
+        motion::app::LibraryBackupResult result;
+        co_await winrt::resume_background();
+        paused = agentPause->RequestAndWait(std::chrono::seconds(20));
+        if (paused && !cancellation->load(std::memory_order_acquire)) {
+            try {
+                auto lastProgress = std::make_shared<std::atomic_int>(-1);
+                result = motion::app::LibraryBackupService::Create(
+                    dataRoot, libraryPath, *identity, std::move(destination),
+                    [dispatcher, weak, lastProgress](motion::app::LibraryBackupProgress const& value) {
+                        int percent = value.totalBytes
+                            ? static_cast<int>((std::min)(100ULL,
+                                value.completedBytes * 100ULL / value.totalBytes)) : 0;
+                        int fingerprint = static_cast<int>(value.phase) * 101 + percent;
+                        if (lastProgress->exchange(fingerprint, std::memory_order_acq_rel) == fingerprint) return;
+                        auto label = backup_phase_label(value.phase);
+                        dispatcher.TryEnqueue([weak, label = std::move(label), percent] {
+                            if (auto self = weak.get(); self &&
+                                !self->closing.load(std::memory_order_acquire)) {
+                                self->ShowStatus(label + L"（" + std::to_wstring(percent) + L"%）…", false, true);
+                            }
+                        });
+                    }, cancellation.get());
+                created = true;
+            } catch (...) {}
+        }
+        if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
+        else agentPause->Cancel();
+
+        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
+            migrationLease = std::move(migrationLease), result = std::move(result),
+            paused, created, resumed]() mutable {
+            if (auto self = weak.get()) {
+                if (self->activeLibraryMigrationPause == agentPause) {
+                    self->activeLibraryMigrationPause.reset();
+                }
+                migrationLease.reset();
+                self->SetLibraryMigrationUi(false);
+                if (!paused) {
+                    self->ShowStatus(L"后台服务未确认暂停；为保证备份一致性，没有复制文件。", true);
+                } else if (!created) {
+                    self->ShowStatus(L"备份未完成；目标位置、磁盘空间或媒体库校验失败，未提交不完整备份。", true);
+                } else if (!resumed) {
+                    self->ShowStatus(L"完整备份已创建，但后台服务未及时恢复；请重启应用。", true);
+                } else {
+                    self->ShowStatus(L"完整备份已创建：" +
+                        result.backup.path.filename().wstring() + L"（" +
+                        format_size(result.backup.totalBytes) + L"）。");
+                }
+            }
+        });
+    }
+
+    winrt::fire_and_forget MainWindow::RestoreLibrary(fs::path backupPath)
+    {
+        auto weak = get_weak();
+        auto dispatcher = DispatcherQueue();
+        winrt::apartment_context uiThread;
+        motion::app::LibraryBackupInfo backup;
+        bool valid{};
+        co_await winrt::resume_background();
+        try {
+            backup = motion::app::LibraryBackupService::Validate(backupPath);
+            valid = true;
+        } catch (...) {}
+        co_await uiThread;
+        auto self = weak.get();
+        if (!self || self->closing.load(std::memory_order_acquire)) co_return;
+        if (!valid) {
+            self->ShowStatus(L"所选文件夹不是完整、可验证的 MotionWallpaper 备份。", true);
+            co_return;
+        }
+        ContentDialog dialog;
+        dialog.XamlRoot(self->Content().as<FrameworkElement>().XamlRoot());
+        dialog.Title(box_value(L"恢复此完整备份？"));
+        dialog.Content(box_value(L"备份包含 " + std::to_wstring(backup.fileCount) +
+            L" 个文件，共 " + format_size(backup.totalBytes) +
+            L"。可验证的当前媒体库会先保留为“恢复前”副本；若当前库离线或不可验证，则不会访问原路径，而会恢复到新的本地媒体库。设置会在校验后原子替换。"));
+        dialog.PrimaryButtonText(L"开始恢复");
+        dialog.CloseButtonText(L"取消");
+        dialog.DefaultButton(ContentDialogButton::Close);
+        if (co_await dialog.ShowAsync() != ContentDialogResult::Primary) co_return;
+
+        auto migrationLease = self->libraryAccessGate->TryBeginMigration();
+        if (!migrationLease) {
+            self->ShowStatus(L"仍有导入、优化或文件操作正在使用媒体库，请完成后再恢复。", true);
+            co_return;
+        }
+        auto dataRoot = self->root;
+        std::optional<motion::MediaLibraryTrustIdentity> identity;
+        if (self->mediaLibraryAvailable) {
+            identity = motion::capture_media_library_trust(
+                self->mediaLibrary->WallpapersPath());
+            if (!identity) self->mediaLibraryAvailable = false;
+        }
+        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
+        if (identity) {
+            try {
+                agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
+            } catch (...) {
+                self->ShowStatus(L"无法建立与后台服务的恢复协调通道。", true);
+                co_return;
+            }
+        }
+        auto cancellation = std::make_shared<std::atomic_bool>();
+        self->activeLibraryMigrationPause = agentPause;
+        self->libraryMigrationCancellation = cancellation;
+        self->SetLibraryMigrationUi(true);
+        self->ShowStatus(identity
+            ? L"正在安全暂停壁纸服务并验证备份…"
+            : L"当前媒体库不可用；正在验证备份并准备新的本地媒体库…",
+            false, true);
+        self = nullptr;
+
+        bool paused{};
+        bool restored{};
+        bool resumed{};
+        motion::app::LibraryRestoreResult result;
+        co_await winrt::resume_background();
+        paused = !agentPause ||
+            agentPause->RequestAndWait(std::chrono::seconds(20));
+        if (paused && !cancellation->load(std::memory_order_acquire)) {
+            try {
+                auto lastProgress = std::make_shared<std::atomic_int>(-1);
+                result = motion::app::LibraryBackupService::Restore(
+                    dataRoot, identity, std::move(backupPath),
+                    [dispatcher, weak, lastProgress](motion::app::LibraryBackupProgress const& value) {
+                        int percent = value.totalBytes
+                            ? static_cast<int>((std::min)(100ULL,
+                                value.completedBytes * 100ULL / value.totalBytes)) : 0;
+                        int fingerprint = static_cast<int>(value.phase) * 101 + percent;
+                        if (lastProgress->exchange(fingerprint, std::memory_order_acq_rel) == fingerprint) return;
+                        auto label = backup_phase_label(value.phase);
+                        dispatcher.TryEnqueue([weak, label = std::move(label), percent] {
+                            if (auto self = weak.get(); self &&
+                                !self->closing.load(std::memory_order_acquire)) {
+                                self->ShowStatus(label + L"（" + std::to_wstring(percent) + L"%）…", false, true);
+                            }
+                        });
+                    }, cancellation.get());
+                restored = true;
+            } catch (...) {}
+        }
+        if (agentPause) {
+            if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
+            else agentPause->Cancel();
+        } else if (restored) {
+            resumed = motion::notify_settings_changed();
+        }
+
+        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
+            migrationLease = std::move(migrationLease), result = std::move(result),
+            paused, restored, resumed]() mutable {
+            if (auto self = weak.get()) {
+                if (self->activeLibraryMigrationPause == agentPause) {
+                    self->activeLibraryMigrationPause.reset();
+                }
+                migrationLease.reset();
+                self->SetLibraryMigrationUi(false);
+                if (!paused) {
+                    self->ShowStatus(L"后台服务未确认暂停；没有更改当前媒体库。", true);
+                    return;
+                }
+                if (!restored) {
+                    self->ShowStatus(L"恢复未完成；备份、目标或事务校验失败。安全回滚已完成，或持久事务会在下次启动继续恢复。", true, true);
+                    return;
+                }
+                try {
+                    self->settings = result.restoredSettings;
+                    self->settingsWritable = true;
+                    self->restoreRecoveryBlocked = false;
+                    bool startupPreferenceApplied =
+                        self->settingsStore->ApplyStartupPreference(
+                            self->settings.startWithWindows);
+                    self->mediaLibraryTrust = self->settings.mediaLibraryPath.empty()
+                        ? std::optional<motion::MediaLibraryTrustIdentity>{}
+                        : std::optional<motion::MediaLibraryTrustIdentity>{ result.restoredLibraryIdentity };
+                    self->mediaLibrary = std::make_shared<motion::app::MediaLibrary>(
+                        self->root, motion::app::DeleteMode::RecycleBin,
+                        result.restoredLibraryIdentity.root,
+                        std::optional<motion::MediaLibraryTrustIdentity>{ result.restoredLibraryIdentity });
+                    self->mediaLibraryAvailable = true;
+                    self->appliedGroupId.clear();
+                    self->appliedMediaId.clear();
+                    self->initializing = true;
+                    self->ApplySettingsToControls();
+                    self->LoadDisplayTargets();
+                    self->LoadGroups();
+                    self->initializing = false;
+                    self->LoadMedia();
+                    auto path = self->mediaLibrary->WallpapersPath().wstring();
+                    self->LibraryPath().Text(path);
+                    self->LibraryPathFull().Text(path);
+                    if (!agentPause && !resumed) self->StartController();
+                    std::wstring restoreMessage = result.previousLibraryPath.empty()
+                        ? L"备份已恢复到新的本地媒体库；原离线媒体库路径未被访问或更改"
+                        : L"备份已恢复；恢复前的媒体库仍安全保留在：" +
+                            result.previousLibraryPath.wstring();
+                    if (agentPause && !resumed) {
+                        restoreMessage += L"；后台服务未及时确认恢复，请重启应用";
+                    } else if (!agentPause && !resumed) {
+                        restoreMessage += L"；后台服务正在启动";
+                    }
+                    self->ShowStatus(restoreMessage +
+                        (startupPreferenceApplied ? std::wstring{} :
+                            L"；开机启动设置未能同步，请在设置中重新切换一次"),
+                        (agentPause && !resumed) || !startupPreferenceApplied);
+                } catch (...) {
+                    self->mediaLibraryAvailable = false;
+                    self->ShowStatus(L"备份已提交，但界面无法重新连接媒体库；请重启应用完成加载。", true);
+                }
+            }
+        });
     }
 
     void MainWindow::MoveLibrary_Click(IInspectable const&, RoutedEventArgs const&)
@@ -2697,12 +4308,13 @@ namespace winrt::MotionWallpaper::implementation
         }
     }
 
-    void MainWindow::ShowStatus(std::wstring const& message, bool error)
+    void MainWindow::ShowStatus(
+        std::wstring const& message, bool error, bool persistent)
     {
         statusHideTimer.Stop();
         StatusBar().Severity(error ? InfoBarSeverity::Error : InfoBarSeverity::Success);
         StatusBar().Message(message);
         StatusBar().IsOpen(true);
-        statusHideTimer.Start();
+        if (!persistent) statusHideTimer.Start();
     }
 }

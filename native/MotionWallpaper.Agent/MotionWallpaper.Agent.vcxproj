@@ -31,7 +31,7 @@
   <ItemGroup><ClCompile Include="Agent.cpp" /><ClCompile Include="VideoOptimizer.cpp" /></ItemGroup>
   <ItemGroup><Manifest Include="app.manifest" /></ItemGroup>
   <ItemGroup><ResourceCompile Include="MotionWallpaper.Agent.rc" /></ItemGroup>
-  <ItemGroup><ClInclude Include="CoveragePolicy.h" /><ClInclude Include="LibraryMigrationProtocol.h" /><ClInclude Include="PlaybackCapabilityPolicy.h" /><ClInclude Include="RandomSelectionPolicy.h" /><ClInclude Include="resource.h" /><ClInclude Include="SharedRendererPolicy.h" /><ClInclude Include="VideoOptimizer.h" /><ClInclude Include="VideoTranscoder.h" /><ClInclude Include="VideoVariantPolicy.h" /><ClInclude Include="..\MotionWallpaper.Protocol\RendererProtocol.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="CoveragePolicy.h" /><ClInclude Include="LibraryMigrationProtocol.h" /><ClInclude Include="PlaybackCapabilityPolicy.h" /><ClInclude Include="RandomSelectionPolicy.h" /><ClInclude Include="resource.h" /><ClInclude Include="RuntimeEventPolicy.h" /><ClInclude Include="RuntimeStatusPolicy.h" /><ClInclude Include="SharedRendererPolicy.h" /><ClInclude Include="TrayControlPolicy.h" /><ClInclude Include="VideoOptimizer.h" /><ClInclude Include="VideoTranscoder.h" /><ClInclude Include="VideoVariantPolicy.h" /><ClInclude Include="..\MotionWallpaper.Protocol\RendererProtocol.h" /></ItemGroup>
   <ItemGroup>
     <ClInclude Include="RuntimePolicy.h" />
     <PackageReference Include="Microsoft.Windows.CppWinRT" Version="3.0.260715.1" />

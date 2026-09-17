@@ -50,6 +50,7 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="App.xaml.h"><DependentUpon>App.xaml</DependentUpon></ClInclude>
     <ClInclude Include="MainWindow.xaml.h"><DependentUpon>MainWindow.xaml</DependentUpon></ClInclude>
+    <ClInclude Include="LibraryBackup.h" />
     <ClInclude Include="LibraryMigration.h" />
     <ClInclude Include="MediaLibrary.h" />
     <ClInclude Include="resource.h" />

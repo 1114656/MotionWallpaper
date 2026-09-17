@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <atomic>
@@ -425,7 +426,7 @@ namespace
         motion::append_utf8_log(root / L"Config" / L"agent.log", message);
     }
 
-    constexpr uint64_t variantCacheLimit = 8ULL * 1024 * 1024 * 1024;
+    constexpr uint64_t defaultVariantCacheLimit = 10ULL * 1024 * 1024 * 1024;
     constexpr uint64_t diskReserve = 256ULL * 1024 * 1024;
 
     struct PhysicalVariantIdentityLess
@@ -473,9 +474,10 @@ namespace
         return available.QuadPart >= worstCase;
     }
 
-    void prune_variant_cache(fs::path const& wallpapers,
+    void prune_variant_cache(fs::path const& wallpapers, uint64_t cacheLimit,
         motion::VariantRemovalCallback const& removeCandidate)
     {
+        if (!cacheLimit) return;
         struct PhysicalAllocation
         {
             uint64_t size{};
@@ -548,12 +550,12 @@ namespace
             candidates.push_back({ iterator->path(),
                 iterator->last_write_time(itemError), allocationIndex });
         }
-        if (total <= variantCacheLimit) return;
+        if (total <= cacheLimit) return;
         std::sort(candidates.begin(), candidates.end(), [](auto const& left, auto const& right) {
             return left.modified < right.modified;
         });
         for (auto const& candidate : candidates) {
-            if (total <= variantCacheLimit) break;
+            if (total <= cacheLimit) break;
             if (!removeCandidate || !removeCandidate(candidate.path)) continue;
             auto& allocation = allocations[candidate.allocationIndex];
             if (allocation.remainingCacheLinks && --allocation.remainingCacheLinks == 0) {
@@ -740,19 +742,24 @@ namespace motion::agent
         {
             auto trust = AcquireLibraryTrust();
             if (libraryTrust_ && !trust) return {};
-            auto sourceResult = [&](bool performanceCopyPending = false) -> ResolvedVideoPath {
+            auto sourceResult = [&](bool performanceCopyRequired = false,
+                bool performanceCopyPending = false) -> ResolvedVideoPath {
                 return { source, RetainLibraryPlaybackLease(trust, acquirePlaybackLease),
-                    performanceCopyPending };
+                    performanceCopyRequired, performanceCopyPending };
             };
             auto mode = softwarePlaybackTarget ? std::string("cpu-smooth") : requestedMode;
+            bool selectedPerformanceMode = !softwarePlaybackTarget &&
+                (mode == "balanced" || mode == "power-saver");
+            bool playbackCopyMode = selectedPerformanceMode || softwarePlaybackTarget;
             if (source.empty()) return {};
             auto stableSource = StablePath(source);
             auto stableMediaDirectory = StablePath(source.parent_path());
             if (!stableSource || !stableMediaDirectory) return {};
-            if (mode == "original" || !mediaFoundationStarted_) return sourceResult();
-            if (fs::is_regular_file(motion::variant_cancelled_path(*stableMediaDirectory))) return sourceResult();
-            if (motion::variant_generation_paused(*stableMediaDirectory)) return sourceResult();
-            if (motion::variant_generation_suppressed(*stableMediaDirectory, mode)) return sourceResult();
+            if (mode == "original") return sourceResult();
+            // If the optimizer itself is unavailable, fail closed for a
+            // selected performance tier. Original and internal cpu-smooth
+            // paths retain their existing source-playback behavior.
+            if (!mediaFoundationStarted_) return sourceResult(playbackCopyMode);
             SourceRate rate;
             {
                 std::lock_guard lock(mutex_);
@@ -774,54 +781,97 @@ namespace motion::agent
             bool codecNeedsVariant = softwarePlaybackTarget && !rate.softwarePlaybackFriendly;
             if (!video_needs_variant(rate.numerator, rate.denominator, decision.targetFps,
                 rate.width, rate.height, dimensions.first, dimensions.second) && !codecNeedsVariant) return sourceResult();
-            if (softwarePlaybackTarget && !rate.softwarePlaybackConversionAllowed) return sourceResult();
+            if (softwarePlaybackTarget && !rate.softwarePlaybackConversionAllowed) {
+                return sourceResult(true);
+            }
             auto destination = source.parent_path() / L"Variants" / decision.fileName;
             auto key = source.wstring() + L"\n" + decision.fileName;
 
             std::shared_ptr<void> playbackLease;
             auto playbackLeaseOutput = acquirePlaybackLease ? &playbackLease : nullptr;
             if (TryAdoptVariant(source, mode, destination, playbackLeaseOutput, trust)) {
-                append_log(logRoot_, L"使用壁纸性能缓存: " + destination.filename().wstring());
-                return { destination, std::move(playbackLease) };
+                append_log(logRoot_, L"使用壁纸优化缓存: " + destination.filename().wstring());
+                return { destination, std::move(playbackLease), false, false };
             }
             if (ReuseEquivalentVariant(source, destination, mode)) {
                 if (TryAdoptVariant(source, mode, destination, playbackLeaseOutput, trust)) {
-                    append_log(logRoot_, L"复用相同规格的壁纸性能副本: " + destination.filename().wstring());
-                    return { destination, std::move(playbackLease) };
+                    append_log(logRoot_, L"复用相同规格的壁纸优化副本: " + destination.filename().wstring());
+                    return { destination, std::move(playbackLease), false, false };
                 }
             }
-            bool performanceCopyPending{};
+            // Cancellation, pause and profile suppression control generation,
+            // not adoption of an already validated copy or presentation
+            // safety. Once we know a missing copy is genuinely required,
+            // retain that fact even when work cannot be queued.
+            if (fs::is_regular_file(motion::variant_cancelled_path(*stableMediaDirectory)) ||
+                motion::variant_generation_paused(*stableMediaDirectory) ||
+                motion::variant_generation_suppressed(*stableMediaDirectory, mode) ||
+                GenerationFailed(source.parent_path(), mode)) {
+                return sourceResult(playbackCopyMode);
+            }
             bool battery = on_battery();
+            auto durableRequest = selectedPerformanceMode
+                ? EnsureAutomaticRequest(source.parent_path(), mode,
+                    battery ? motion::VariantProgressState::waitingForPower :
+                        motion::VariantProgressState::queued)
+                : motion::VariantGenerationRequest{};
+            // A conflicting explicit request, or a marker that landed while
+            // probing the source, must not be replaced by automatic playback.
+            if (selectedPerformanceMode && !durableRequest) {
+                return sourceResult(true);
+            }
+            bool performanceCopyPending{};
             {
                 std::lock_guard lock(mutex_);
                 auto currentGeneration = generation_.load(std::memory_order_relaxed);
                 bool activeCurrent = active_ && active_->Key() == key &&
                     active_->generation == currentGeneration;
-                bool queued = PendingContains(key);
-                bool eligible = allowGenerationRequest && generationAllowed_ && !battery &&
+                auto pending = std::find_if(pending_.begin(), pending_.end(),
+                    [&](auto const& request) { return request.Key() == key; });
+                bool queued = pending != pending_.end();
+                if (selectedPerformanceMode && durableRequest) {
+                    // A durable request with no failure marker is either the
+                    // automatic request above or a fresh UI retry.
+                    failed_.erase(key);
+                }
+                bool canGenerate = generationAllowed_ && !battery &&
                     failed_.find(key) == failed_.end();
-                if (eligible && !activeCurrent && !queued) {
-                    pending_.push_back(Request{ source, destination, decision.targetFps,
+                bool mayEnqueue = allowGenerationRequest && canGenerate;
+                if (mayEnqueue && !activeCurrent && !queued) {
+                    // Resolve is the playback path, so its target is the
+                    // wallpaper the user is waiting to see. Put it ahead of
+                    // background/import work without interrupting an active
+                    // transcode, which keeps prioritization cheap and stable.
+                    pending_.push_front(Request{ source, destination, decision.targetFps,
                         dimensions.first, dimensions.second, rate.duration100ns, rate.visual, mode,
-                        {}, currentGeneration, false,
+                        durableRequest, currentGeneration,
+                        static_cast<bool>(durableRequest),
                         softwarePlaybackTarget ? rate.softwarePlaybackConversionAllowed :
                             rate.softwareFallbackAllowed,
                         softwarePlaybackTarget });
                     condition_.notify_one();
                     queued = true;
+                } else if (mayEnqueue && !activeCurrent && queued) {
+                    if (durableRequest) {
+                        pending->explicitRequest = true;
+                        pending->durableRequest = durableRequest;
+                    }
+                    if (pending != pending_.begin()) {
+                        auto selected = std::move(*pending);
+                        pending_.erase(pending);
+                        pending_.push_front(std::move(selected));
+                    }
                 }
-                // cpu-smooth is an internal compatibility copy. It may be
-                // prepared in parallel, but must not freeze a balanced or
-                // power-saver selection while the source remains playable.
-                bool selectedPerformanceMode = !softwarePlaybackTarget &&
-                    (mode == "balanced" || mode == "power-saver");
-                performanceCopyPending = selectedPerformanceMode && eligible &&
+                // cpu-smooth is internal rather than a durable UI request, but
+                // it obeys the same static-preview barrier as selected
+                // balanced/power-saver copies before it may be queued.
+                performanceCopyPending = playbackCopyMode && canGenerate &&
                     (activeCurrent || queued);
             }
             // Never cache a fallback. Resolve must keep observing generation
             // eligibility and discover a completed target without another mode
             // toggle or process restart.
-            return sourceResult(performanceCopyPending);
+            return sourceResult(playbackCopyMode, performanceCopyPending);
         }
 
         void Prepare(fs::path const& source, std::string const& mode,
@@ -995,6 +1045,25 @@ namespace motion::agent
             }
         }
 
+        [[nodiscard]] bool Quiesce(uint32_t timeoutMilliseconds)
+        {
+            std::unique_lock lock(mutex_);
+            if (generationAllowed_) {
+                generationAllowed_ = false;
+                generation_.fetch_add(1, std::memory_order_relaxed);
+            }
+            pending_.clear();
+            condition_.notify_all();
+            return condition_.wait_for(lock,
+                std::chrono::milliseconds(timeoutMilliseconds),
+                [&] { return !active_; });
+        }
+
+        void SetStorageQuotaBytes(uint64_t quotaBytes) noexcept
+        {
+            storageQuotaBytes_.store(quotaBytes, std::memory_order_relaxed);
+        }
+
     private:
         static constexpr auto variantLeaseGrace = std::chrono::seconds(30);
 
@@ -1067,6 +1136,76 @@ namespace motion::agent
             auto stable = StablePath(configuredMediaDirectory);
             return stable ? motion::read_variant_generation_request(*stable)
                 : motion::VariantGenerationRequest{};
+        }
+
+        [[nodiscard]] bool GenerationFailed(
+            fs::path const& configuredMediaDirectory,
+            std::string const& mode) const noexcept
+        {
+            auto stable = StablePath(configuredMediaDirectory);
+            if (!stable) return true;
+            return motion::read_small_file(
+                motion::variant_failed_path(*stable)) == mode;
+        }
+
+        // Playback-created work is a real library task: publish one durable,
+        // tokenized request so the UI can observe, pause and cancel it. Unlike
+        // an explicit retry, this helper never clears cancellation, pause,
+        // failure or suppression markers and never replaces another mode.
+        [[nodiscard]] motion::VariantGenerationRequest EnsureAutomaticRequest(
+            fs::path const& configuredMediaDirectory, std::string const& mode,
+            motion::VariantProgressState initialState) const noexcept
+        {
+            if (!motion::valid_variant_request_mode(mode)) return {};
+            auto access = AcquireStableAccess(configuredMediaDirectory);
+            if (!access) return {};
+            auto const& mediaDirectory = access->path;
+            auto blocked = [&] {
+                std::error_code error;
+                return (fs::is_regular_file(
+                            motion::variant_cancelled_path(mediaDirectory), error) && !error) ||
+                    motion::variant_generation_paused(mediaDirectory) ||
+                    motion::variant_generation_suppressed(mediaDirectory, mode) ||
+                    motion::read_small_file(
+                        motion::variant_failed_path(mediaDirectory)) == mode;
+            };
+            if (blocked()) return {};
+
+            auto current = motion::read_variant_generation_request(mediaDirectory);
+            if (current) return current.mode == mode ? current :
+                motion::VariantGenerationRequest{};
+
+            motion::VariantGenerationRequest created{
+                mode, motion::new_variant_request_id() };
+            auto serialized = motion::serialize_variant_request(created);
+            if (serialized.empty()) return {};
+            motion::unique_handle request(CreateFileW(
+                motion::variant_request_path(mediaDirectory).c_str(),
+                GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, nullptr));
+            if (!request) {
+                auto error = GetLastError();
+                if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) return {};
+                current = motion::read_variant_generation_request(mediaDirectory);
+                return current.mode == mode ? current :
+                    motion::VariantGenerationRequest{};
+            }
+            DWORD written{};
+            bool published = WriteFile(request.get(), serialized.data(),
+                    static_cast<DWORD>(serialized.size()), &written, nullptr) &&
+                written == static_cast<DWORD>(serialized.size()) &&
+                FlushFileBuffers(request.get());
+            if (!published) motion::mark_locked_request_for_deletion(request.get());
+            request.reset();
+            if (!published || blocked() ||
+                motion::read_variant_generation_request(mediaDirectory) != created) {
+                return {};
+            }
+            // The request is authoritative even if this optional progress
+            // write loses a race. A later policy pass will repair visibility.
+            motion::write_variant_progress_if_current(
+                mediaDirectory, created, initialState);
+            return created;
         }
 
         [[nodiscard]] bool GenerationPaused(
@@ -1160,12 +1299,6 @@ namespace motion::agent
         {
             auto now = std::chrono::steady_clock::now();
             RemoveExpiredRetiredLeasesLocked(now);
-        }
-
-        bool PendingContains(std::wstring const& key) const
-        {
-            return std::any_of(pending_.begin(), pending_.end(),
-                [&](auto const& request) { return request.Key() == key; });
         }
 
         [[nodiscard]] std::shared_ptr<void> RetainPlaybackVariantLocked(fs::path const& path,
@@ -1277,6 +1410,7 @@ namespace motion::agent
             if (fs::remove(access->path, error) && !error) {
                 retainedProfiles_.erase(path);
                 retentionRetryAfter_.erase(path);
+                variantUseTouchAfter_.erase(path);
                 return true;
             }
             if (error) return false;
@@ -1284,6 +1418,7 @@ namespace motion::agent
             if (!fs::exists(access->path, error) && !error) {
                 retainedProfiles_.erase(path);
                 retentionRetryAfter_.erase(path);
+                variantUseTouchAfter_.erase(path);
                 return true;
             }
             return false;
@@ -1298,6 +1433,7 @@ namespace motion::agent
             auto stableMediaDirectory = StablePath(source.parent_path());
             if (!destinationAccess || !stableSource || !stableMediaDirectory) return false;
             bool shouldRetain{};
+            bool shouldTouchUseTime{};
             auto now = std::chrono::steady_clock::now();
             {
                 std::lock_guard lock(mutex_);
@@ -1320,6 +1456,15 @@ namespace motion::agent
                     // random rotation for the entire Agent session.
                     RetireLeaseLocked(destination, now);
                 }
+                auto nextTouch = variantUseTouchAfter_.find(destination);
+                if (nextTouch == variantUseTouchAfter_.end() ||
+                    now >= nextTouch->second) {
+                    // Cache quota eviction orders by last_write_time. Touch at
+                    // most once per half hour so it approximates last use
+                    // without turning the playback policy loop into disk I/O.
+                    variantUseTouchAfter_[destination] = now + std::chrono::minutes(30);
+                    shouldTouchUseTime = true;
+                }
                 if (!retainedProfiles_.contains(destination)) {
                     auto retry = retentionRetryAfter_.find(destination);
                     if (retry == retentionRetryAfter_.end() || now >= retry->second) {
@@ -1327,6 +1472,11 @@ namespace motion::agent
                         shouldRetain = true;
                     }
                 }
+            }
+            if (shouldTouchUseTime) {
+                std::error_code ignored;
+                fs::last_write_time(destinationAccess->path,
+                    fs::file_time_type::clock::now(), ignored);
             }
             if (shouldRetain && motion::retain_variant_profile(
                 *stableMediaDirectory, mode, destination.filename().wstring(),
@@ -1356,8 +1506,11 @@ namespace motion::agent
                 }
                 auto operationTrust = AcquireLibraryTrust();
                 if (libraryTrust_ && !operationTrust) {
-                    std::lock_guard lock(mutex_);
-                    active_.reset();
+                    {
+                        std::lock_guard lock(mutex_);
+                        active_.reset();
+                    }
+                    condition_.notify_all();
                     continue;
                 }
                 auto transcodeResult = Transcode(request, stop);
@@ -1365,8 +1518,11 @@ namespace motion::agent
                 // drive was replaced at the configured path. The Agent notices
                 // the same loss on its next policy loop and joins this worker.
                 if (!LibraryTrusted()) {
-                    std::lock_guard lock(mutex_);
-                    active_.reset();
+                    {
+                        std::lock_guard lock(mutex_);
+                        active_.reset();
+                    }
+                    condition_.notify_all();
                     continue;
                 }
                 bool succeeded = transcodeResult == VideoTranscodeResult::succeeded;
@@ -1413,6 +1569,7 @@ namespace motion::agent
                     if (!succeeded && !paused && !stop.stop_requested() && !obsolete && !cancelled &&
                         !suppressed && !superseded) failed_.insert(request.Key());
                 }
+                condition_.notify_all();
 
                 auto durableRequest = ReadGenerationRequest(request.source.parent_path());
                 bool requestStillCurrent = request.explicitRequest &&
@@ -1498,22 +1655,27 @@ namespace motion::agent
                 fs::remove(temporary, ignored);
                 std::set<fs::path> protectedFiles;
                 protectedFiles.insert(request.destination);
-                prune_variant_cache(*stableWallpapers,
-                    [this, &protectedFiles](fs::path const& candidate) {
+                auto pruneToStorageQuota = [&] {
+                    prune_variant_cache(*stableWallpapers,
+                        storageQuotaBytes_.load(std::memory_order_relaxed),
+                        [this, &protectedFiles](fs::path const& candidate) {
                         // The expensive traversal remains outside the mutex;
                         // only the final protection check and deletion are
                         // serialized with Resolve()/TryAdoptVariant().
                         auto configured = ConfiguredPath(candidate);
                         return configured && RemoveVariantIfUnleased(*configured, &protectedFiles);
-                    });
+                        });
+                };
+                pruneToStorageQuota();
                 if (!has_transcode_space(directory, *stableSource)) {
-                    append_log(logRoot_, L"磁盘空间不足，跳过壁纸性能缓存生成。");
+                    append_log(logRoot_, L"磁盘空间不足，跳过壁纸优化副本生成。");
                     return VideoTranscodeResult::failed;
                 }
                 auto targetFps = request.targetFps;
                 std::wstring error;
                 std::wstring selectedBackend;
                 auto lastProgressWrite = std::chrono::steady_clock::time_point::min();
+                auto attemptStartedAt = std::chrono::steady_clock::now();
                 uint32_t lastProgressPercent{};
                 uint32_t lastProgressAttempt{};
                 bool lastProgressKnown{};
@@ -1538,6 +1700,7 @@ namespace motion::agent
                     auto now = std::chrono::steady_clock::now();
                     bool newAttempt = progress.attemptStarted ||
                         progress.attempt != lastProgressAttempt;
+                    if (newAttempt) attemptStartedAt = now;
                     bool completed = progress.percent == 100;
                     if (!newAttempt && !completed) {
                         if (!progress.determinate ||
@@ -1545,10 +1708,32 @@ namespace motion::agent
                             now - lastProgressWrite < std::chrono::seconds(1)) return;
                     }
                     lastProgressAttempt = progress.attempt;
+                    uint64_t estimatedRemainingSeconds{};
+                    bool estimatedRemainingKnown{};
+                    auto elapsed = now - attemptStartedAt;
+                    if (progress.determinate && progress.processedMicroseconds &&
+                        progress.durationMicroseconds > progress.processedMicroseconds &&
+                        elapsed >= std::chrono::seconds(2)) {
+                        auto elapsedSeconds =
+                            std::chrono::duration<long double>(elapsed).count();
+                        auto remainingMedia = static_cast<long double>(
+                            progress.durationMicroseconds - progress.processedMicroseconds);
+                        auto encodedMedia = static_cast<long double>(
+                            progress.processedMicroseconds);
+                        auto estimate = elapsedSeconds * remainingMedia / encodedMedia;
+                        constexpr long double maximumEtaSeconds =
+                            365.0L * 24.0L * 60.0L * 60.0L;
+                        if (estimate >= 0.0L && estimate <= maximumEtaSeconds) {
+                            estimatedRemainingSeconds = static_cast<uint64_t>(
+                                std::ceil(estimate));
+                            estimatedRemainingKnown = true;
+                        }
+                    }
                     bool persisted = request.explicitRequest &&
                         motion::write_variant_progress_if_current(*stableMediaDirectory,
                             request.durableRequest, motion::VariantProgressState::generating,
-                            progress.percent, progress.determinate);
+                            progress.percent, progress.determinate,
+                            estimatedRemainingSeconds, estimatedRemainingKnown);
                     // Cancel/pause/suppress and a replacement request are
                     // cross-process file operations. They may land between
                     // the optimistic check above and this write; re-check the
@@ -1692,6 +1877,10 @@ namespace motion::agent
                     RemoveVariantIfUnleased(request.destination, nullptr, true);
                     return VideoTranscodeResult::failed;
                 }
+                // A completed encode can itself cross the quota. Re-run exact
+                // physical-allocation accounting while protecting the new file
+                // and all Renderer leases, instead of waiting for another task.
+                pruneToStorageQuota();
                 return VideoTranscodeResult::succeeded;
             } catch (...) {
                 removeTemporaryIfTrusted();
@@ -1717,8 +1906,10 @@ namespace motion::agent
         std::map<fs::path, std::weak_ptr<PlaybackLeaseAnchor>> playbackVariantLeases_;
         std::set<fs::path> retainedProfiles_;
         std::map<fs::path, std::chrono::steady_clock::time_point> retentionRetryAfter_;
+        std::map<fs::path, std::chrono::steady_clock::time_point> variantUseTouchAfter_;
         std::jthread worker_;
         std::atomic_uint64_t generation_{};
+        std::atomic_uint64_t storageQuotaBytes_{ defaultVariantCacheLimit };
         bool generationAllowed_{};
         bool mediaFoundationStarted_{};
     };
@@ -1758,6 +1949,14 @@ namespace motion::agent
         return impl_->SourceHardwareDecodeAdapter(
             source, preferredAdapter, aggregateOutputPixels);
     }
+    void VideoOptimizer::SetStorageQuotaBytes(uint64_t quotaBytes) noexcept
+    {
+        impl_->SetStorageQuotaBytes(quotaBytes);
+    }
     void VideoOptimizer::SetGenerationAllowed(bool allowed) { impl_->SetGenerationAllowed(allowed); }
+    bool VideoOptimizer::Quiesce(uint32_t timeoutMilliseconds)
+    {
+        return impl_->Quiesce(timeoutMilliseconds);
+    }
     void VideoOptimizer::InvalidateChoices() { impl_->InvalidateChoices(); }
 }

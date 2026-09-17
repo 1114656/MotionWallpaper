@@ -74,6 +74,17 @@ namespace
     bool automaticDecodeStatusPending{};
     HANDLE lowMemoryNotification{};
 
+    void refresh_cursor_if_over_renderer()
+    {
+        if (hiddenRenderer || !visualShown || !videoWindow) return;
+        POINT cursor{};
+        if (!GetCursorPos(&cursor)) return;
+        HWND cursorWindow = WindowFromPoint(cursor);
+        if (cursorWindow != videoWindow && !IsChild(videoWindow, cursorWindow)) return;
+        SendMessageW(videoWindow, WM_SETCURSOR, reinterpret_cast<WPARAM>(videoWindow),
+            MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+    }
+
     bool low_memory_pressure()
     {
         BOOL lowMemory{};
@@ -747,6 +758,7 @@ namespace
             presentationMode == PresentationMode::Screensaver ? HWND_TOPMOST : HWND_BOTTOM,
             0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         visualShown = true;
+        refresh_cursor_if_over_renderer();
     }
 
     bool apply_window_region()
@@ -772,7 +784,14 @@ namespace
 
     bool size_window(PresentationMode requested)
     {
-        if (hiddenRenderer || presentationMode == requested) return true;
+        if (hiddenRenderer) {
+            presentationMode = requested;
+            return true;
+        }
+        if (presentationMode == requested) {
+            refresh_cursor_if_over_renderer();
+            return true;
+        }
         UINT flags = SWP_NOACTIVATE | SWP_FRAMECHANGED;
         if (visualShown) flags |= SWP_SHOWWINDOW;
         auto bounds = displayLayout.bounds;
@@ -795,6 +814,7 @@ namespace
         }
         if (!apply_window_region()) return false;
         presentationMode = requested;
+        refresh_cursor_if_over_renderer();
         return true;
     }
 
@@ -966,6 +986,11 @@ namespace
     LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
     {
         switch (message) {
+        case WM_SETCURSOR:
+            if (LOWORD(lParam) != HTCLIENT) break;
+            SetCursor(motion::renderer::presentation_hides_cursor(presentationMode)
+                ? nullptr : LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
         case WM_PAINT: ValidateRect(window, nullptr); return 0;
         case WM_ERASEBKGND: return 1;
         case wmFrameTick:
@@ -991,7 +1016,11 @@ namespace
             PostMessageW(window, WM_CLOSE, 0, 0);
             return 0;
         case WM_CLOSE: DestroyWindow(window); return 0;
-        case WM_DESTROY: stop_frame_timer(); cancel_residency_timer(); PostQuitMessage(0); return 0;
+        case WM_DESTROY:
+            stop_frame_timer();
+            cancel_residency_timer();
+            PostQuitMessage(0);
+            return 0;
         }
         return DefWindowProcW(window, message, wParam, lParam);
     }
@@ -1001,7 +1030,10 @@ namespace
         WNDCLASSEXW definition{ sizeof(definition) };
         definition.lpfnWndProc = window_proc;
         definition.hInstance = instance;
-        definition.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        // Client cursor ownership follows the current presentation mode in
+        // WM_SETCURSOR; a class cursor would make DefWindowProc restore the
+        // arrow while the full-screen screen saver is active.
+        definition.hCursor = nullptr;
         definition.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
         definition.lpszClassName = L"MotionWallpaper.Native.Renderer";
         if (!RegisterClassExW(&definition) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;

@@ -44,7 +44,7 @@
                     <Button x:Name="VariantsNavButton" Click="Variants_Click" Style="{StaticResource SidebarButtonStyle}">
                         <Grid>
                             <Border x:Name="VariantsNavIndicator" Visibility="Collapsed" Width="3" Margin="-12,0,0,0" HorizontalAlignment="Left" CornerRadius="2" Background="{StaticResource AccentBrush}" />
-                            <TextBlock Text="性能副本" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center" />
+                            <TextBlock Text="存储与节能优化" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center" />
                             <FontIcon Glyph="&#xEDA2;" FontSize="15" Foreground="{StaticResource TextSecondaryBrush}" HorizontalAlignment="Right" VerticalAlignment="Center" />
                         </Grid>
                     </Button>
@@ -55,7 +55,20 @@
                     <ListView x:Name="GroupPicker" Grid.Row="1" SelectionChanged="GroupPicker_SelectionChanged" RightTapped="GroupPicker_RightTapped" DragItemsStarting="GroupPicker_DragItemsStarting" DragItemsCompleted="GroupPicker_DragItemsCompleted" SelectionMode="Single" CanDragItems="True" CanReorderItems="True" AllowDrop="True" IsSwipeEnabled="False" HorizontalContentAlignment="Stretch"><ListView.ItemContainerStyle><Style TargetType="ListViewItem"><Setter Property="HorizontalContentAlignment" Value="Stretch" /><Setter Property="Padding" Value="13,9" /><Setter Property="Margin" Value="0,2" /><Setter Property="CornerRadius" Value="8" /></Style></ListView.ItemContainerStyle></ListView>
                     <Grid Grid.Row="2" Margin="0,12,0,0" ColumnSpacing="8"><Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions><Button Content="＋  新建分组" HorizontalAlignment="Stretch" Style="{StaticResource SidebarButtonStyle}" Click="OpenNewGroup_Click" /><Button Grid.Column="1" Width="38" Padding="0" CornerRadius="9" ToolTipService.ToolTip="管理当前分组"><FontIcon Glyph="&#xE712;" FontSize="15" /><Button.Flyout><MenuFlyout><MenuFlyoutItem Text="重命名" Click="RenameGroup_Click" /><MenuFlyoutItem Text="上移" Click="MoveGroupUp_Click" /><MenuFlyoutItem Text="下移" Click="MoveGroupDown_Click" /><MenuFlyoutSeparator /><MenuFlyoutItem Text="移到回收站" Click="DeleteGroup_Click" /></MenuFlyout></Button.Flyout></Button></Grid>
                 </Grid>
-                <Border Grid.Row="3" Margin="0,18,0,0" Padding="14" Style="{StaticResource CardStyle}" Background="#FFFFFF"><StackPanel Spacing="8"><Grid ColumnSpacing="8"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xEDA2;" FontSize="14" /><TextBlock Grid.Column="1" Text="固定媒体库" FontWeight="SemiBold" /></Grid><Button HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Padding="3" CornerRadius="6" Background="Transparent" BorderThickness="0" ToolTipService.ToolTip="点击查看完整路径"><TextBlock x:Name="LibraryPath" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" Style="{StaticResource QuietTextStyle}" /><Button.Flyout><Flyout Placement="RightEdgeAlignedBottom"><StackPanel Width="380" Spacing="8"><TextBlock Text="媒体库完整路径" FontWeight="SemiBold" /><TextBlock x:Name="LibraryPathFull" TextWrapping="Wrap" IsTextSelectionEnabled="True" Foreground="{StaticResource TextSecondaryBrush}" /></StackPanel></Flyout></Button.Flyout></Button><Grid ColumnSpacing="8"><Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions><Button Content="打开" Click="OpenLibrary_Click" HorizontalAlignment="Stretch" Padding="9,7" /><Button Grid.Column="1" Content="移动位置" Click="MoveLibrary_Click" HorizontalAlignment="Stretch" Padding="9,7" /></Grid></StackPanel></Border>
+                <Border Grid.Row="3" Margin="0,18,0,0" Padding="14" Style="{StaticResource CardStyle}" Background="#FFFFFF">
+                    <StackPanel Spacing="8">
+                        <Grid ColumnSpacing="8"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xEDA2;" FontSize="14" /><TextBlock Grid.Column="1" Text="固定媒体库" FontWeight="SemiBold" /></Grid>
+                        <Button HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Padding="3" CornerRadius="6" Background="Transparent" BorderThickness="0" ToolTipService.ToolTip="点击查看完整路径"><TextBlock x:Name="LibraryPath" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" Style="{StaticResource QuietTextStyle}" /><Button.Flyout><Flyout Placement="RightEdgeAlignedBottom"><StackPanel Width="380" Spacing="8"><TextBlock Text="媒体库完整路径" FontWeight="SemiBold" /><TextBlock x:Name="LibraryPathFull" TextWrapping="Wrap" IsTextSelectionEnabled="True" Foreground="{StaticResource TextSecondaryBrush}" /></StackPanel></Flyout></Button.Flyout></Button>
+                        <Grid ColumnSpacing="8" RowSpacing="8">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                            <Button Content="打开" Click="OpenLibrary_Click" HorizontalAlignment="Stretch" Padding="9,7" />
+                            <Button Grid.Column="1" Content="移动位置" Click="MoveLibrary_Click" HorizontalAlignment="Stretch" Padding="9,7" />
+                            <Button Grid.Row="1" Content="一键备份" Click="BackupLibrary_Click" HorizontalAlignment="Stretch" Padding="9,7" />
+                            <Button Grid.Row="1" Grid.Column="1" Content="恢复备份" Click="RestoreLibrary_Click" HorizontalAlignment="Stretch" Padding="9,7" />
+                        </Grid>
+                    </StackPanel>
+                </Border>
             </Grid>
         </Border>
 
@@ -66,11 +79,60 @@
                         <Grid ColumnSpacing="16">
                             <Grid.ColumnDefinitions><ColumnDefinition Width="236" /><ColumnDefinition Width="170" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
                             <Border Width="236" Height="142" CornerRadius="9" Background="{StaticResource SurfaceMutedBrush}"><Image x:Name="CurrentWallpaperPreview" Stretch="UniformToFill" /></Border>
-                            <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5"><TextBlock Text="当前壁纸" FontSize="13" Foreground="{StaticResource TextSecondaryBrush}" /><TextBlock x:Name="CurrentWallpaperName" Text="尚未选择壁纸" FontSize="20" FontWeight="SemiBold" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis" /><TextBlock x:Name="CurrentWallpaperDetails" Text="从壁纸分组中选择" Style="{StaticResource QuietTextStyle}" /><TextBlock x:Name="PlaybackStatusText" Visibility="Collapsed" /><TextBlock x:Name="DecodeStatusText" Visibility="Collapsed" /></StackPanel>
+                            <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="5"><TextBlock Text="当前壁纸" FontSize="13" Foreground="{StaticResource TextSecondaryBrush}" /><TextBlock x:Name="CurrentWallpaperName" Text="尚未选择壁纸" FontSize="20" FontWeight="SemiBold" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis" /><TextBlock x:Name="CurrentWallpaperDetails" Text="从壁纸分组中选择" Style="{StaticResource QuietTextStyle}" /><TextBlock x:Name="PlaybackStatusText" FontWeight="SemiBold" Foreground="{StaticResource AccentBrush}" /><TextBlock x:Name="DecodeStatusText" Style="{StaticResource QuietTextStyle}" Visibility="Collapsed" TextWrapping="Wrap" /></StackPanel>
                             <Grid Grid.Column="2" ColumnSpacing="9" VerticalAlignment="Center"><Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions><Border Height="104" CornerRadius="8" Background="{StaticResource SurfaceMutedBrush}"><Image x:Name="CurrentWallpaperThumb1" Stretch="UniformToFill" /></Border><Border Grid.Column="1" Height="104" CornerRadius="8" Background="{StaticResource SurfaceMutedBrush}"><Image x:Name="CurrentWallpaperThumb2" Stretch="UniformToFill" /></Border><Border Grid.Column="2" Height="104" CornerRadius="8" Background="{StaticResource SurfaceMutedBrush}"><Image x:Name="CurrentWallpaperThumb3" Stretch="UniformToFill" /></Border><Border Grid.Column="3" Height="104" CornerRadius="8" Background="{StaticResource SurfaceMutedBrush}"><Grid><Image x:Name="CurrentWallpaperThumb4" Stretch="UniformToFill" /><Border x:Name="CurrentWallpaperOverflowOverlay" Visibility="Collapsed" Background="#A8000000"><TextBlock x:Name="CurrentWallpaperOverflow" Foreground="White" FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" /></Border></Grid></Border></Grid>
                             <Button Grid.Column="3" Width="38" Height="38" Padding="0" CornerRadius="9" VerticalAlignment="Top" Click="CurrentWallpaper_Click" ToolTipService.ToolTip="打开当前壁纸分组"><FontIcon Glyph="&#xE72A;" FontSize="15" /></Button>
                         </Grid>
                     </Border>
+
+                    <Border x:Name="RuntimeStatusPanel" Style="{StaticResource CardStyle}" Padding="16">
+                        <StackPanel Spacing="12">
+                            <Grid ColumnSpacing="10">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                <StackPanel Spacing="3">
+                                    <TextBlock Text="运行状态" FontSize="18" FontWeight="SemiBold" />
+                                    <TextBlock x:Name="RuntimeStatusSummary" Text="正在连接后台服务…" Style="{StaticResource QuietTextStyle}" />
+                                </StackPanel>
+                                <Button x:Name="RetryRuntimeButton" Grid.Column="1" Content="重试" Click="RetryRuntime_Click" IsEnabled="False" VerticalAlignment="Center" />
+                                <Button x:Name="RestartRendererButton" Grid.Column="2" Content="重启渲染" Click="RestartRenderer_Click" IsEnabled="False" VerticalAlignment="Center" />
+                            </Grid>
+                            <StackPanel x:Name="DisplayRuntimeCards" Spacing="8" />
+                        </StackPanel>
+                    </Border>
+
+                    <Grid ColumnSpacing="28">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock Text="使用场景" Style="{StaticResource SectionTitleStyle}" />
+                            <Border Style="{StaticResource CardStyle}" Padding="16">
+                                <StackPanel Spacing="12">
+                                    <Grid ColumnSpacing="10">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                        <ComboBox x:Name="ScenePicker" HorizontalAlignment="Stretch" SelectionChanged="ScenePicker_Changed" AutomationProperties.Name="选择使用场景" />
+                                        <Button Grid.Column="1" Content="立即应用" Click="ApplyScene_Click" Style="{StaticResource AccentButtonStyle}" />
+                                    </Grid>
+                                    <Grid ColumnSpacing="10">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                        <StackPanel Spacing="2">
+                                            <TextBlock x:Name="SceneDescription" Text="工作、夜间、电池和投屏可保存不同壁纸与播放偏好" TextWrapping="Wrap" Style="{StaticResource QuietTextStyle}" />
+                                            <TextBlock x:Name="SceneAutomationHint" Text="此场景仅手动启用" TextWrapping="Wrap" Style="{StaticResource QuietTextStyle}" />
+                                        </StackPanel>
+                                        <ToggleSwitch x:Name="SceneAutoSwitch" Grid.Column="1" Header="自动切换" Toggled="SceneAutoSwitch_Changed" VerticalAlignment="Center" />
+                                    </Grid>
+                                    <Button Content="把当前壁纸和设置保存到此场景" Click="SaveScene_Click" HorizontalAlignment="Stretch" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                        <StackPanel Grid.Column="1">
+                            <TextBlock Text="显示器布局" Style="{StaticResource SectionTitleStyle}" />
+                            <Border Style="{StaticResource CardStyle}" Padding="16">
+                                <StackPanel Spacing="9">
+                                    <Canvas x:Name="DisplayLayoutMap" Width="500" Height="150" HorizontalAlignment="Center" Background="{StaticResource SurfaceMutedBrush}" />
+                                    <TextBlock x:Name="DisplayLayoutHint" Text="点击屏幕，再从壁纸库中直接选择要分配的壁纸。" TextAlignment="Center" TextWrapping="Wrap" Style="{StaticResource QuietTextStyle}" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </Grid>
 
                     <Grid ColumnSpacing="28">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
@@ -88,6 +150,7 @@
                             <TextBlock Text="屏保与电源" Style="{StaticResource SectionTitleStyle}" />
                             <Border Style="{StaticResource CardStyle}"><StackPanel>
                                 <Border Style="{StaticResource SettingRowStyle}"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="32" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xE708;" Style="{StaticResource SettingIconStyle}" /><TextBlock Grid.Column="1" Text="闲置屏保" FontWeight="SemiBold" VerticalAlignment="Center" /><ToggleSwitch x:Name="ScreensaverEnabled" Grid.Column="2" VerticalAlignment="Center" Toggled="Settings_Changed" AutomationProperties.Name="闲置屏保" /></Grid></Border>
+                                <Border Style="{StaticResource SettingRowStyle}"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="32" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xE786;" Style="{StaticResource SettingIconStyle}" /><StackPanel Grid.Column="1" VerticalAlignment="Center"><TextBlock Text="立即预览屏保" FontWeight="SemiBold" /><TextBlock Text="无需等待闲置倒计时，移动鼠标即可退出" Style="{StaticResource QuietTextStyle}" /></StackPanel><Button Grid.Column="2" Content="立即预览" Click="PreviewScreensaver_Click" VerticalAlignment="Center" /></Grid></Border>
                                 <Border Style="{StaticResource SettingRowStyle}"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="32" /><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xE823;" Style="{StaticResource SettingIconStyle}" /><TextBlock Grid.Column="1" Text="进入屏保" FontWeight="SemiBold" VerticalAlignment="Center" /><ComboBox x:Name="IdleTimeout" Grid.Column="2" Style="{StaticResource SettingsComboBoxStyle}" SelectionChanged="Policy_Changed"><ComboBoxItem Content="30 秒" Tag="30" /><ComboBoxItem Content="1 分钟" Tag="60" /><ComboBoxItem Content="3 分钟" Tag="180" /><ComboBoxItem Content="5 分钟" Tag="300" /><ComboBoxItem Content="10 分钟" Tag="600" /></ComboBox></Grid></Border>
                                 <Border Style="{StaticResource SettingRowStyle}"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="32" /><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xE72E;" Style="{StaticResource SettingIconStyle}" /><TextBlock Grid.Column="1" Text="自动锁屏" FontWeight="SemiBold" VerticalAlignment="Center" /><ComboBox x:Name="AutoLockTimeout" Grid.Column="2" Style="{StaticResource SettingsComboBoxStyle}" SelectionChanged="Policy_Changed"><ComboBoxItem Content="不自动锁屏" Tag="0" /><ComboBoxItem Content="1 分钟" Tag="60" /><ComboBoxItem Content="3 分钟" Tag="180" /><ComboBoxItem Content="5 分钟" Tag="300" /><ComboBoxItem Content="10 分钟" Tag="600" /><ComboBoxItem Content="30 分钟" Tag="1800" /></ComboBox></Grid></Border>
                                 <Border Style="{StaticResource SettingRowStyle}"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="32" /><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xE7F4;" Style="{StaticResource SettingIconStyle}" /><TextBlock Grid.Column="1" Text="锁屏后熄屏" FontWeight="SemiBold" VerticalAlignment="Center" /><ComboBox x:Name="DisplayOffAfterLockDelay" Grid.Column="2" Style="{StaticResource SettingsComboBoxStyle}" SelectionChanged="Policy_Changed"><ComboBoxItem Content="不熄屏" Tag="-1" /><ComboBoxItem Content="立即" Tag="0" /><ComboBoxItem Content="30 秒" Tag="30" /><ComboBoxItem Content="1 分钟" Tag="60" /><ComboBoxItem Content="3 分钟" Tag="180" /><ComboBoxItem Content="5 分钟" Tag="300" /></ComboBox></Grid></Border>
@@ -111,12 +174,26 @@
                 <StackPanel Padding="34,28,34,48" Spacing="20" MaxWidth="1160" HorizontalAlignment="Stretch">
                     <Grid>
                         <StackPanel Spacing="4">
-                            <TextBlock Text="性能副本" FontSize="30" FontWeight="SemiBold" />
-                            <TextBlock Text="单独管理源文件和性能副本；保留有效副本后可释放源文件空间。" Style="{StaticResource QuietTextStyle}" />
+                            <TextBlock Text="存储与节能优化" FontSize="30" FontWeight="SemiBold" />
+                            <TextBlock Text="按显示设备生成更省电的优化版本，并集中管理任务与可释放空间。" Style="{StaticResource QuietTextStyle}" />
                         </StackPanel>
                         <TextBlock x:Name="VariantSummaryText" HorizontalAlignment="Right" VerticalAlignment="Center"
                                    Foreground="{StaticResource TextSecondaryBrush}" />
                     </Grid>
+                    <Border Style="{StaticResource CardStyle}" Padding="16">
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <StackPanel Spacing="3">
+                                <TextBlock Text="优化存储" FontWeight="SemiBold" />
+                                <TextBlock x:Name="OptimizationStorageText" Text="正在统计可释放空间…" Style="{StaticResource QuietTextStyle}" />
+                            </StackPanel>
+                            <ComboBox x:Name="OptimizationQuota" Grid.Column="1" SelectedIndex="2" VerticalAlignment="Center" AutomationProperties.Name="优化版本磁盘配额">
+                                <ComboBoxItem Content="最多 2 GB" Tag="2147483648" /><ComboBoxItem Content="最多 5 GB" Tag="5368709120" /><ComboBoxItem Content="最多 10 GB" Tag="10737418240" /><ComboBoxItem Content="最多 20 GB" Tag="21474836480" /><ComboBoxItem Content="不限制" Tag="0" />
+                            </ComboBox>
+                            <Button Grid.Column="2" Content="保存并整理" Click="ApplyOptimizationQuota_Click" VerticalAlignment="Center" />
+                            <Button Grid.Column="3" Content="一键释放空间" Click="ReleaseOptimizationSpace_Click" VerticalAlignment="Center" />
+                        </Grid>
+                    </Border>
                     <StackPanel x:Name="VariantTasksSection" Spacing="10" Visibility="Collapsed">
                         <Grid>
                             <TextBlock Text="生成任务" Style="{StaticResource SectionTitleStyle}" />
@@ -130,7 +207,7 @@
                         <StackPanel HorizontalAlignment="Center" Spacing="8">
                             <FontIcon Glyph="&#xEDA2;" FontSize="28" Opacity="0.45" />
                             <TextBlock Text="还没有视频副本" FontSize="17" FontWeight="SemiBold" HorizontalAlignment="Center" />
-                            <TextBlock Text="导入视频后，可在这里生成和管理性能副本。" Style="{StaticResource QuietTextStyle}" />
+                            <TextBlock Text="导入视频后，可在这里生成和管理存储与节能优化版本。" Style="{StaticResource QuietTextStyle}" />
                         </StackPanel>
                     </Border>
                 </StackPanel>
@@ -140,6 +217,17 @@
                 <StackPanel Padding="34,28,34,48" Spacing="20" MaxWidth="1160" HorizontalAlignment="Stretch">
                     <Grid><TextBlock x:Name="GroupTitle" Text="壁纸分组" FontSize="30" FontWeight="SemiBold" VerticalAlignment="Center" /><StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" VerticalAlignment="Center"><Button x:Name="ImportImageButton" Content="导入图片" Click="ImportImage_Click" /><Button x:Name="ImportVideoButton" Content="导入视频" Click="ImportVideo_Click" Style="{StaticResource AccentButtonStyle}" /></StackPanel></Grid>
                     <Border x:Name="ImportPanel" Style="{StaticResource CardStyle}" Padding="15" Visibility="Collapsed"><Grid ColumnSpacing="14"><Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions><StackPanel Spacing="8"><Grid><TextBlock x:Name="ImportStatusText" Text="正在导入…" FontWeight="SemiBold" /><TextBlock x:Name="ImportPercentText" Text="0%" HorizontalAlignment="Right" Foreground="{StaticResource TextSecondaryBrush}" /></Grid><ProgressBar x:Name="ImportProgress" Minimum="0" Maximum="100" Value="0" /><TextBlock Text="保持源文件原始字节；导入在后台执行。" Style="{StaticResource QuietTextStyle}" /></StackPanel><Button x:Name="CancelImportButton" Grid.Column="1" Content="取消" Click="CancelImport_Click" VerticalAlignment="Center" /></Grid></Border>
+                    <Grid ColumnSpacing="10">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /><ColumnDefinition Width="140" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <TextBox x:Name="MediaSearchBox" PlaceholderText="搜索全部壁纸、文件名或标签" TextChanged="MediaSearch_Changed" />
+                        <TextBox x:Name="MediaTagFilter" Grid.Column="1" PlaceholderText="按标签筛选（可多项）" TextChanged="MediaSearch_Changed" />
+                        <ComboBox x:Name="MediaKindFilter" Grid.Column="2" SelectedIndex="0" SelectionChanged="MediaFilter_Changed" HorizontalAlignment="Stretch">
+                            <ComboBoxItem Content="全部类型" Tag="" /><ComboBoxItem Content="视频" Tag="video" /><ComboBoxItem Content="图片" Tag="image" />
+                        </ComboBox>
+                        <ToggleButton x:Name="FavoritesOnlyButton" Grid.Column="3" Content="收藏" Click="MediaFilter_Click" ToolTipService.ToolTip="只显示收藏" />
+                        <ToggleButton x:Name="BatchModeButton" Grid.Column="4" Content="批量管理" Click="BatchMode_Click" />
+                        <Button Grid.Column="5" Content="修复重复项" Click="RepairDuplicates_Click" />
+                    </Grid>
                     <Grid ColumnSpacing="10">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
@@ -166,6 +254,10 @@
                                         <Button x:Name="RenameMediaButton" Content="重命名" Click="RenameMedia_Click" IsEnabled="False"
                                                 HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" />
                                         <Button x:Name="MoveMediaButton" Content="移动分组" Click="MoveMedia_Click" IsEnabled="False"
+                                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" />
+                                        <Button x:Name="FavoriteMediaButton" Content="收藏 / 取消收藏" Click="ToggleFavorite_Click" IsEnabled="False"
+                                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" />
+                                        <Button x:Name="TagMediaButton" Content="编辑标签" Click="EditTags_Click" IsEnabled="False"
                                                 HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" />
                                         <Button x:Name="DeleteMediaButton" Content="删除壁纸本体" Click="DeleteMedia_Click" IsEnabled="False"
                                                 HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Foreground="#C42B1C" />

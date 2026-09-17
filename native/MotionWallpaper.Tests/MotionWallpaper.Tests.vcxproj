@@ -22,10 +22,11 @@
   <PropertyGroup><TargetName>MotionWallpaper.Tests</TargetName><OutDir>$(SolutionDir)x64\$(Configuration)\MotionWallpaper.Tests\</OutDir><IntDir>$(SolutionDir)obj\$(ProjectName)\$(Configuration)\</IntDir></PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile><WarningLevel>Level4</WarningLevel><LanguageStandard>stdcpp20</LanguageStandard><PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions></ClCompile>
-    <Link><SubSystem>Console</SubSystem><AdditionalDependencies>windowsapp.lib;ole32.lib;bcrypt.lib;shell32.lib;d3d11.lib;dxgi.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowscodecs.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><SubSystem>Console</SubSystem><AdditionalDependencies>windowsapp.lib;ole32.lib;bcrypt.lib;shell32.lib;d3d11.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowscodecs.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Tests.cpp" />
+    <ClCompile Include="..\MotionWallpaper.Agent\VideoOptimizer.cpp" />
   </ItemGroup>
   <ItemGroup><Manifest Include="app.manifest" /></ItemGroup>
   <ItemGroup>
@@ -33,6 +34,6 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2526" />
   </ItemGroup>
   <ItemGroup><ProjectReference Include="..\MotionWallpaper.Common\MotionWallpaper.Common.vcxproj"><Project>{8E8B0D7C-63C7-4D90-A08E-8F15AA760E39}</Project></ProjectReference><ProjectReference Include="..\MotionWallpaper.Core\MotionWallpaper.Core.vcxproj"><Project>{B154C177-6898-485C-82C8-9BE027E466F8}</Project></ProjectReference></ItemGroup>
-  <ItemGroup><ClInclude Include="..\MotionWallpaper.Agent\CoveragePolicy.h" /><ClInclude Include="..\MotionWallpaper.Agent\PlaybackCapabilityPolicy.h" /><ClInclude Include="..\MotionWallpaper.Agent\SharedRendererPolicy.h" /><ClInclude Include="..\MotionWallpaper.Agent\VideoTranscoder.h" /><ClInclude Include="..\MotionWallpaper.Agent\VideoVariantPolicy.h" /><ClInclude Include="..\MotionWallpaper.App\MediaLibrary.h" /><ClInclude Include="..\MotionWallpaper.Renderer\DecodePolicy.h" /><ClInclude Include="..\MotionWallpaper.Renderer\FrameTiming.h" /><ClInclude Include="..\MotionWallpaper.Renderer\SoftwareFramePolicy.h" /><ClInclude Include="..\MotionWallpaper.Protocol\RendererProtocol.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="LibraryBackupTests.h" /><ClInclude Include="..\MotionWallpaper.Agent\CoveragePolicy.h" /><ClInclude Include="..\MotionWallpaper.Agent\PlaybackCapabilityPolicy.h" /><ClInclude Include="..\MotionWallpaper.Agent\RuntimeEventPolicy.h" /><ClInclude Include="..\MotionWallpaper.Agent\RuntimeStatusPolicy.h" /><ClInclude Include="..\MotionWallpaper.Agent\SharedRendererPolicy.h" /><ClInclude Include="..\MotionWallpaper.Agent\TrayControlPolicy.h" /><ClInclude Include="..\MotionWallpaper.Agent\VideoOptimizer.h" /><ClInclude Include="..\MotionWallpaper.Agent\VideoTranscoder.h" /><ClInclude Include="..\MotionWallpaper.Agent\VideoVariantPolicy.h" /><ClInclude Include="..\MotionWallpaper.App\LibraryBackup.h" /><ClInclude Include="..\MotionWallpaper.App\MediaLibrary.h" /><ClInclude Include="..\MotionWallpaper.Renderer\DecodePolicy.h" /><ClInclude Include="..\MotionWallpaper.Renderer\FrameTiming.h" /><ClInclude Include="..\MotionWallpaper.Renderer\SoftwareFramePolicy.h" /><ClInclude Include="..\MotionWallpaper.Protocol\RendererProtocol.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

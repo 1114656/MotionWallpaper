@@ -16,11 +16,14 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <vector>
 #include "MediaLibrary.h"
 #include "ThumbnailGenerator.h"
@@ -39,6 +42,8 @@ namespace
     constexpr std::wstring_view moveRecordPrefix = L".mw-move-";
     constexpr std::wstring_view moveConflictPrefix = L".mw-move-conflict-";
     constexpr std::string_view moveRecordMagic = "MotionWallpaper.Move/v1\n";
+    constexpr size_t maximumMediaTags = 32;
+    constexpr size_t maximumMediaTagCharacters = 64;
 
     struct MoveRestoreRecord
     {
@@ -79,6 +84,46 @@ namespace
         value.erase(value.begin(), std::find_if(value.begin(), value.end(), notSpace));
         value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(), value.end());
         return value;
+    }
+
+    std::wstring folded(std::wstring_view value)
+    {
+        std::wstring result(value);
+        std::transform(result.begin(), result.end(), result.begin(), [](wchar_t character) {
+            return static_cast<wchar_t>(towlower(character));
+        });
+        return result;
+    }
+
+    std::vector<std::wstring> normalize_media_tags(
+        std::vector<std::wstring> const& values)
+    {
+        std::vector<std::wstring> result;
+        result.reserve((std::min)(values.size(), maximumMediaTags));
+        for (auto value : values) {
+            value = trim(std::move(value));
+            if (value.empty() || value.size() > maximumMediaTagCharacters ||
+                !std::all_of(value.begin(), value.end(), [](wchar_t character) {
+                    return character >= 0x20 && character != 0x7f &&
+                        character != L'|' && character != L'\r' && character != L'\n';
+                })) {
+                throw std::invalid_argument("invalid media tag");
+            }
+            auto duplicate = std::find_if(result.begin(), result.end(),
+                [&](auto const& existing) {
+                    return _wcsicmp(existing.c_str(), value.c_str()) == 0;
+                });
+            if (duplicate == result.end()) result.push_back(std::move(value));
+        }
+        if (result.size() > maximumMediaTags) {
+            throw std::invalid_argument("too many media tags");
+        }
+        return result;
+    }
+
+    bool contains_folded(std::wstring const& value, std::wstring const& needle)
+    {
+        return needle.empty() || folded(value).find(needle) != std::wstring::npos;
     }
 
     std::wstring recycle_token()
@@ -533,6 +578,88 @@ namespace motion::app
                 result.push_back(std::move(*media));
             } catch (...) {}
         }
+        return result;
+    }
+
+    std::vector<CatalogMediaEntry> MediaLibrary::QueryMedia(MediaQuery const& query)
+    {
+        if (!query.groupId.empty() && !motion::valid_id(query.groupId)) {
+            throw std::invalid_argument("invalid catalog group id");
+        }
+        if (!query.kind.empty() && query.kind != "video" && query.kind != "image") {
+            throw std::invalid_argument("invalid catalog media kind");
+        }
+        auto requiredTags = normalize_media_tags(query.tags);
+        auto search = folded(trim(query.text));
+        std::vector<CatalogMediaEntry> result;
+        auto groups = LoadGroups().groups;
+        for (auto const& group : groups) {
+            if (!query.groupId.empty() && group.id != query.groupId) continue;
+            for (auto& media : LoadMedia(group.id)) {
+                if (!query.kind.empty() && media.kind != query.kind) continue;
+                if (query.favoritesOnly && !media.favorite) continue;
+
+                bool tagsMatch = std::all_of(requiredTags.begin(), requiredTags.end(),
+                    [&](auto const& required) {
+                        return std::any_of(media.tags.begin(), media.tags.end(),
+                            [&](auto const& existing) {
+                                return _wcsicmp(existing.c_str(), required.c_str()) == 0;
+                            });
+                    });
+                if (!tagsMatch) continue;
+
+                bool textMatches = search.empty() ||
+                    contains_folded(media.name, search) ||
+                    contains_folded(media.originalName, search) ||
+                    contains_folded(group.name, search) ||
+                    std::any_of(media.tags.begin(), media.tags.end(),
+                        [&](auto const& tag) { return contains_folded(tag, search); });
+                if (!textMatches) continue;
+                result.push_back({ std::move(media), group.name });
+            }
+        }
+        std::stable_sort(result.begin(), result.end(), [&](auto const& left, auto const& right) {
+            if (query.sort == MediaCatalogSort::Newest &&
+                left.media.importedAt != right.media.importedAt) {
+                return left.media.importedAt > right.media.importedAt;
+            }
+            if (query.sort == MediaCatalogSort::Size &&
+                left.media.sizeBytes != right.media.sizeBytes) {
+                return left.media.sizeBytes > right.media.sizeBytes;
+            }
+            if (query.sort == MediaCatalogSort::Kind &&
+                left.media.kind != right.media.kind) {
+                return left.media.kind == "video";
+            }
+            auto compared = _wcsicmp(left.media.name.c_str(), right.media.name.c_str());
+            if (compared != 0) return compared < 0;
+            return left.media.id < right.media.id;
+        });
+        return result;
+    }
+
+    std::vector<DuplicateMediaSet> MediaLibrary::FindDuplicateMedia()
+    {
+        using DuplicateKey = std::tuple<std::wstring, std::string, uint64_t>;
+        std::map<DuplicateKey, std::vector<CatalogMediaEntry>> candidates;
+        for (auto& item : QueryMedia()) {
+            if (item.media.sha256.empty() || !item.media.sizeBytes) continue;
+            candidates[{ folded(item.media.sha256), item.media.kind,
+                item.media.sizeBytes }].push_back(std::move(item));
+        }
+        std::vector<DuplicateMediaSet> result;
+        for (auto& [key, items] : candidates) {
+            if (items.size() < 2) continue;
+            result.push_back({ std::get<0>(key), std::get<1>(key),
+                std::get<2>(key), std::move(items) });
+        }
+        std::stable_sort(result.begin(), result.end(), [](auto const& left, auto const& right) {
+            if (left.items.size() != right.items.size()) {
+                return left.items.size() > right.items.size();
+            }
+            if (left.sizeBytes != right.sizeBytes) return left.sizeBytes > right.sizeBytes;
+            return left.sha256 < right.sha256;
+        });
         return result;
     }
 
@@ -1143,7 +1270,7 @@ namespace motion::app
                 }
                 RequireTrustedLibrary();
                 motion::append_utf8_log(root_ / L"Config" / L"app.log",
-                    L"性能副本删除恢复发现同名冲突，暂存数据已保留在 " +
+                    L"优化副本删除恢复发现同名冲突，暂存数据已保留在 " +
                     conflict.wstring() + L"（" + std::wstring(reason) + L"）");
                 throw std::runtime_error(
                     "conflicting interrupted variant deletion was preserved");
@@ -1256,6 +1383,153 @@ namespace motion::app
         ++updated.revision;
         updated.updatedAt = motion::timestamp_utc();
         motion::save_media(path, updated);
+    }
+
+    void MediaLibrary::MutateCatalogMetadata(
+        std::vector<motion::MediaMetadata> const& requestedMedia,
+        std::function<void(motion::MediaMetadata&)> const& mutation)
+    {
+        if (!mutation || requestedMedia.empty()) return;
+        std::scoped_lock lock(mutex_);
+        RequireTrustedLibrary();
+
+        struct PendingUpdate
+        {
+            fs::path path;
+            motion::MediaMetadata before;
+            motion::MediaMetadata after;
+        };
+        std::vector<PendingUpdate> updates;
+        std::set<std::string> visited;
+        updates.reserve(requestedMedia.size());
+        auto changedAt = motion::timestamp_utc();
+        for (auto const& requested : requestedMedia) {
+            if (!motion::valid_id(requested.id) || !visited.insert(requested.id).second) {
+                if (!motion::valid_id(requested.id)) {
+                    throw std::invalid_argument("invalid media id");
+                }
+                continue;
+            }
+            auto path = ResolveMediaDirectory(requested) / L"metadata.json";
+            auto current = motion::load_media(path);
+            if (!current || current->id != requested.id) {
+                throw std::runtime_error("media changed during catalog update");
+            }
+            auto updated = *current;
+            mutation(updated);
+            updated.version = motion::media_schema_version;
+            ++updated.revision;
+            updated.updatedAt = changedAt;
+            updates.push_back({ std::move(path), std::move(*current), std::move(updated) });
+        }
+
+        size_t committed{};
+        try {
+            for (; committed < updates.size(); ++committed) {
+                RequireTrustedLibrary();
+                motion::save_media(updates[committed].path, updates[committed].after);
+            }
+        } catch (...) {
+            while (committed && StableLibraryTrusted()) {
+                --committed;
+                try {
+                    motion::save_media(updates[committed].path,
+                        updates[committed].before);
+                } catch (...) {}
+            }
+            throw;
+        }
+    }
+
+    void MediaLibrary::SetFavorite(motion::MediaMetadata const& media, bool favorite)
+    {
+        SetFavorite(std::vector<motion::MediaMetadata>{ media }, favorite);
+    }
+
+    void MediaLibrary::SetFavorite(
+        std::vector<motion::MediaMetadata> const& media, bool favorite)
+    {
+        MutateCatalogMetadata(media,
+            [favorite](motion::MediaMetadata& item) { item.favorite = favorite; });
+    }
+
+    void MediaLibrary::SetTags(motion::MediaMetadata const& media,
+        std::vector<std::wstring> const& tags)
+    {
+        auto normalized = normalize_media_tags(tags);
+        MutateCatalogMetadata({ media },
+            [normalized = std::move(normalized)](motion::MediaMetadata& item) {
+                item.tags = normalized;
+            });
+    }
+
+    void MediaLibrary::AddTags(std::vector<motion::MediaMetadata> const& media,
+        std::vector<std::wstring> const& tags)
+    {
+        auto normalized = normalize_media_tags(tags);
+        MutateCatalogMetadata(media,
+            [normalized = std::move(normalized)](motion::MediaMetadata& item) {
+                auto combined = item.tags;
+                combined.insert(combined.end(), normalized.begin(), normalized.end());
+                item.tags = normalize_media_tags(combined);
+            });
+    }
+
+    motion::MediaMetadata MediaLibrary::MergeDuplicateMedia(
+        motion::MediaMetadata const& keep, motion::MediaMetadata const& duplicate)
+    {
+        if (keep.id == duplicate.id) {
+            throw std::invalid_argument("cannot merge a media item into itself");
+        }
+        std::scoped_lock lock(mutex_);
+        RequireTrustedLibrary();
+        auto keepDirectory = ResolveMediaDirectory(keep);
+        auto duplicateDirectory = ResolveMediaDirectory(duplicate);
+        auto currentKeep = motion::load_media(keepDirectory / L"metadata.json");
+        auto currentDuplicate = motion::load_media(duplicateDirectory / L"metadata.json");
+        if (!currentKeep || !currentDuplicate || currentKeep->id != keep.id ||
+            currentDuplicate->id != duplicate.id || currentKeep->sha256.empty() ||
+            _wcsicmp(currentKeep->sha256.c_str(), currentDuplicate->sha256.c_str()) != 0 ||
+            currentKeep->kind != currentDuplicate->kind ||
+            currentKeep->sizeBytes != currentDuplicate->sizeBytes) {
+            throw std::runtime_error("media items are not verified duplicates");
+        }
+
+        // Metadata hashes are an efficient discovery index, but the files may
+        // have been edited outside MotionWallpaper since import. Re-hash both
+        // sources immediately before the destructive half of a repair.
+        auto keepSource = keepDirectory / currentKeep->fileName;
+        auto duplicateSource = duplicateDirectory / currentDuplicate->fileName;
+        std::error_code keepSizeError;
+        std::error_code duplicateSizeError;
+        auto keepSize = fs::file_size(keepSource, keepSizeError);
+        auto duplicateSize = fs::file_size(duplicateSource, duplicateSizeError);
+        if (keepSizeError || duplicateSizeError ||
+            keepSize != currentKeep->sizeBytes ||
+            duplicateSize != currentDuplicate->sizeBytes) {
+            throw std::runtime_error("duplicate source changed since import");
+        }
+        auto keepHash = sha256_file(keepSource);
+        auto duplicateHash = sha256_file(duplicateSource);
+        if (_wcsicmp(keepHash.c_str(), currentKeep->sha256.c_str()) != 0 ||
+            _wcsicmp(duplicateHash.c_str(), currentDuplicate->sha256.c_str()) != 0 ||
+            _wcsicmp(keepHash.c_str(), duplicateHash.c_str()) != 0) {
+            throw std::runtime_error("duplicate source changed since import");
+        }
+
+        auto merged = *currentKeep;
+        merged.favorite = merged.favorite || currentDuplicate->favorite;
+        auto tags = merged.tags;
+        tags.insert(tags.end(), currentDuplicate->tags.begin(), currentDuplicate->tags.end());
+        merged.tags = normalize_media_tags(tags);
+        merged.version = motion::media_schema_version;
+        ++merged.revision;
+        merged.updatedAt = motion::timestamp_utc();
+        motion::save_media(keepDirectory / L"metadata.json", merged);
+        // A failed recycle leaves the duplicate intact and the canonical item
+        // with a harmless metadata union, so retry never loses user data.
+        DeletePath(duplicateDirectory);
+        return merged;
     }
 
     void MediaLibrary::UpdateCover(motion::MediaMetadata const& media, std::wstring const& coverFileName)
@@ -1567,6 +1841,30 @@ namespace motion::app
         }
     }
 
+    void MediaLibrary::ReclaimVariantsForStorageQuota(
+        motion::MediaMetadata const& media)
+    {
+        std::scoped_lock lock(mutex_);
+        RequireTrustedLibrary();
+        auto directory = ResolveMediaDirectory(media);
+        RecoverInterruptedVariantDeletions(directory);
+        std::error_code sourceError;
+        if (!fs::is_regular_file(directory / media.fileName, sourceError) || sourceError) {
+            throw std::runtime_error("cannot reclaim the last playable media files");
+        }
+        if (!motion::abandon_variant_generation_for_cache_eviction(directory)) {
+            throw std::runtime_error("unable to abandon optimization work for cache eviction");
+        }
+        RequireTrustedLibrary();
+        std::error_code error;
+        fs::remove_all(directory / L"Variants", error);
+        RequireTrustedLibrary();
+        if (error || fs::exists(directory / L"Variants")) {
+            throw std::system_error(error ? error :
+                std::make_error_code(std::errc::operation_canceled));
+        }
+    }
+
     motion::VariantCacheStatus MediaLibrary::VariantStatus(motion::MediaMetadata const& media) const
     {
         std::scoped_lock lock(mutex_);
@@ -1577,6 +1875,95 @@ namespace motion::app
             return motion::inspect_variant_cache(directory);
         }
         catch (...) { return {}; }
+    }
+
+    OptimizationStorageSummary MediaLibrary::InspectOptimizationStorage()
+    {
+        OptimizationStorageSummary result;
+        for (auto const& item : QueryMedia()) {
+            auto status = VariantStatus(item.media);
+            result.bytes += status.bytes;
+            result.files += status.files;
+            result.queuedTasks += status.queued ? 1u : 0u;
+            if (status.files) {
+                ++result.mediaWithCopies;
+                if (SourceAvailable(item.media)) {
+                    result.reclaimableBytes += status.bytes;
+                }
+            }
+        }
+        return result;
+    }
+
+    OptimizationCleanupResult MediaLibrary::TrimOptimizationStorage(
+        uint64_t quotaBytes, std::vector<std::string> const& protectedMediaIds)
+    {
+        OptimizationCleanupResult result;
+        result.before = InspectOptimizationStorage();
+        if (result.before.bytes <= quotaBytes) {
+            result.after = result.before;
+            return result;
+        }
+
+        std::set<std::string> protectedIds;
+        for (auto const& id : protectedMediaIds) {
+            if (!motion::valid_id(id)) throw std::invalid_argument("invalid protected media id");
+            protectedIds.insert(id);
+        }
+        struct Candidate
+        {
+            motion::MediaMetadata media;
+            uint64_t bytes{};
+            fs::file_time_type lastUsed{ fs::file_time_type::min() };
+        };
+        std::vector<Candidate> candidates;
+        for (auto const& item : QueryMedia()) {
+            auto status = VariantStatus(item.media);
+            if (!status.files) continue;
+            if (protectedIds.contains(item.media.id)) {
+                ++result.skippedProtected;
+                continue;
+            }
+            if (!SourceAvailable(item.media)) {
+                ++result.skippedSourceLess;
+                continue;
+            }
+            Candidate candidate{ item.media, status.bytes };
+            std::error_code error;
+            auto variants = MediaDirectory(item.media) / L"Variants";
+            for (fs::directory_iterator entries(variants, error), end;
+                !error && entries != end; entries.increment(error)) {
+                std::error_code itemError;
+                auto modified = entries->last_write_time(itemError);
+                if (!itemError && modified > candidate.lastUsed) {
+                    candidate.lastUsed = modified;
+                }
+            }
+            candidates.push_back(std::move(candidate));
+        }
+        std::stable_sort(candidates.begin(), candidates.end(),
+            [](auto const& left, auto const& right) {
+                if (left.lastUsed != right.lastUsed) return left.lastUsed < right.lastUsed;
+                return left.media.id < right.media.id;
+            });
+
+        uint64_t remaining = result.before.bytes;
+        for (auto const& candidate : candidates) {
+            if (remaining <= quotaBytes) break;
+            ReclaimVariantsForStorageQuota(candidate.media);
+            remaining = remaining >= candidate.bytes ? remaining - candidate.bytes : 0;
+            ++result.cleanedMedia;
+        }
+        result.after = InspectOptimizationStorage();
+        result.freedBytes = result.before.bytes >= result.after.bytes
+            ? result.before.bytes - result.after.bytes : 0;
+        return result;
+    }
+
+    OptimizationCleanupResult MediaLibrary::ReleaseOptimizationStorage(
+        std::vector<std::string> const& protectedMediaIds)
+    {
+        return TrimOptimizationStorage(0, protectedMediaIds);
     }
 
     bool MediaLibrary::SourceAvailable(motion::MediaMetadata const& media) const

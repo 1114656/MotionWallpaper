@@ -12,8 +12,8 @@ namespace motion::app
               agentPath_(std::move(applicationRoot) / L"motionwallpaper-agent.exe") {}
         motion::Settings Load(bool* mediaLibraryAvailable = nullptr) const;
         bool Save(motion::Settings const& settings) const;
+        bool ApplyStartupPreference(bool enabled) const noexcept;
     private:
-        bool ApplyStartup(bool enabled) const noexcept;
         std::filesystem::path path_;
         std::filesystem::path agentPath_;
     };

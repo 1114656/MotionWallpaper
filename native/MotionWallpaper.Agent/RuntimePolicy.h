@@ -9,6 +9,7 @@ namespace motion::agent
     inline constexpr uint32_t responsive_wait_ms = 50;
     inline constexpr uint32_t background_work_wait_ms = 500;
     inline constexpr uint32_t stable_wait_ms = 1000;
+    inline constexpr uint32_t optimizer_quiesce_timeout_ms = 2000;
 
     enum class RuntimeAction
     {
@@ -77,17 +78,47 @@ namespace motion::agent
         return !onBattery && (priorityRequest || playbackIdle);
     }
 
-    // Active desktop playback must reflect the selected performance tier. A
-    // source-file fallback is still safe for screensaver playback, but it must
-    // not make an in-progress balanced/power-saver task appear to be ready.
+    // Active desktop playback must reflect the selected performance tier or
+    // cpu-smooth compatibility path. A source-file fallback is still safe for
+    // screensaver playback, but it must not appear ready while that copy is
+    // unavailable.
     [[nodiscard]] inline bool active_playback_waits_for_performance_copy(
-        std::string const& performanceMode,
-        bool performanceCopyPending,
+        bool performanceCopyRequired,
         bool videoSourceFallback) noexcept
     {
-        return videoSourceFallback &&
-            (performanceMode == "balanced" || performanceMode == "power-saver") &&
-            performanceCopyPending;
+        return videoSourceFallback && performanceCopyRequired;
+    }
+
+    // A mixed-display pool chooses its target per route. Only an output whose
+    // selected performance tier is unavailable freezes; unrelated displays
+    // continue playing normally.
+    [[nodiscard]] constexpr bool performance_copy_preview_required(
+        RuntimeAction action, bool performanceCopyRequired) noexcept
+    {
+        return action == RuntimeAction::DesktopPlay && performanceCopyRequired;
+    }
+
+    // A transcode may run only after every old source route is known to be
+    // stationary or gone. Desktop playback needs its explicit poster/first-
+    // frame barrier; freeze/pause need their target ACK; stopped playback must
+    // have no active route at all. Retiring routes are checked in every case.
+    [[nodiscard]] constexpr bool optimization_renderer_is_static(
+        RuntimeAction action, bool waitingForPerformanceCopy,
+        bool previewBarrierReady, bool targetReady, bool hasActiveRoute,
+        bool retiringRoutesStopped, bool holdExistingRenderer = false) noexcept
+    {
+        if (holdExistingRenderer || !retiringRoutesStopped) return false;
+        if (waitingForPerformanceCopy) return previewBarrierReady;
+        if (action == RuntimeAction::DesktopFrozen ||
+            action == RuntimeAction::DesktopPaused) return targetReady;
+        if (action == RuntimeAction::Stopped) return !hasActiveRoute;
+        return false;
+    }
+
+    [[nodiscard]] constexpr bool source_presentation_may_apply(
+        bool sourceTransitionNeedsIdle, bool optimizerIdle) noexcept
+    {
+        return !sourceTransitionNeedsIdle || optimizerIdle;
     }
 
     // A frozen previous route can acknowledge its freeze target while a new

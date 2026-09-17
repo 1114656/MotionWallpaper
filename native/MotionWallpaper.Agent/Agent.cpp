@@ -2,6 +2,7 @@
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <dxgi1_6.h>
+#include <hidusage.h>
 #include <powrprof.h>
 #include <shellapi.h>
 #include <wtsapi32.h>
@@ -10,6 +11,7 @@
 #include "../MotionWallpaper.Common/Common.h"
 #include "../MotionWallpaper.Common/DisplayAwareness.h"
 #include "../MotionWallpaper.Common/DisplayTopology.h"
+#include "../MotionWallpaper.Common/SceneProfiles.h"
 #include "../MotionWallpaper.Common/VariantCache.h"
 #include "CoveragePolicy.h"
 #include "IdlePolicy.h"
@@ -18,7 +20,10 @@
 #include "RandomSelectionPolicy.h"
 #include "resource.h"
 #include "RuntimePolicy.h"
+#include "RuntimeEventPolicy.h"
+#include "RuntimeStatusPolicy.h"
 #include "SharedRendererPolicy.h"
+#include "TrayControlPolicy.h"
 #include "VideoOptimizer.h"
 #include "../MotionWallpaper.Protocol/RendererProtocol.h"
 
@@ -46,6 +51,13 @@ using namespace std::chrono_literals;
 
 namespace
 {
+    struct IterationSettingsRestore
+    {
+        motion::Settings& target;
+        motion::Settings configured;
+        ~IterationSettingsRestore() noexcept { target = std::move(configured); }
+    };
+
     std::wstring display_adapter_key(std::wstring const& displayDevice)
     {
         if (displayDevice.empty()) return {};
@@ -97,6 +109,38 @@ namespace
         return false;
     }
 
+    bool cloned_or_projected_display_active() noexcept
+    {
+        UINT32 pathCount{};
+        UINT32 modeCount{};
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,
+                &pathCount, &modeCount) != ERROR_SUCCESS || pathCount < 2) {
+            return false;
+        }
+        try {
+            std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+            std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+            if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount,
+                    paths.data(), &modeCount, modes.data(), nullptr) !=
+                ERROR_SUCCESS) return false;
+            paths.resize(pathCount);
+            for (size_t first = 0; first < paths.size(); ++first) {
+                if ((paths[first].flags & DISPLAYCONFIG_PATH_ACTIVE) == 0) continue;
+                for (size_t second = first + 1; second < paths.size(); ++second) {
+                    if ((paths[second].flags & DISPLAYCONFIG_PATH_ACTIVE) == 0) continue;
+                    auto const& left = paths[first].sourceInfo;
+                    auto const& right = paths[second].sourceInfo;
+                    if (left.id == right.id &&
+                        left.adapterId.HighPart == right.adapterId.HighPart &&
+                        left.adapterId.LowPart == right.adapterId.LowPart) {
+                        return true;
+                    }
+                }
+            }
+        } catch (...) {}
+        return false;
+    }
+
     struct MediaSelection
     {
         fs::path path;
@@ -131,6 +175,23 @@ namespace
         return fs::is_regular_file(retainedPath, error) && !error
             ? MediaSelection{ std::move(retainedPath), "video", mediaId, false }
             : MediaSelection{};
+    }
+
+    MediaSelection media_poster_by_id(fs::path const& wallpapers,
+        std::string const& groupId, std::string const& mediaId)
+    {
+        if (!motion::valid_id(groupId) || !motion::valid_id(mediaId)) return {};
+        auto directory = wallpapers / L"Groups" / motion::utf8_to_wide(groupId) /
+            L"Videos" / motion::utf8_to_wide(mediaId);
+        motion::MediaMetadata metadata;
+        if (!motion::try_load_media(directory / L"metadata.json", metadata) ||
+            metadata.id != mediaId || metadata.groupId != groupId ||
+            metadata.coverFileName.empty() ||
+            !motion::safe_file_name(metadata.coverFileName)) return {};
+        auto poster = directory / metadata.coverFileName;
+        std::error_code error;
+        if (!fs::is_regular_file(poster, error) || error) return {};
+        return { std::move(poster), "image", mediaId, false };
     }
 
     struct ImportedOptimizationRequest
@@ -171,6 +232,14 @@ namespace
         uint32_t width{};
         uint32_t height{};
         uint32_t refreshRateHz{};
+    };
+
+    enum class PerformancePreviewStage
+    {
+        Inactive,
+        FreezePrevious,
+        PresentPreview,
+        Ready
     };
 
     OptimizationTarget optimization_target_size(motion::Settings const& settings)
@@ -221,6 +290,28 @@ namespace
         return ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(generator)];
     }
 
+    std::string next_media_id(fs::path const& wallpapers, std::string const& groupId,
+        std::string const& current, std::string const& performanceMode)
+    {
+        return motion::agent::next_media_id(
+            group_media_ids(wallpapers, groupId, performanceMode), current);
+    }
+
+    std::string display_assignments_key(
+        std::vector<motion::DisplayAssignment> const& assignments)
+    {
+        std::string result;
+        for (auto const& assignment : assignments) {
+            for (auto const* value : { &assignment.displayId, &assignment.groupId,
+                    &assignment.mediaId }) {
+                result += std::to_string(value->size());
+                result.push_back(':');
+                result += *value;
+            }
+        }
+        return result;
+    }
+
     bool request_display_off() noexcept
     {
         DWORD_PTR result{};
@@ -239,6 +330,16 @@ namespace
     {
     public:
         enum class Target { Unknown, DesktopPlay, DesktopFreeze, ScreensaverPlay, Paused };
+
+        struct Snapshot
+        {
+            bool running{};
+            bool targetReady{};
+            bool transitionPending{};
+            bool failed{};
+            uint32_t processId{};
+            motion::protocol::DecodeStatus decode;
+        };
 
         explicit Renderer(fs::path executable) : executable_(std::move(executable)) {}
         ~Renderer()
@@ -326,6 +427,32 @@ namespace
         {
             std::scoped_lock lock(decodeStatusMutex_);
             return decodeStatus_;
+        }
+
+        [[nodiscard]] Snapshot RuntimeSnapshot() const
+        {
+            Snapshot result;
+            result.running = static_cast<bool>(process_);
+            result.targetReady = TargetReady();
+            result.transitionPending = TransitionPending();
+            result.failed = permanentlyUnavailable_.load(std::memory_order_acquire) ||
+                (!process_ && failureCount_ != 0);
+            result.processId = process_ ? GetProcessId(process_.get()) : 0;
+            std::scoped_lock lock(decodeStatusMutex_);
+            result.decode = decodeStatus_;
+            return result;
+        }
+
+        bool RetryFailed()
+        {
+            if (!permanentlyUnavailable_.load(std::memory_order_acquire) &&
+                (process_ || failureCount_ == 0)) return false;
+            return Shutdown(true);
+        }
+
+        bool Restart()
+        {
+            return Shutdown(true);
         }
 
         bool Stop()
@@ -639,6 +766,7 @@ namespace
 
     struct DisplayMediaTarget
     {
+        std::string displayId;
         std::wstring deviceName;
         std::string groupId;
         std::string mediaId;
@@ -649,21 +777,24 @@ namespace
         std::wstring decodeAdapter;
         bool softwarePlaybackTarget{};
         uint32_t playbackFrameRateCap{};
+        bool performanceCopyRequired{};
+        bool performanceCopyPending{};
     };
 
     std::vector<DisplayMediaTarget> display_media_targets(fs::path const& wallpapers, motion::Settings const& settings,
         std::string const& defaultGroupId, std::string const& defaultMediaId,
-        std::string const& performanceMode)
+        std::string const& performanceMode,
+        std::vector<motion::DisplayTarget> const& displays)
     {
         auto defaultMedia = media_by_id(wallpapers, defaultGroupId, defaultMediaId, performanceMode);
-        auto displays = motion::enumerate_displays();
         if (settings.displayMode == "primary") {
             if (defaultMedia.path.empty()) return {};
             auto primary = std::find_if(displays.begin(), displays.end(), [](auto const& display) { return display.primary; });
             uint32_t width = primary == displays.end() ? 0u : static_cast<uint32_t>(primary->bounds.right - primary->bounds.left);
             uint32_t height = primary == displays.end() ? 0u : static_cast<uint32_t>(primary->bounds.bottom - primary->bounds.top);
             uint32_t refreshRate = primary == displays.end() ? 60u : primary->refreshRateHz;
-            return { { primary == displays.end() ? std::wstring{} : primary->deviceName,
+            return { { primary == displays.end() ? std::string{} : primary->id,
+                primary == displays.end() ? std::wstring{} : primary->deviceName,
                 defaultGroupId, defaultMediaId, std::move(defaultMedia), width, height, refreshRate } };
         }
 
@@ -681,13 +812,13 @@ namespace
                 if (!assigned.path.empty()) {
                     groupId = assignment->groupId;
                     mediaId = assignment->mediaId;
-                    targets.push_back({ display.deviceName,
+                    targets.push_back({ display.id, display.deviceName,
                         std::move(groupId), std::move(mediaId), std::move(assigned), width, height, display.refreshRateHz });
                     continue;
                 }
             }
             if (!defaultMedia.path.empty()) {
-                targets.push_back({ display.deviceName,
+                targets.push_back({ display.id, display.deviceName,
                     std::move(groupId), std::move(mediaId), defaultMedia, width, height, display.refreshRateHz });
             }
         }
@@ -699,20 +830,49 @@ namespace
     public:
         explicit RendererPool(fs::path executable) : executable_(std::move(executable)) {}
 
-        void Apply(Renderer::Target target, std::vector<DisplayMediaTarget> const& outputs,
-            std::string const& decodeMode, bool primaryOnly)
+        [[nodiscard]] bool SourcePresentationNeedsOptimizerIdle(
+            Renderer::Target target,
+            std::vector<DisplayMediaTarget> const& outputs,
+            std::string const& decodeMode, bool primaryOnly,
+            bool freezePerformanceCopies = false) const
         {
+            bool hasSourceVideo = std::any_of(outputs.begin(), outputs.end(),
+                [](auto const& output) {
+                    return output.media.kind == "video" &&
+                        output.media.sourceBacked;
+                });
+            if (!hasSourceVideo) return false;
+            return PresentationKey(target, outputs, decodeMode, primaryOnly,
+                       freezePerformanceCopies) != acknowledgedPresentationKey_ ||
+                !TargetReady();
+        }
+
+        void Apply(Renderer::Target target, std::vector<DisplayMediaTarget> const& outputs,
+            std::string const& decodeMode, bool primaryOnly,
+            bool freezePerformanceCopies = false)
+        {
+            auto presentationKey = PresentationKey(target, outputs, decodeMode,
+                primaryOnly, freezePerformanceCopies);
             std::vector<motion::agent::RendererRoute> routes;
             routes.reserve(outputs.size());
             for (auto const& output : outputs) {
-                auto adapterKey = primaryOnly ? std::wstring{} : display_adapter_key(output.deviceName);
+                auto adapterKey = primaryOnly ? std::wstring{} :
+                    motion::agent::renderer_adapter_key(
+                        display_adapter_key(output.deviceName), output.deviceName);
+                if (!primaryOnly) {
+                    adapterKey = motion::agent::renderer_preview_adapter_key(
+                        std::move(adapterKey), freezePerformanceCopies &&
+                            motion::agent::performance_copy_preview_required(
+                                motion::agent::RuntimeAction::DesktopPlay,
+                                output.performanceCopyRequired));
+                }
                 routes.push_back({ motion::agent::renderer_media_key(output.media.path, output.media.kind),
-                    output.deviceName, primaryOnly ? std::wstring{} :
-                    motion::agent::renderer_adapter_key(std::move(adapterKey), output.deviceName),
+                    output.deviceName, std::move(adapterKey),
                     static_cast<uint64_t>(output.targetWidth) * output.targetHeight });
             }
             auto grouped = motion::agent::group_renderer_routes(routes, !primaryOnly);
             std::vector<std::wstring> desiredKeys;
+            std::map<std::string, std::wstring> desiredDisplayKeys;
             desiredKeys.reserve(grouped.size());
             bool allReady = !grouped.empty();
             for (auto const& route : grouped) {
@@ -742,9 +902,32 @@ namespace
                 }
                 auto routeKey = RouteKey(route, decodeMode, primaryOnly, routeFrameRateCap);
                 desiredKeys.push_back(routeKey);
+                bool freezeRoute = freezePerformanceCopies &&
+                    std::any_of(outputs.begin(), outputs.end(), [&](auto const& candidate) {
+                        if (!motion::agent::performance_copy_preview_required(
+                                motion::agent::RuntimeAction::DesktopPlay,
+                                candidate.performanceCopyRequired) ||
+                            motion::agent::renderer_media_key(candidate.media.path,
+                                candidate.media.kind) != route.mediaKey) return false;
+                        return primaryOnly || route.monitorDevices.empty() ||
+                            std::find(route.monitorDevices.begin(), route.monitorDevices.end(),
+                                candidate.deviceName) != route.monitorDevices.end();
+                    });
+                for (auto const& candidate : outputs) {
+                    if (motion::agent::renderer_media_key(candidate.media.path,
+                            candidate.media.kind) != route.mediaKey) continue;
+                    if (!primaryOnly && !route.monitorDevices.empty() &&
+                        std::find(route.monitorDevices.begin(), route.monitorDevices.end(),
+                            candidate.deviceName) == route.monitorDevices.end()) continue;
+                    if (!candidate.displayId.empty()) {
+                        desiredDisplayKeys[candidate.displayId] = routeKey;
+                    }
+                }
                 auto& renderer = renderers_[routeKey];
                 if (!renderer) renderer = std::make_unique<Renderer>(executable_);
-                bool applied = renderer->Apply(target, output->media, decodeMode,
+                auto routeTarget = freezeRoute
+                    ? Renderer::Target::DesktopFreeze : target;
+                bool applied = renderer->Apply(routeTarget, output->media, decodeMode,
                     primaryOnly ? "primary" : "monitor", routeFrameRateCap,
                     route.monitorDevices, output->decodeAdapter);
                 auto decode = renderer->DecodeState();
@@ -756,6 +939,7 @@ namespace
                 allReady = applied && renderer->TargetReady() && allReady;
             }
             desiredKeys_ = desiredKeys;
+            desiredDisplayKeys_ = std::move(desiredDisplayKeys);
             if (allReady) {
                 for (auto iterator = renderers_.begin(); iterator != renderers_.end();) {
                     if (std::find(desiredKeys.begin(), desiredKeys.end(), iterator->first) == desiredKeys.end()) {
@@ -776,16 +960,55 @@ namespace
                     }
                 }
             }
+            if (allReady && RetiringRoutesStopped()) {
+                acknowledgedPresentationKey_ = std::move(presentationKey);
+            }
         }
 
         void Pause()
         {
+            acknowledgedPresentationKey_.clear();
             for (auto& [_, renderer] : renderers_) renderer->Pause();
         }
 
         void Freeze()
         {
+            acknowledgedPresentationKey_.clear();
             for (auto& [_, renderer] : renderers_) renderer->Freeze();
+        }
+
+        // Freeze only old routes used exclusively by displays that are about
+        // to wait for a performance preview. A shared route that also owns a
+        // non-pending sibling must remain playing until the replacement routes
+        // are ready; the generation barrier prevents overlap in the meantime.
+        [[nodiscard]] bool FreezeDisplays(
+            std::vector<std::string> const& displayIds)
+        {
+            acknowledgedPresentationKey_.clear();
+            std::vector<std::wstring> keys;
+            for (auto const& displayId : displayIds) {
+                auto route = desiredDisplayKeys_.find(displayId);
+                if (route == desiredDisplayKeys_.end() ||
+                    std::find(keys.begin(), keys.end(), route->second) != keys.end()) {
+                    continue;
+                }
+                bool sharedWithPlayingSibling = std::any_of(
+                    desiredDisplayKeys_.begin(), desiredDisplayKeys_.end(),
+                    [&](auto const& candidate) {
+                        return candidate.second == route->second &&
+                            std::find(displayIds.begin(), displayIds.end(),
+                                candidate.first) == displayIds.end();
+                    });
+                if (!sharedWithPlayingSibling) keys.push_back(route->second);
+            }
+            bool ready = true;
+            for (auto const& key : keys) {
+                auto renderer = renderers_.find(key);
+                if (renderer == renderers_.end()) continue;
+                renderer->second->Freeze();
+                ready = renderer->second->TargetReady() && ready;
+            }
+            return ready;
         }
 
         [[nodiscard]] bool TargetReady() const
@@ -805,6 +1028,16 @@ namespace
         }
 
         [[nodiscard]] bool HasActiveRoute() const noexcept { return !desiredKeys_.empty(); }
+
+        [[nodiscard]] bool RetiringRoutesStopped() const
+        {
+            return std::none_of(renderers_.begin(), renderers_.end(),
+                [&](auto const& entry) {
+                    return std::find(desiredKeys_.begin(), desiredKeys_.end(),
+                        entry.first) == desiredKeys_.end() &&
+                        entry.second->RuntimeSnapshot().running;
+                });
+        }
 
         [[nodiscard]] bool AutoDecodeRouteRejected(
             fs::path const& media, std::wstring const& adapter) const
@@ -847,14 +1080,138 @@ namespace
             return aggregate;
         }
 
+        [[nodiscard]] std::vector<motion::DisplayRuntimeState> RuntimeStates(
+            std::vector<motion::DisplayTarget> const& displays,
+            std::vector<DisplayMediaTarget> const& outputs,
+            motion::agent::RuntimeAction action, bool primaryOnly,
+            bool manuallyPaused = false) const
+        {
+            std::vector<motion::DisplayRuntimeState> result;
+            result.reserve(displays.size());
+            bool paused = action == motion::agent::RuntimeAction::DisplayOff ||
+                action == motion::agent::RuntimeAction::Locked ||
+                action == motion::agent::RuntimeAction::Stopped ||
+                action == motion::agent::RuntimeAction::DesktopPaused ||
+                action == motion::agent::RuntimeAction::DesktopFrozen;
+            auto pausedReason = [&]() -> std::string {
+                switch (action) {
+                case motion::agent::RuntimeAction::DisplayOff: return "display-off";
+                case motion::agent::RuntimeAction::Locked: return "session-locked";
+                case motion::agent::RuntimeAction::Stopped: return "playback-stopped";
+                case motion::agent::RuntimeAction::DesktopPaused:
+                    return std::string(motion::agent::desktop_pause_reason(manuallyPaused));
+                case motion::agent::RuntimeAction::DesktopFrozen:
+                    return "active-playback-disabled";
+                default: return {};
+                }
+            };
+            for (auto const& display : displays) {
+                motion::DisplayRuntimeState state;
+                state.displayId = display.id;
+                state.deviceName = display.deviceName;
+                state.displayName = display.friendlyName;
+                auto output = std::find_if(outputs.begin(), outputs.end(), [&](auto const& value) {
+                    return value.displayId == display.id;
+                });
+                if (output == outputs.end()) {
+                    state.state = "paused";
+                    state.reason = paused ? pausedReason() :
+                        (primaryOnly ? "not-targeted" : "no-wallpaper");
+                    result.push_back(std::move(state));
+                    continue;
+                }
+                state.groupId = output->groupId;
+                state.mediaId = output->mediaId;
+                Renderer::Snapshot snapshot;
+                bool hasRenderer{};
+                auto route = desiredDisplayKeys_.find(display.id);
+                if (route != desiredDisplayKeys_.end()) {
+                    auto renderer = renderers_.find(route->second);
+                    if (renderer != renderers_.end()) {
+                        snapshot = renderer->second->RuntimeSnapshot();
+                        hasRenderer = true;
+                    }
+                }
+                bool performanceCopyUnavailable = output->performanceCopyRequired &&
+                    !output->performanceCopyPending;
+                bool degraded = output->softwarePlaybackTarget ||
+                    snapshot.decode.path == "software-fallback" ||
+                    performanceCopyUnavailable;
+                motion::agent::DisplayRuntimeSignals signals{
+                    snapshot.failed,
+                    output->performanceCopyPending,
+                    paused,
+                    snapshot.targetReady,
+                    degraded
+                };
+                state.state = motion::agent::display_runtime_state(signals);
+                state.decodePath = snapshot.decode.path;
+                state.decodeReason = snapshot.decode.reason;
+                state.rendererProcessId = snapshot.processId;
+                state.canRetry = snapshot.failed;
+                state.canRestartRenderer = hasRenderer;
+                if (snapshot.failed) {
+                    state.reason = snapshot.decode.reason.empty()
+                        ? "renderer-process-failed" : snapshot.decode.reason;
+                } else if (!snapshot.targetReady) {
+                    state.reason = paused ? "pause-pending" :
+                        snapshot.transitionPending
+                            ? "waiting-for-first-frame" : "renderer-starting";
+                } else if (paused) {
+                    state.reason = pausedReason();
+                } else if (output->performanceCopyPending) {
+                    state.reason = "performance-copy-pending";
+                } else if (performanceCopyUnavailable) {
+                    state.reason = "performance-copy-unavailable";
+                } else if (degraded) {
+                    state.reason = snapshot.decode.reason.empty()
+                        ? "compatibility-fallback" : snapshot.decode.reason;
+                }
+                result.push_back(std::move(state));
+            }
+            return result;
+        }
+
+        bool Retry(std::string const& displayId)
+        {
+            auto keys = ControlKeys(displayId);
+            bool retried{};
+            for (auto const& key : keys) {
+                auto renderer = renderers_.find(key);
+                if (renderer != renderers_.end()) {
+                    retried = renderer->second->RetryFailed() || retried;
+                }
+            }
+            if (retried) ResetAutoDecodeFailures();
+            return retried;
+        }
+
+        bool Restart(std::string const& displayId)
+        {
+            auto keys = ControlKeys(displayId);
+            bool found{};
+            bool stopped = true;
+            for (auto const& key : keys) {
+                auto renderer = renderers_.find(key);
+                if (renderer == renderers_.end()) continue;
+                found = true;
+                stopped = renderer->second->Restart() && stopped;
+            }
+            if (found && stopped) ResetAutoDecodeFailures();
+            return found && stopped;
+        }
+
         void TopologyChanged() noexcept
         {
             ++topologyGeneration_;
+            acknowledgedPresentationKey_.clear();
             ResetAutoDecodeFailures();
         }
         bool Stop()
         {
+            acknowledgedPresentationKey_.clear();
             desiredKeys_.clear();
+            desiredDisplayKeys_.clear();
             bool stopped = true;
             for (auto& [_, renderer] : renderers_) {
                 stopped = renderer->Stop() && stopped;
@@ -864,6 +1221,38 @@ namespace
         }
 
     private:
+        [[nodiscard]] std::wstring PresentationKey(
+            Renderer::Target target,
+            std::vector<DisplayMediaTarget> const& outputs,
+            std::string const& decodeMode, bool primaryOnly,
+            bool freezePerformanceCopies) const
+        {
+            std::wstring key = std::to_wstring(static_cast<unsigned>(target)) +
+                L"\n" + motion::utf8_to_wide(decodeMode) + L"\n" +
+                (primaryOnly ? L"primary" : L"monitor") + L"\n" +
+                (freezePerformanceCopies ? L"performance-preview" : L"normal") +
+                L"\n" + std::to_wstring(topologyGeneration_);
+            for (auto const& output : outputs) {
+                key += L"\n" + motion::utf8_to_wide(output.displayId) + L"\n" +
+                    output.deviceName + L"\n" + output.media.path.wstring() + L"\n" +
+                    motion::utf8_to_wide(output.media.kind) + L"\n" +
+                    output.decodeAdapter + L"\n" +
+                    std::to_wstring(output.playbackFrameRateCap) + L"\n" +
+                    (output.media.sourceBacked ? L"source" : L"derived") + L"\n" +
+                    (output.performanceCopyRequired ? L"copy-required" : L"copy-ready");
+            }
+            return key;
+        }
+
+        [[nodiscard]] std::vector<std::wstring> ControlKeys(
+            std::string const& displayId) const
+        {
+            if (displayId.empty()) return desiredKeys_;
+            auto route = desiredDisplayKeys_.find(displayId);
+            if (route == desiredDisplayKeys_.end()) return {};
+            return { route->second };
+        }
+
         std::wstring RouteKey(motion::agent::SharedRendererRoute const& route,
             std::string const& decodeMode, bool primaryOnly,
             uint32_t frameRateCap) const
@@ -885,7 +1274,9 @@ namespace
         fs::path executable_;
         std::map<std::wstring, std::unique_ptr<Renderer>> renderers_;
         std::vector<std::wstring> desiredKeys_;
+        std::map<std::string, std::wstring> desiredDisplayKeys_;
         std::vector<std::pair<std::wstring, std::wstring>> autoDecodeFailures_;
+        std::wstring acknowledgedPresentationKey_;
         uint64_t topologyGeneration_{};
     };
 
@@ -949,6 +1340,9 @@ namespace
         explicit RuntimeEvents(fs::path settingsExecutable) : settingsExecutable_(std::move(settingsExecutable))
         {
             appExitEvent_.reset(CreateEventW(nullptr, TRUE, FALSE, motion::app_exit_event_name));
+            togglePlaybackEvent_.reset(CreateEventW(nullptr, FALSE, FALSE, motion::toggle_playback_event_name));
+            nextWallpaperEvent_.reset(CreateEventW(nullptr, FALSE, FALSE, motion::next_wallpaper_event_name));
+            screensaverPreviewEvent_.reset(CreateEventW(nullptr, FALSE, FALSE, motion::screensaver_preview_event_name));
             if (auto locked = query_session_locked()) locked_ = *locked;
             SYSTEM_POWER_STATUS power{};
             if (GetSystemPowerStatus(&power) && power.ACLineStatus != 255) {
@@ -979,6 +1373,7 @@ namespace
 
         ~RuntimeEvents()
         {
+            SetScreensaverInputWakeEnabled(false);
             if (foregroundHook_) UnhookWinEvent(foregroundHook_);
             if (minimizeHook_) UnhookWinEvent(minimizeHook_);
             if (locationHook_) UnhookWinEvent(locationHook_);
@@ -996,12 +1391,64 @@ namespace
             }
         }
 
-        explicit operator bool() const { return window_ != nullptr && static_cast<bool>(appExitEvent_); }
+        explicit operator bool() const
+        {
+            return window_ != nullptr && appExitEvent_ && togglePlaybackEvent_ &&
+                nextWallpaperEvent_ && screensaverPreviewEvent_;
+        }
         bool Locked() const { return locked_; }
         bool DisplayOn() const { return displayOn_; }
         bool OnBattery() const { return onBattery_; }
         uint64_t TopologyRevision() const { return topologyRevision_; }
+        uint64_t InputRevision() const { return inputRevision_; }
         bool ExitRequested() const { return exitRequested_; }
+
+        bool TakeTogglePlaybackRequested() noexcept
+        {
+            return std::exchange(togglePlaybackRequested_, false);
+        }
+
+        bool TakeNextWallpaperRequested() noexcept
+        {
+            return std::exchange(nextWallpaperRequested_, false);
+        }
+
+        bool TakeScreensaverPreviewRequested() noexcept
+        {
+            return std::exchange(screensaverPreviewRequested_, false);
+        }
+
+        void SetTrayStatus(motion::agent::TrayStatus status, bool manuallyPaused)
+        {
+            bool changed = status_ != status || manuallyPaused_ != manuallyPaused;
+            status_ = status;
+            manuallyPaused_ = manuallyPaused;
+            if (!changed || !window_) return;
+            NOTIFYICONDATAW icon{ sizeof(icon) };
+            icon.hWnd = window_;
+            icon.uID = trayIconId;
+            icon.uFlags = NIF_TIP;
+            auto tip = std::wstring(L"MotionWallpaper · ") +
+                motion::agent::tray_status_text(status_);
+            wcscpy_s(icon.szTip, tip.c_str());
+            Shell_NotifyIconW(NIM_MODIFY, &icon);
+        }
+
+        bool SetScreensaverInputWakeEnabled(bool enabled) noexcept
+        {
+            if (!window_ || enabled == rawInputWakeEnabled_) return enabled == rawInputWakeEnabled_;
+            RAWINPUTDEVICE devices[]{
+                { HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_MOUSE,
+                    static_cast<DWORD>(enabled ? RIDEV_INPUTSINK : RIDEV_REMOVE),
+                    enabled ? window_ : nullptr },
+                { HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_KEYBOARD,
+                    static_cast<DWORD>(enabled ? RIDEV_INPUTSINK : RIDEV_REMOVE),
+                    enabled ? window_ : nullptr }
+            };
+            if (!RegisterRawInputDevices(devices, ARRAYSIZE(devices), sizeof(RAWINPUTDEVICE))) return false;
+            rawInputWakeEnabled_ = enabled;
+            return true;
+        }
 
         void PollSessionState(std::chrono::steady_clock::time_point now)
         {
@@ -1012,11 +1459,24 @@ namespace
 
         bool Wait(HANDLE settingsEvent, DWORD milliseconds)
         {
-            HANDLE handles[]{ settingsEvent, appExitEvent_.get() };
+            HANDLE handles[]{ settingsEvent, appExitEvent_.get(), togglePlaybackEvent_.get(),
+                nextWallpaperEvent_.get(), screensaverPreviewEvent_.get() };
             DWORD result = MsgWaitForMultipleObjects(ARRAYSIZE(handles), handles, FALSE, milliseconds, QS_ALLINPUT);
             if (result == WAIT_OBJECT_0) return true;
             if (result == WAIT_OBJECT_0 + 1) {
                 exitRequested_ = true;
+                return false;
+            }
+            if (result == WAIT_OBJECT_0 + 2) {
+                togglePlaybackRequested_ = true;
+                return false;
+            }
+            if (result == WAIT_OBJECT_0 + 3) {
+                nextWallpaperRequested_ = true;
+                return false;
+            }
+            if (result == WAIT_OBJECT_0 + 4) {
+                screensaverPreviewRequested_ = true;
                 return false;
             }
             if (result == WAIT_OBJECT_0 + ARRAYSIZE(handles)) {
@@ -1033,6 +1493,11 @@ namespace
         static constexpr UINT wmTrayIcon = WM_APP + 100;
         static constexpr UINT wmForegroundChanged = WM_APP + 101;
         static constexpr UINT trayIconId = 1;
+        static constexpr UINT commandOpen = 1;
+        static constexpr UINT commandExit = 2;
+        static constexpr UINT commandTogglePlayback = 3;
+        static constexpr UINT commandNextWallpaper = 4;
+        static constexpr UINT commandPreviewScreensaver = 5;
         static inline std::atomic<HWND> eventWindow_{};
         static inline std::atomic_bool foregroundWakePending_{};
 
@@ -1058,7 +1523,9 @@ namespace
                 GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_MOTIONWALLPAPER), IMAGE_ICON,
                 GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
             if (!icon.hIcon) icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-            wcscpy_s(icon.szTip, L"MotionWallpaper");
+            auto tip = std::wstring(L"MotionWallpaper · ") +
+                motion::agent::tray_status_text(status_);
+            wcscpy_s(icon.szTip, tip.c_str());
             Shell_NotifyIconW(NIM_ADD, &icon);
             icon.uVersion = NOTIFYICON_VERSION_4;
             Shell_NotifyIconW(NIM_SETVERSION, &icon);
@@ -1077,15 +1544,30 @@ namespace
             GetCursorPos(&cursor);
             HMENU menu = CreatePopupMenu();
             if (!menu) return;
-            AppendMenuW(menu, MF_STRING, 1, L"打开 MotionWallpaper");
+            auto status = std::wstring(L"当前状态：") +
+                motion::agent::tray_status_text(status_);
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status.c_str());
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(menu, MF_STRING, 2, L"退出");
+            AppendMenuW(menu, MF_STRING, commandTogglePlayback,
+                manuallyPaused_ ? L"恢复壁纸" : L"暂停壁纸");
+            AppendMenuW(menu, MF_STRING | (manuallyPaused_ ? MF_GRAYED : 0),
+                commandNextWallpaper, L"下一张");
+            AppendMenuW(menu, MF_STRING, commandPreviewScreensaver, L"立即屏保");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, commandOpen, L"打开 MotionWallpaper");
+            AppendMenuW(menu, MF_STRING, commandExit, L"退出");
             SetForegroundWindow(window_);
             UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
                 cursor.x, cursor.y, 0, window_, nullptr);
             DestroyMenu(menu);
-            if (command == 1) OpenSettings();
-            else if (command == 2) {
+            if (command == commandOpen) OpenSettings();
+            else if (command == commandTogglePlayback && togglePlaybackEvent_) {
+                SetEvent(togglePlaybackEvent_.get());
+            } else if (command == commandNextWallpaper && nextWallpaperEvent_) {
+                SetEvent(nextWallpaperEvent_.get());
+            } else if (command == commandPreviewScreensaver && screensaverPreviewEvent_) {
+                SetEvent(screensaverPreviewEvent_.get());
+            } else if (command == commandExit) {
                 if (appExitEvent_) SetEvent(appExitEvent_.get());
                 exitRequested_ = true;
             }
@@ -1100,11 +1582,14 @@ namespace
                 SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
             }
             if (!self) return DefWindowProcW(window, message, wParam, lParam);
-            if (self->taskbarCreated_ && message == self->taskbarCreated_) {
-                ++self->topologyRevision_;
+            auto eventEffect = motion::agent::runtime_system_event_effect(
+                message, wParam, self->taskbarCreated_, self->rawInputWakeEnabled_);
+            motion::agent::apply_runtime_system_event_effect(eventEffect,
+                self->topologyRevision_, self->inputRevision_, self->displayOn_);
+            if (eventEffect.shellRestarted) {
                 self->AddTrayIcon();
-                return 0;
             }
+            if (eventEffect.handled) return message == WM_POWERBROADCAST ? TRUE : 0;
             if (message == wmTrayIcon) {
                 auto event = LOWORD(lParam);
                 if (event == WM_LBUTTONDBLCLK) self->OpenSettings();
@@ -1116,6 +1601,8 @@ namespace
                 return 0;
             }
             switch (message) {
+            case WM_INPUT:
+                return DefWindowProcW(window, message, wParam, lParam);
             case WM_WTSSESSION_CHANGE:
                 switch (wParam) {
                 case WTS_SESSION_LOCK:
@@ -1132,9 +1619,6 @@ namespace
                     self->locked_ = false;
                     break;
                 }
-                return 0;
-            case WM_DISPLAYCHANGE:
-                ++self->topologyRevision_;
                 return 0;
             case WM_POWERBROADCAST:
                 if (wParam == PBT_POWERSETTINGCHANGE) {
@@ -1161,12 +1645,22 @@ namespace
         UINT taskbarCreated_{};
         fs::path settingsExecutable_;
         motion::unique_handle appExitEvent_;
+        motion::unique_handle togglePlaybackEvent_;
+        motion::unique_handle nextWallpaperEvent_;
+        motion::unique_handle screensaverPreviewEvent_;
+        motion::agent::TrayStatus status_{ motion::agent::TrayStatus::Starting };
         bool locked_{};
         bool sessionNotificationRegistered_{};
         bool displayOn_{ true };
         bool onBattery_{};
         bool exitRequested_{};
+        bool togglePlaybackRequested_{};
+        bool nextWallpaperRequested_{};
+        bool screensaverPreviewRequested_{};
+        bool manuallyPaused_{};
+        bool rawInputWakeEnabled_{};
         uint64_t topologyRevision_{};
+        uint64_t inputRevision_{};
         std::chrono::steady_clock::time_point nextSessionPoll_{};
     };
 
@@ -1285,6 +1779,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
     try {
         fs::path configPath = root / L"Config" / L"settings.json";
         fs::path runtimePath = root / L"Config" / L"runtime.json";
+        fs::path runtimeControlPath = root / L"Config" / L"runtime-command.json";
         motion::Settings settings;
         auto initialSettingsStatus = legacyDataConflict
             ? motion::SettingsFileStatus::invalid
@@ -1316,12 +1811,19 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
         RuntimeEvents runtimeEvents(applicationRoot / L"MotionWallpaper.exe");
         if (!runtimeEvents) return 1;
         std::string previousRandomGroup, previousSelectedGroup, previousSelectedMedia, previousPerformanceMode, randomId;
+        std::string trayOverrideGroupId, trayOverrideMediaId;
+        std::string previousDisplayAssignmentsKey;
+        std::map<std::string, std::pair<std::string, std::string>> trayDisplayOverrides;
         int previousRandomInterval = -1;
         bool wasLocked = false, autoLockTriggered = false, displayOffAfterLockTriggered = false;
         bool reload = true, selectionInitialized = false;
+        PerformancePreviewStage performancePreviewStage{
+            PerformancePreviewStage::Inactive };
+        bool performanceCopyWasRequired{};
         motion::IdleTimer screensaverIdleTimer;
         motion::IdleTimer autoLockIdleTimer;
         bool screensaverWasActive{};
+        motion::agent::TrayControlState trayControls;
         IdleInhibitor idleInhibitor;
         auto nextFallbackReload = std::chrono::steady_clock::now();
         std::error_code configWriteTimeError;
@@ -1343,31 +1845,98 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
             static_cast<uint32_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
         bool physicalVideoDeviceAvailable = physical_video_device_available();
         std::string publishedGroupId, publishedMediaId, publishedDecodePath, publishedDecodeReason;
+        std::vector<motion::DisplayRuntimeState> publishedDisplayStates;
+        auto agentInstanceId = motion::new_id();
+        uint32_t agentProcessId = GetCurrentProcessId();
+        std::string publishedAgentInstanceId;
+        uint32_t publishedAgentProcessId{};
+        std::string lastCommandId, lastCommandAction, lastCommandMessage;
+        std::string publishedLastCommandId, publishedLastCommandAction,
+            publishedLastCommandMessage;
+        bool lastCommandSucceeded{};
+        bool publishedLastCommandSucceeded{};
+        if (!legacyDataConflict) {
+            motion::RuntimeState previousRuntime;
+            if (motion::try_load_runtime(runtimePath, previousRuntime)) {
+                publishedGroupId = std::move(previousRuntime.activeGroupId);
+                publishedMediaId = std::move(previousRuntime.activeMediaId);
+                publishedDecodePath = std::move(previousRuntime.decodePath);
+                publishedDecodeReason = std::move(previousRuntime.decodeReason);
+                publishedDisplayStates = std::move(previousRuntime.displayStates);
+                publishedAgentInstanceId = std::move(previousRuntime.agentInstanceId);
+                publishedAgentProcessId = previousRuntime.agentProcessId;
+                lastCommandId = std::move(previousRuntime.lastCommandId);
+                lastCommandAction = std::move(previousRuntime.lastCommandAction);
+                lastCommandSucceeded = previousRuntime.lastCommandSucceeded;
+                lastCommandMessage = std::move(previousRuntime.lastCommandMessage);
+                publishedLastCommandId = lastCommandId;
+                publishedLastCommandAction = lastCommandAction;
+                publishedLastCommandSucceeded = lastCommandSucceeded;
+                publishedLastCommandMessage = lastCommandMessage;
+            }
+        }
         bool configFailureReported{};
         bool runtimeFailureReported{};
         bool automaticCompatibilityPriority{};
         auto publishRuntime = [&](std::string groupId, std::string mediaId,
-            std::string decodePath = {}, std::string decodeReason = {}) {
+            std::string decodePath = {}, std::string decodeReason = {},
+            std::optional<std::vector<motion::DisplayRuntimeState>> displayStates = std::nullopt) {
             if (legacyDataConflict) return;
+            auto nextDisplayStates = displayStates
+                ? std::move(*displayStates) : publishedDisplayStates;
             if (groupId == publishedGroupId && mediaId == publishedMediaId &&
-                decodePath == publishedDecodePath && decodeReason == publishedDecodeReason) return;
+                decodePath == publishedDecodePath && decodeReason == publishedDecodeReason &&
+                nextDisplayStates == publishedDisplayStates &&
+                agentInstanceId == publishedAgentInstanceId &&
+                agentProcessId == publishedAgentProcessId &&
+                lastCommandId == publishedLastCommandId &&
+                lastCommandAction == publishedLastCommandAction &&
+                lastCommandSucceeded == publishedLastCommandSucceeded &&
+                lastCommandMessage == publishedLastCommandMessage) return;
             try {
                 motion::RuntimeState runtime;
                 runtime.activeGroupId = groupId;
                 runtime.activeMediaId = mediaId;
                 runtime.decodePath = decodePath;
                 runtime.decodeReason = decodeReason;
+                runtime.agentInstanceId = agentInstanceId;
+                runtime.agentProcessId = agentProcessId;
+                runtime.displayStates = nextDisplayStates;
+                runtime.lastCommandId = lastCommandId;
+                runtime.lastCommandAction = lastCommandAction;
+                runtime.lastCommandSucceeded = lastCommandSucceeded;
+                runtime.lastCommandMessage = lastCommandMessage;
                 runtime.updatedAt = motion::timestamp_utc();
                 motion::save_runtime(runtimePath, runtime);
                 publishedGroupId = std::move(groupId);
                 publishedMediaId = std::move(mediaId);
                 publishedDecodePath = std::move(decodePath);
                 publishedDecodeReason = std::move(decodeReason);
+                publishedDisplayStates = std::move(nextDisplayStates);
+                publishedAgentInstanceId = agentInstanceId;
+                publishedAgentProcessId = agentProcessId;
+                publishedLastCommandId = lastCommandId;
+                publishedLastCommandAction = lastCommandAction;
+                publishedLastCommandSucceeded = lastCommandSucceeded;
+                publishedLastCommandMessage = lastCommandMessage;
                 runtimeFailureReported = false;
             } catch (...) {
                 if (!runtimeFailureReported) append_agent_log(root, L"无法写入运行时壁纸状态。");
                 runtimeFailureReported = true;
             }
+        };
+        auto uniformDisplayStates = [](std::string state, std::string reason) {
+            std::vector<motion::DisplayRuntimeState> result;
+            for (auto const& display : motion::enumerate_displays()) {
+                motion::DisplayRuntimeState value;
+                value.displayId = display.id;
+                value.deviceName = display.deviceName;
+                value.displayName = display.friendlyName;
+                value.state = state;
+                value.reason = reason;
+                result.push_back(std::move(value));
+            }
+            return result;
         };
 
         for (;;) {
@@ -1390,8 +1959,23 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     publishedMediaId.clear();
                     publishedDecodePath.clear();
                     publishedDecodeReason.clear();
+                    publishedDisplayStates.clear();
+                    publishedAgentInstanceId.clear();
+                    publishedAgentProcessId = 0;
+                    lastCommandId.clear();
+                    lastCommandAction.clear();
+                    lastCommandMessage.clear();
+                    lastCommandSucceeded = false;
+                    publishedLastCommandId.clear();
+                    publishedLastCommandAction.clear();
+                    publishedLastCommandMessage.clear();
+                    publishedLastCommandSucceeded = false;
                 }
                 legacyDataConflict = true;
+                trayControls.CancelScreensaverPreview();
+                runtimeEvents.SetScreensaverInputWakeEnabled(false);
+                runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::Unavailable,
+                    trayControls.ManuallyPaused());
                 runtimeEvents.Wait(settingsEvent.get(), 1000);
                 continue;
             }
@@ -1403,6 +1987,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 root = motion::application_data_directory();
                 configPath = root / L"Config" / L"settings.json";
                 runtimePath = root / L"Config" / L"runtime.json";
+                runtimeControlPath = root / L"Config" / L"runtime-command.json";
                 settings = {};
                 wallpapers.clear();
                 mediaLibraryTrust.reset();
@@ -1413,7 +1998,58 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 configWriteTimeKnown = false;
                 configFailureReported = false;
                 runtimeFailureReported = false;
+                publishedGroupId.clear();
+                publishedMediaId.clear();
+                publishedDecodePath.clear();
+                publishedDecodeReason.clear();
+                publishedDisplayStates.clear();
+                publishedAgentInstanceId.clear();
+                publishedAgentProcessId = 0;
+                lastCommandId.clear();
+                lastCommandAction.clear();
+                lastCommandMessage.clear();
+                lastCommandSucceeded = false;
+                motion::RuntimeState previousRuntime;
+                if (motion::try_load_runtime(runtimePath, previousRuntime)) {
+                    publishedGroupId = std::move(previousRuntime.activeGroupId);
+                    publishedMediaId = std::move(previousRuntime.activeMediaId);
+                    publishedDecodePath = std::move(previousRuntime.decodePath);
+                    publishedDecodeReason = std::move(previousRuntime.decodeReason);
+                    publishedDisplayStates = std::move(previousRuntime.displayStates);
+                    publishedAgentInstanceId = std::move(previousRuntime.agentInstanceId);
+                    publishedAgentProcessId = previousRuntime.agentProcessId;
+                    lastCommandId = std::move(previousRuntime.lastCommandId);
+                    lastCommandAction = std::move(previousRuntime.lastCommandAction);
+                    lastCommandSucceeded = previousRuntime.lastCommandSucceeded;
+                    lastCommandMessage = std::move(previousRuntime.lastCommandMessage);
+                }
+                publishedLastCommandId = lastCommandId;
+                publishedLastCommandAction = lastCommandAction;
+                publishedLastCommandSucceeded = lastCommandSucceeded;
+                publishedLastCommandMessage = lastCommandMessage;
                 nextFallbackReload = std::chrono::steady_clock::now();
+            }
+
+            motion::RuntimeControlRequest controlRequest;
+            if (motion::try_load_runtime_control_request(
+                    runtimeControlPath, controlRequest) &&
+                controlRequest.requestId != lastCommandId) {
+                bool succeeded{};
+                if (controlRequest.action == "retry") {
+                    succeeded = renderers.Retry(controlRequest.displayId);
+                    lastCommandMessage = succeeded
+                        ? "retry-scheduled" : "no-failed-renderer";
+                } else if (controlRequest.action == "restart-renderer") {
+                    succeeded = renderers.Restart(controlRequest.displayId);
+                    lastCommandMessage = succeeded
+                        ? "renderer-restart-scheduled" :
+                        "renderer-not-found-or-stop-failed";
+                }
+                lastCommandId = controlRequest.requestId;
+                lastCommandAction = controlRequest.action;
+                lastCommandSucceeded = succeeded;
+                publishRuntime(publishedGroupId, publishedMediaId,
+                    publishedDecodePath, publishedDecodeReason);
             }
 
             if (libraryMigration.Requested()) {
@@ -1424,7 +2060,12 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 videoOptimizer.reset();
                 importedRequests.clear();
                 mediaLibraryTrust.reset();
-                publishRuntime({}, {}, "unavailable", "library-migration");
+                trayControls.CancelScreensaverPreview();
+                runtimeEvents.SetScreensaverInputWakeEnabled(false);
+                runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::Paused,
+                    trayControls.ManuallyPaused());
+                publishRuntime({}, {}, "unavailable", "library-migration",
+                    uniformDisplayStates("paused", "library-migration"));
                 if (!renderersStopped) {
                     // Keep the request unacknowledged. The App will retain all
                     // files and either observe a later successful retry or
@@ -1608,7 +2249,12 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
             }
             if (!configurationAvailable || !videoOptimizer) {
                 renderers.Stop();
-                publishRuntime({}, {}, "unavailable", "settings-unavailable");
+                trayControls.CancelScreensaverPreview();
+                runtimeEvents.SetScreensaverInputWakeEnabled(false);
+                runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::Unavailable,
+                    trayControls.ManuallyPaused());
+                publishRuntime({}, {}, "unavailable", "settings-unavailable",
+                    uniformDisplayStates("failed", "settings-unavailable"));
                 reload = runtimeEvents.Wait(settingsEvent.get(), 1000);
                 continue;
             }
@@ -1628,10 +2274,17 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
             bool locked = runtimeEvents.Locked();
             auto input = input_state();
             auto uptime = std::chrono::milliseconds(GetTickCount64());
+            if (runtimeEvents.TakeTogglePlaybackRequested()) trayControls.TogglePlayback();
+            if (runtimeEvents.TakeScreensaverPreviewRequested()) {
+                trayControls.RequestScreensaverPreview(input.tick, runtimeEvents.InputRevision());
+            }
+            (void)trayControls.ObserveInput(input.tick, runtimeEvents.InputRevision());
             auto inhibition = idleInhibitor.State(now);
             auto screensaverIdle = screensaverIdleTimer.Update(uptime, input.tick, input.idle,
                 motion::agent::screensaver_idle_is_inhibited(inhibition.display, screensaverWasActive));
             DWORD waitMilliseconds = motion::agent::stable_wait_ms;
+            auto displays = motion::enumerate_displays();
+            std::vector<motion::DisplayRuntimeState> currentDisplayStates;
             if (runtimeEvents.TopologyRevision() != topologyRevision) {
                 topologyRevision = runtimeEvents.TopologyRevision();
                 renderers.TopologyChanged();
@@ -1644,19 +2297,45 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 videoOptimizer->InvalidateChoices();
                 automaticCompatibilityPriority = false;
             }
+            IterationSettingsRestore restoreConfiguredSettings{ settings, settings };
+            SYSTEMTIME localTime{};
+            GetLocalTime(&localTime);
+            motion::SceneActivationContext sceneContext{
+                static_cast<int>(localTime.wHour) * 60 + localTime.wMinute,
+                runtimeEvents.OnBattery(),
+                cloned_or_projected_display_active()
+            };
+            if (auto automaticScene = motion::automatic_scene_for_context(
+                    settings, sceneContext)) {
+                (void)motion::apply_scene_profile(settings, *automaticScene);
+            }
+            videoOptimizer->SetStorageQuotaBytes(
+                settings.optimizationStorageQuotaBytes);
             auto sessionAction = motion::agent::reduce_runtime_action(settings,
                 { runtimeEvents.DisplayOn(), locked, false, false, 0 });
             if (sessionAction == motion::agent::RuntimeAction::DisplayOff) {
                 screensaverWasActive = false;
+                trayControls.CancelScreensaverPreview();
+                runtimeEvents.SetScreensaverInputWakeEnabled(false);
+                runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::DisplayOff,
+                    trayControls.ManuallyPaused());
                 // The display-off contract wins over background preparation:
                 // stop hardware work now and resume the durable request later.
                 videoOptimizer->SetGenerationAllowed(false);
                 renderers.Stop();
+                currentDisplayStates = renderers.RuntimeStates(displays, {},
+                    sessionAction, settings.displayMode == "primary");
                 waitMilliseconds = 1000;
             } else if (sessionAction == motion::agent::RuntimeAction::Locked) {
                 screensaverWasActive = false;
+                trayControls.CancelScreensaverPreview();
+                runtimeEvents.SetScreensaverInputWakeEnabled(false);
+                runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::Locked,
+                    trayControls.ManuallyPaused());
                 videoOptimizer->SetGenerationAllowed(false);
                 renderers.Stop();
+                currentDisplayStates = renderers.RuntimeStates(displays, {},
+                    sessionAction, settings.displayMode == "primary");
                 if (!wasLocked) {
                     wasLocked = true;
                     lockObservedAt = now;
@@ -1692,10 +2371,25 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 selectionInitialized = true;
                 bool performanceModeChanged = settings.performanceMode != previousPerformanceMode;
                 previousPerformanceMode = settings.performanceMode;
-                if (selectionChanged || performanceModeChanged) {
+                auto displayAssignmentsKey = display_assignments_key(settings.displayAssignments);
+                bool displayAssignmentsChanged = displayAssignmentsKey != previousDisplayAssignmentsKey;
+                previousDisplayAssignmentsKey = std::move(displayAssignmentsKey);
+                if (displayAssignmentsChanged) trayDisplayOverrides.clear();
+                if (selectionChanged || performanceModeChanged ||
+                    displayAssignmentsChanged) {
+                    // A new playback epoch must establish its static preview
+                    // before any selected-wallpaper transcode can run beside
+                    // an older source Renderer.
+                    videoOptimizer->SetGenerationAllowed(false);
                     videoOptimizer->InvalidateChoices();
                     renderers.ResetAutoDecodeFailures();
                     automaticCompatibilityPriority = false;
+                    performancePreviewStage = PerformancePreviewStage::Inactive;
+                    performanceCopyWasRequired = false;
+                }
+                if (selectionChanged || randomGroupChanged) {
+                    trayOverrideGroupId.clear();
+                    trayOverrideMediaId.clear();
                 }
                 bool randomIntervalChanged = settings.randomIntervalMinutes != previousRandomInterval;
                 if (randomIntervalChanged) {
@@ -1724,6 +2418,64 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         ? now + std::chrono::minutes(settings.randomIntervalMinutes)
                         : std::chrono::steady_clock::time_point::max();
                 }
+                // Always consume the auto-reset request. A command received
+                // while manually paused is intentionally discarded instead
+                // of firing unexpectedly after the later resume.
+                bool nextWallpaperRequested =
+                    runtimeEvents.TakeNextWallpaperRequested();
+                if (motion::agent::tray_next_wallpaper_should_advance(
+                        nextWallpaperRequested, trayControls.ManuallyPaused())) {
+                    auto currentGroupId = trayOverrideMediaId.empty()
+                        ? (randomId.empty() ? settings.selectedGroupId : settings.randomGroupId)
+                        : trayOverrideGroupId;
+                    auto currentMediaId = trayOverrideMediaId.empty()
+                        ? (randomId.empty() ? settings.selectedMediaId : randomId)
+                        : trayOverrideMediaId;
+                    auto nextId = next_media_id(wallpapers, currentGroupId,
+                        currentMediaId, playbackPerformanceMode);
+                    bool advanced{};
+                    if (!nextId.empty()) {
+                        advanced = true;
+                        if (randomActive) {
+                            randomId = std::move(nextId);
+                            trayOverrideGroupId.clear();
+                            trayOverrideMediaId.clear();
+                            nextRandomChange = settings.randomIntervalMinutes > 0
+                                ? now + std::chrono::minutes(settings.randomIntervalMinutes)
+                                : std::chrono::steady_clock::time_point::max();
+                        } else {
+                            trayOverrideGroupId = std::move(currentGroupId);
+                            trayOverrideMediaId = std::move(nextId);
+                        }
+                    }
+                    if (settings.displayMode != "primary") {
+                        for (auto const& assignment : settings.displayAssignments) {
+                            auto activeDisplay = std::find_if(displays.begin(), displays.end(),
+                                [&](auto const& display) {
+                                    return display.id == assignment.displayId;
+                                });
+                            if (activeDisplay == displays.end()) continue;
+                            auto existing = trayDisplayOverrides.find(assignment.displayId);
+                            auto assignedCurrent = existing != trayDisplayOverrides.end() &&
+                                existing->second.first == assignment.groupId
+                                ? existing->second.second : assignment.mediaId;
+                            auto assignedNext = next_media_id(wallpapers, assignment.groupId,
+                                assignedCurrent, playbackPerformanceMode);
+                            if (!assignedNext.empty()) {
+                                trayDisplayOverrides[assignment.displayId] = {
+                                    assignment.groupId, std::move(assignedNext) };
+                                advanced = true;
+                            }
+                        }
+                    }
+                    if (advanced) {
+                        videoOptimizer->SetGenerationAllowed(false);
+                        videoOptimizer->InvalidateChoices();
+                        renderers.ResetAutoDecodeFailures();
+                        performancePreviewStage = PerformancePreviewStage::Inactive;
+                        performanceCopyWasRequired = false;
+                    }
+                }
                 if (wasLocked) {
                     wasLocked = false;
                     autoLockTriggered = false;
@@ -1731,10 +2483,23 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     lockObservedAt = std::chrono::steady_clock::time_point::max();
                 }
 
-                auto groupId = randomId.empty() ? settings.selectedGroupId : settings.randomGroupId;
-                auto mediaId = randomId.empty() ? settings.selectedMediaId : randomId;
+                auto groupId = trayOverrideMediaId.empty()
+                    ? (randomId.empty() ? settings.selectedGroupId : settings.randomGroupId)
+                    : trayOverrideGroupId;
+                auto mediaId = trayOverrideMediaId.empty()
+                    ? (randomId.empty() ? settings.selectedMediaId : randomId)
+                    : trayOverrideMediaId;
+                auto outputSettings = settings;
+                for (auto& assignment : outputSettings.displayAssignments) {
+                    auto override = trayDisplayOverrides.find(assignment.displayId);
+                    if (override != trayDisplayOverrides.end() &&
+                        override->second.first == assignment.groupId) {
+                        assignment.mediaId = override->second.second;
+                    }
+                }
                 auto outputs = display_media_targets(
-                    wallpapers, settings, groupId, mediaId, playbackPerformanceMode);
+                    wallpapers, outputSettings, groupId, mediaId, playbackPerformanceMode,
+                    displays);
                 if (softwarePlayback) {
                     for (auto& output : outputs) {
                         output.softwarePlaybackTarget = output.media.kind == "video";
@@ -1798,28 +2563,33 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 if (!outputs.empty() || !selectedMediaTemporarilyMissing) missingMediaSince.reset();
                 auto state = motion::agent::reduce_runtime_action(settings,
                     { true, false, desktop_covered(), !outputs.empty(), screensaverIdle.count() / 1000 });
+                if (outputs.empty()) trayControls.CancelScreensaverPreview();
+                if (trayControls.ManuallyPaused() && !outputs.empty()) {
+                    state = motion::agent::RuntimeAction::DesktopPaused;
+                }
+                if (trayControls.ScreensaverPreviewActive() && !outputs.empty()) {
+                    state = motion::agent::RuntimeAction::ScreensaverPlay;
+                }
                 bool ownScreensaverActive = screensaverWasActive ||
                     state == motion::agent::RuntimeAction::ScreensaverPlay;
                 auto autoLockIdle = autoLockIdleTimer.Update(uptime, input.tick, input.idle,
                     motion::agent::automatic_lock_idle_is_inhibited(
                         inhibition.display, inhibition.system, ownScreensaverActive));
                 screensaverWasActive = state == motion::agent::RuntimeAction::ScreensaverPlay;
-                // Explicit/import requests are durable and run at background
-                // priority. Power saver is also allowed to prepare its selected
-                // display-sized stream while the source remains visible. The
-                // selected tier is never changed implicitly by power state.
+                runtimeEvents.SetScreensaverInputWakeEnabled(screensaverWasActive);
+                // Explicit/import requests are durable background work. The
+                // selected tier is never changed implicitly by power state;
+                // current-wallpaper work is admitted separately only after a
+                // static Renderer barrier below.
                 bool powerSaverNeedsPriority = settings.performanceMode == "power-saver" ||
                     softwarePlayback || automaticCompatibilityPriority;
                 bool playbackIdle = state != motion::agent::RuntimeAction::DesktopPlay &&
                     state != motion::agent::RuntimeAction::ScreensaverPlay;
                 bool onBattery = runtimeEvents.OnBattery();
-                bool selectedTierGenerationAllowed = motion::agent::variant_generation_allowed(
-                    onBattery, settings.performanceMode == "power-saver" ||
-                        !importedRequests.empty(), playbackIdle);
-                videoOptimizer->SetGenerationAllowed(motion::agent::variant_generation_allowed(
-                    onBattery, powerSaverNeedsPriority || !importedRequests.empty(), playbackIdle));
-                prepareImported();
-                auto resolveVideoOutputs = [&](bool onlySoftwareTargets = false) {
+                bool backgroundGenerationAllowed = motion::agent::variant_generation_allowed(
+                    onBattery, powerSaverNeedsPriority || !importedRequests.empty(), playbackIdle);
+                auto resolveVideoOutputs = [&](bool onlySoftwareTargets = false,
+                    bool allowGenerationRequest = false) {
                     using ResolveKey = std::pair<std::wstring, bool>;
                     std::map<ResolveKey, OptimizationTarget> requiredVideoTargets;
                     for (auto const& output : outputs) {
@@ -1839,7 +2609,6 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         required.refreshRateHz = (std::max)(required.refreshRateHz,
                             profile.enabled ? profile.frameRate : output.targetRefreshRate);
                     }
-                    bool waiting{};
                     for (auto& output : outputs) {
                         if (output.media.kind != "video" || !output.media.sourceBacked) continue;
                         if (onlySoftwareTargets && !output.softwarePlaybackTarget) continue;
@@ -1849,16 +2618,14 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         auto resolved = videoOptimizer->ResolveWithLease(source, settings.performanceMode,
                             required.width, required.height, required.refreshRateHz,
                             output.softwarePlaybackTarget,
-                            output.softwarePlaybackTarget || selectedTierGenerationAllowed);
+                            allowGenerationRequest);
+                        output.performanceCopyRequired =
+                            resolved.performanceCopyRequired;
+                        output.performanceCopyPending =
+                            resolved.performanceCopyPending;
                         output.media.path = std::move(resolved.path);
                         output.media.playbackLease = std::move(resolved.lease);
                         output.media.sourceBacked = output.media.path == source;
-                        if (state == motion::agent::RuntimeAction::DesktopPlay &&
-                            motion::agent::active_playback_waits_for_performance_copy(
-                                settings.performanceMode, resolved.performanceCopyPending,
-                                output.media.sourceBacked)) {
-                            waiting = true;
-                        }
                     }
                     for (auto& output : outputs) {
                         // External-library identity must remain pinned for every
@@ -1870,9 +2637,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                                 output.media.path);
                         }
                     }
-                    return waiting;
                 };
-                bool waitingForPerformanceCopy = resolveVideoOutputs();
+                resolveVideoOutputs();
 
                 if (settings.decodeMode == "auto") {
                     // Resolve can switch codecs/profiles (for example H.264
@@ -1884,7 +2650,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     if (!softwarePlayback && !unsupportedRoutes.empty()) {
                         automaticCompatibilityPriority = true;
                         auto cpuOutputs = display_media_targets(wallpapers, settings,
-                            groupId, mediaId, std::string(motion::agent::cpu_smooth_mode));
+                            groupId, mediaId, std::string(motion::agent::cpu_smooth_mode),
+                            displays);
                         for (auto index : unsupportedRoutes) {
                             if (index >= outputs.size()) continue;
                             auto& output = outputs[index];
@@ -1897,6 +2664,12 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                             if (fallback != cpuOutputs.end()) {
                                 output.media = std::move(fallback->media);
                             }
+                            // The selected balanced/power-saver route is being
+                            // replaced by an internal cpu-smooth route. Do not
+                            // carry its preview requirement across that policy
+                            // boundary.
+                            output.performanceCopyRequired = false;
+                            output.performanceCopyPending = false;
                             output.softwarePlaybackTarget = true;
                             output.playbackFrameRateCap =
                                 motion::agent::software_playback_profile(true,
@@ -1904,10 +2677,9 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                                     output.targetHeight, output.targetRefreshRate).frameRate;
                         }
                         powerSaverNeedsPriority = true;
-                        videoOptimizer->SetGenerationAllowed(motion::agent::variant_generation_allowed(
-                            onBattery, true, playbackIdle));
-                        waitingForPerformanceCopy = resolveVideoOutputs(true) ||
-                            waitingForPerformanceCopy;
+                        backgroundGenerationAllowed = motion::agent::variant_generation_allowed(
+                            onBattery, true, playbackIdle);
+                        resolveVideoOutputs(true);
                         // The CPU-friendly file may still be decoded and
                         // composed by a capable physical GPU. If it is not yet
                         // ready or no adapter supports it, automatic playback
@@ -1915,6 +2687,57 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         assignDecodeAdapters(outputs);
                     } else if (!softwarePlayback) {
                         automaticCompatibilityPriority = false;
+                    }
+                }
+
+                bool anyPlaybackCopyRequired = std::any_of(outputs.begin(),
+                    outputs.end(), [](auto const& output) {
+                        return output.performanceCopyRequired &&
+                            output.media.sourceBacked;
+                    });
+                bool waitingForPerformanceCopy =
+                    state == motion::agent::RuntimeAction::DesktopPlay &&
+                    std::any_of(outputs.begin(), outputs.end(), [](auto const& output) {
+                        return motion::agent::active_playback_waits_for_performance_copy(
+                            output.performanceCopyRequired,
+                            output.media.sourceBacked);
+                    });
+                std::vector<std::string> performanceCopyDisplayIds;
+                if (waitingForPerformanceCopy) {
+                    for (auto const& output : outputs) {
+                        if (output.performanceCopyRequired &&
+                            !output.displayId.empty()) {
+                            performanceCopyDisplayIds.push_back(output.displayId);
+                        }
+                    }
+                }
+
+                if (waitingForPerformanceCopy && !performanceCopyWasRequired) {
+                    // Stop an already running optimizer before touching the
+                    // previous playback route. Generation remains disabled
+                    // until both barriers below have acknowledged.
+                    videoOptimizer->SetGenerationAllowed(false);
+                    performancePreviewStage = renderers.HasActiveRoute()
+                        ? PerformancePreviewStage::FreezePrevious
+                        : PerformancePreviewStage::PresentPreview;
+                } else if (!waitingForPerformanceCopy) {
+                    performancePreviewStage = PerformancePreviewStage::Inactive;
+                }
+                performanceCopyWasRequired = waitingForPerformanceCopy;
+
+                auto performanceCopyPreviewOutputs = outputs;
+                if (waitingForPerformanceCopy) {
+                    for (auto& output : performanceCopyPreviewOutputs) {
+                        if (!output.performanceCopyRequired) continue;
+                        auto poster = media_poster_by_id(
+                            wallpapers, output.groupId, output.mediaId);
+                        if (!poster.path.empty()) {
+                            poster.playbackLease = videoOptimizer->AcquirePlaybackLease(poster.path);
+                            output.media = std::move(poster);
+                            output.decodeAdapter.clear();
+                            output.softwarePlaybackTarget = false;
+                            output.playbackFrameRateCap = 0;
+                        }
                     }
                 }
 
@@ -1940,58 +2763,221 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 }
 
                 bool targetReady{};
+                bool optimizerQuiescenceBlocked{};
+                auto sourcePresentationMayApply = [&](Renderer::Target target,
+                    std::vector<DisplayMediaTarget> const& presentationOutputs,
+                    bool freezePerformanceCopies = false) {
+                    bool needsIdle = renderers.SourcePresentationNeedsOptimizerIdle(
+                        target, presentationOutputs, settings.decodeMode,
+                        settings.displayMode == "primary", freezePerformanceCopies);
+                    bool idle = !needsIdle || videoOptimizer->Quiesce(
+                        motion::agent::optimizer_quiesce_timeout_ms);
+                    bool allowed = motion::agent::source_presentation_may_apply(
+                        needsIdle, idle);
+                    optimizerQuiescenceBlocked = !allowed;
+                    return allowed;
+                };
+                auto trayStatus = motion::agent::TrayStatus::Applying;
                 if (autoLockTriggered) {
+                    runtimeEvents.SetScreensaverInputWakeEnabled(false);
+                    trayControls.CancelScreensaverPreview();
+                    trayStatus = motion::agent::TrayStatus::Locked;
                     waitMilliseconds = 1000;
                 } else if (holdExistingRenderer) {
                     // Import/move publishes metadata and files in separate atomic
                     // steps. Preserve the last fully presented frame during that
                     // short transaction instead of exposing the Windows wallpaper.
+                    trayStatus = motion::agent::TrayStatus::Applying;
                     waitMilliseconds = 50;
                 } else if (waitingForPerformanceCopy) {
-                    // Honor the selected tier without exposing the Windows
-                    // wallpaper or continuing an expensive source stream. Keep
-                    // the old route's exact last frame until every requested
-                    // copy is ready; RendererPool will retire stale routes only
-                    // after the replacement route receives its first-frame ACK.
-                    renderers.Freeze();
-                    targetReady = renderers.TargetReady();
-                    waitMilliseconds = motion::agent::performance_copy_wait_interval_ms(
-                        targetReady || !renderers.TransitionPending());
+                    if (performancePreviewStage ==
+                        PerformancePreviewStage::FreezePrevious) {
+                        // Barrier 1: an old source route must acknowledge its
+                        // freeze before a selected optimization can start. Do
+                        // not rely on the later seamless-retirement path: a
+                        // slow poster could otherwise overlap the whole encode.
+                        if (renderers.FreezeDisplays(
+                                performanceCopyDisplayIds)) {
+                            performancePreviewStage =
+                                PerformancePreviewStage::PresentPreview;
+                        }
+                        targetReady = false;
+                        trayStatus = motion::agent::TrayStatus::Applying;
+                        waitMilliseconds = motion::agent::responsive_wait_ms;
+                    } else {
+                        // Barrier 2: present posters (or decode only one legacy
+                        // source frame) per pending display. Routes without a
+                        // missing performance copy remain in DesktopPlay.
+                        if (sourcePresentationMayApply(
+                                Renderer::Target::DesktopPlay,
+                                performanceCopyPreviewOutputs, true)) {
+                            renderers.Apply(Renderer::Target::DesktopPlay,
+                                performanceCopyPreviewOutputs, settings.decodeMode,
+                                settings.displayMode == "primary", true);
+                            targetReady = renderers.TargetReady() &&
+                                renderers.RetiringRoutesStopped();
+                        }
+                        if (targetReady) {
+                            performancePreviewStage =
+                                PerformancePreviewStage::Ready;
+                        }
+                        bool anyCopyPending = std::any_of(outputs.begin(),
+                            outputs.end(), [](auto const& output) {
+                                return output.performanceCopyPending;
+                            });
+                        trayStatus = !targetReady
+                            ? motion::agent::TrayStatus::Applying
+                            : anyCopyPending
+                                ? motion::agent::TrayStatus::Optimizing
+                                : motion::agent::TrayStatus::Frozen;
+                        waitMilliseconds = anyCopyPending
+                            ? motion::agent::performance_copy_wait_interval_ms(
+                                targetReady || !renderers.TransitionPending())
+                            : motion::agent::runtime_wait_interval_ms(
+                                targetReady || !renderers.TransitionPending());
+                    }
                 } else {
                     switch (state) {
                     case motion::agent::RuntimeAction::ScreensaverPlay:
-                        renderers.Apply(Renderer::Target::ScreensaverPlay, outputs, settings.decodeMode,
-                            settings.displayMode == "primary");
-                        targetReady = renderers.TargetReady();
+                        if (sourcePresentationMayApply(
+                                Renderer::Target::ScreensaverPlay, outputs)) {
+                            renderers.Apply(Renderer::Target::ScreensaverPlay,
+                                outputs, settings.decodeMode,
+                                settings.displayMode == "primary");
+                            targetReady = renderers.TargetReady();
+                        }
+                        trayStatus = targetReady ? motion::agent::TrayStatus::Screensaver :
+                            motion::agent::TrayStatus::Applying;
                         waitMilliseconds = motion::agent::runtime_wait_interval_ms(
                             targetReady || !renderers.TransitionPending());
                         break;
                     case motion::agent::RuntimeAction::DesktopPlay:
-                        renderers.Apply(Renderer::Target::DesktopPlay, outputs, settings.decodeMode,
-                            settings.displayMode == "primary");
-                        targetReady = renderers.TargetReady();
+                        if (sourcePresentationMayApply(
+                                Renderer::Target::DesktopPlay, outputs)) {
+                            renderers.Apply(Renderer::Target::DesktopPlay,
+                                outputs, settings.decodeMode,
+                                settings.displayMode == "primary");
+                            targetReady = renderers.TargetReady();
+                        }
+                        trayStatus = targetReady ? motion::agent::TrayStatus::Playing :
+                            motion::agent::TrayStatus::Applying;
                         waitMilliseconds = motion::agent::runtime_wait_interval_ms(
                             targetReady || !renderers.TransitionPending());
                         break;
                     case motion::agent::RuntimeAction::DesktopFrozen:
-                        renderers.Apply(Renderer::Target::DesktopFreeze, outputs, settings.decodeMode,
-                            settings.displayMode == "primary");
-                        targetReady = renderers.TargetReady();
+                        if (sourcePresentationMayApply(
+                                Renderer::Target::DesktopFreeze, outputs)) {
+                            renderers.Apply(Renderer::Target::DesktopFreeze,
+                                outputs, settings.decodeMode,
+                                settings.displayMode == "primary");
+                            targetReady = renderers.TargetReady();
+                        }
+                        trayStatus = targetReady ? motion::agent::TrayStatus::Frozen :
+                            motion::agent::TrayStatus::Applying;
                         waitMilliseconds = motion::agent::runtime_wait_interval_ms(
                             targetReady || !renderers.TransitionPending());
                         break;
                     case motion::agent::RuntimeAction::DesktopPaused:
                         renderers.Pause();
                         targetReady = renderers.TargetReady();
+                        trayStatus = targetReady
+                            ? motion::agent::TrayStatus::Paused
+                            : motion::agent::TrayStatus::Applying;
                         waitMilliseconds = motion::agent::runtime_wait_interval_ms(
                             targetReady || !renderers.TransitionPending());
                         break;
                     default:
                         renderers.Stop();
+                        trayStatus = motion::agent::TrayStatus::Stopped;
                         publishRuntime({}, {});
                         break;
                     }
                 }
+                bool previewBarrierReady = !waitingForPerformanceCopy ||
+                    performancePreviewStage == PerformancePreviewStage::Ready;
+                bool retiredRoutesStopped = renderers.RetiringRoutesStopped();
+                bool rendererStaticForOptimization =
+                    !optimizerQuiescenceBlocked &&
+                    motion::agent::optimization_renderer_is_static(
+                        state, waitingForPerformanceCopy, previewBarrierReady,
+                        targetReady, renderers.HasActiveRoute(),
+                        retiredRoutesStopped, holdExistingRenderer);
+                bool currentWallpaperMayGenerate = anyPlaybackCopyRequired &&
+                    rendererStaticForOptimization && !onBattery;
+                bool optimizerMayRun = !autoLockTriggered &&
+                    rendererStaticForOptimization &&
+                    (backgroundGenerationAllowed || currentWallpaperMayGenerate);
+                videoOptimizer->SetGenerationAllowed(optimizerMayRun);
+                if (optimizerMayRun) {
+                    if (anyPlaybackCopyRequired) {
+                        // The first Resolve published durable selected-tier
+                        // requests without starting them. Re-resolve every
+                        // source-backed output only after the static barrier;
+                        // this queues balanced, power-saver and cpu-smooth
+                        // using the same aggregate per-source target and also
+                        // refreshes pending state in this pass.
+                        resolveVideoOutputs(false, true);
+                    }
+                    prepareImported();
+                }
+                if (waitingForPerformanceCopy && targetReady) {
+                    // Resolve/Prepare above may queue the current copy during
+                    // this same pass. Publish it immediately instead of
+                    // leaving tray/runtime one stable poll behind.
+                    bool anyCopyPending = std::any_of(outputs.begin(), outputs.end(),
+                        [](auto const& output) {
+                            return output.performanceCopyPending;
+                        });
+                    trayStatus = anyCopyPending
+                        ? motion::agent::TrayStatus::Optimizing
+                        : motion::agent::TrayStatus::Frozen;
+                    waitMilliseconds = anyCopyPending
+                        ? motion::agent::performance_copy_wait_interval_ms(true)
+                        : motion::agent::runtime_wait_interval_ms(true);
+                }
+                auto statusAction = autoLockTriggered
+                    ? motion::agent::RuntimeAction::Locked : state;
+                currentDisplayStates = renderers.RuntimeStates(displays, outputs,
+                    statusAction, settings.displayMode == "primary",
+                    trayControls.ManuallyPaused());
+                if (optimizerQuiescenceBlocked) {
+                    for (auto& display : currentDisplayStates) {
+                        if (display.state == "failed") continue;
+                        auto targeted = std::any_of(outputs.begin(), outputs.end(),
+                            [&](auto const& output) {
+                                return output.displayId == display.displayId;
+                            });
+                        if (!targeted) continue;
+                        display.state = "applying";
+                        display.reason = "optimizer-quiescence-timeout";
+                    }
+                } else if (holdExistingRenderer) {
+                    for (auto& display : currentDisplayStates) {
+                        if (display.state == "failed") continue;
+                        display.state = "applying";
+                        display.reason = "media-transaction";
+                    }
+                } else if (waitingForPerformanceCopy &&
+                    performancePreviewStage ==
+                        PerformancePreviewStage::FreezePrevious) {
+                    for (auto& display : currentDisplayStates) {
+                        bool requiresPreview = std::any_of(outputs.begin(),
+                            outputs.end(), [&](auto const& output) {
+                                return output.displayId == display.displayId &&
+                                    output.performanceCopyRequired;
+                            });
+                        if (!requiresPreview || display.state == "paused" ||
+                            display.state == "failed") continue;
+                        display.state = "applying";
+                        display.reason = "freezing-previous-route";
+                    }
+                }
+                trayStatus = motion::agent::tray_status_with_renderer_health(
+                    trayStatus, std::any_of(currentDisplayStates.begin(),
+                        currentDisplayStates.end(), [](auto const& display) {
+                            return display.state == "failed";
+                        }));
+                runtimeEvents.SetTrayStatus(trayStatus, trayControls.ManuallyPaused());
                 if (motion::agent::runtime_selection_can_publish(
                         targetReady, waitingForPerformanceCopy)) {
                     auto decode = renderers.DecodeState();
@@ -2000,7 +2986,9 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 }
             }
             auto decode = renderers.DecodeState();
-            publishRuntime(publishedGroupId, publishedMediaId, decode.path, decode.reason);
+            publishRuntime(publishedGroupId, publishedMediaId, decode.path, decode.reason,
+                std::optional<std::vector<motion::DisplayRuntimeState>>(
+                    std::move(currentDisplayStates)));
             reload = runtimeEvents.Wait(settingsEvent.get(), waitMilliseconds);
         }
     } catch (std::exception const& error) {

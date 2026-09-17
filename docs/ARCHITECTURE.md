@@ -42,7 +42,7 @@
 ├─ Config\
 │  ├─ settings.json               # 仅设置应用写入
 │  ├─ runtime.json                # 活动媒体，仅 Agent 写入
-│  └─ agent.log                   # Agent 与性能副本生成日志
+│  └─ agent.log                   # Agent 与优化副本生成日志
 └─ portable.mode                  # 单目录数据模式标记
 ```
 
