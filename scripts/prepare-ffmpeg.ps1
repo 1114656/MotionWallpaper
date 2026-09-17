@@ -7,10 +7,10 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $workspaceRoot = Split-Path -Parent $projectRoot
 $cacheRoot = Join-Path $workspaceRoot 'Codex\MotionWallpaper-ffmpeg'
-$assetName = 'ffmpeg-n8.1.2-44-g7c533d0f86-win64-lgpl-shared-8.1.zip'
+$assetName = 'ffmpeg-n8.1.2-53-g1005b294ff-win64-lgpl-shared-8.1.zip'
 $headers = @{ 'User-Agent' = 'MotionWallpaper-build' }
-$expectedHash = '7b32983c242dd73d43c20836582572e9927986f8cb112aafd62aa9978f4be645'
-$downloadUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-23-13-03/' + $assetName
+$expectedHash = 'a654407793b1caef118550de3b99e46299dcabc6649ccf9a3a325f41ff4ea414'
+$downloadUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-16-19-44/' + $assetName
 $notice = Join-Path $projectRoot 'third_party\FFmpeg-NOTICE.txt'
 $openH264License = Join-Path $projectRoot 'third_party\OpenH264-LICENSE.txt'
 $expectedOpenH264LicenseHash = 'e7e7f1b027867f49b2a4731f2c317fe6572ff66fd0909d1469b0a7a328e8a293'

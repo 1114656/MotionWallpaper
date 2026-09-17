@@ -3,6 +3,8 @@ separate background media-preparation tool.
 
 Build distribution: BtbN/FFmpeg-Builds, Windows x64 LGPL shared build 8.1
 Project: https://github.com/BtbN/FFmpeg-Builds
+Pinned build: autobuild-2026-09-16-19-44 / ffmpeg-n8.1.2-53-g1005b294ff-win64-lgpl-shared-8.1.zip
+SHA-256: a654407793b1caef118550de3b99e46299dcabc6649ccf9a3a325f41ff4ea414
 FFmpeg source and license information: https://ffmpeg.org/
 
 The accompanying FFmpeg libraries are dynamically linked and distributed
