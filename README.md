@@ -4,7 +4,7 @@
 
 MotionWallpaper 关注三件事：保留导入素材的源画质、让桌面与屏保之间平滑切换，以及尽量降低常驻内存和后台功耗。
 
-> **项目状态：** 当前源码版本为 `v0.2.0-alpha.2` 测试版，使用 Windows App SDK 1.8 维护版本。请优先在非关键设备上试用；安装器尚未代码签名，Windows SmartScreen 可能显示警告，详见 [发布清单](docs/RELEASING.md)。
+> **项目状态：** 当前源码版本为 `v0.2.0-alpha.3` 测试版，使用 Windows App SDK 1.8 维护版本。请优先在非关键设备上试用；安装器尚未代码签名，Windows SmartScreen 可能显示警告，详见 [发布清单](docs/RELEASING.md)。
 
 ## 主要功能
 

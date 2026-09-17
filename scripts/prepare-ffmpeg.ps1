@@ -16,25 +16,34 @@ $openH264License = Join-Path $projectRoot 'third_party\OpenH264-LICENSE.txt'
 $expectedOpenH264LicenseHash = 'e7e7f1b027867f49b2a4731f2c317fe6572ff66fd0909d1469b0a7a328e8a293'
 
 function Copy-FfmpegPackage {
-    param([string]$PackageRoot)
+    param(
+        [Parameter(Mandatory)][string]$PackageRoot,
+        [Parameter(Mandatory)][string]$OutputDirectory,
+        [Parameter(Mandatory)][string]$NoticePath,
+        [Parameter(Mandatory)][string]$OpenH264LicensePath,
+        [Parameter(Mandatory)][string]$ExpectedOpenH264LicenseHash
+    )
     $bin = Join-Path $PackageRoot 'bin'
     $license = Join-Path $PackageRoot 'LICENSE.txt'
     if (-not (Test-Path -LiteralPath (Join-Path $bin 'ffmpeg.exe')) -or -not (Test-Path -LiteralPath $license)) {
         throw 'The FFmpeg package is incomplete.'
     }
-    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
     Get-ChildItem -LiteralPath $bin -File | Where-Object {
         $_.Extension -ieq '.dll' -or $_.Name -ieq 'ffmpeg.exe'
-    } | Copy-Item -Destination $Destination -Force
-    Copy-Item -LiteralPath $license -Destination (Join-Path $Destination 'LICENSE-FFmpeg.txt') -Force
-    Copy-Item -LiteralPath $notice -Destination $Destination -Force
-    if (-not (Test-Path -LiteralPath $openH264License -PathType Leaf) -or
-        (Get-FileHash -LiteralPath $openH264License -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedOpenH264LicenseHash) {
-        throw 'The pinned OpenH264 license text is missing or has an unexpected SHA-256 hash.'
+    } | Copy-Item -Destination $OutputDirectory -Force
+    Copy-Item -LiteralPath $license -Destination (Join-Path $OutputDirectory 'LICENSE-FFmpeg.txt') -Force
+    Copy-Item -LiteralPath $NoticePath -Destination $OutputDirectory -Force
+    if (-not (Test-Path -LiteralPath $OpenH264LicensePath -PathType Leaf)) {
+        throw "The pinned OpenH264 license text is missing: $OpenH264LicensePath"
     }
-    Copy-Item -LiteralPath $openH264License -Destination (Join-Path $Destination 'LICENSE-OpenH264.txt') -Force
+    $actualOpenH264LicenseHash = (Get-FileHash -LiteralPath $OpenH264LicensePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualOpenH264LicenseHash -ne $ExpectedOpenH264LicenseHash) {
+        throw "The pinned OpenH264 license SHA-256 is $actualOpenH264LicenseHash; expected $ExpectedOpenH264LicenseHash. Ensure the checkout preserves LF line endings."
+    }
+    Copy-Item -LiteralPath $OpenH264LicensePath -Destination (Join-Path $OutputDirectory 'LICENSE-OpenH264.txt') -Force
 
-    $publishedFfmpeg = Join-Path $Destination 'ffmpeg.exe'
+    $publishedFfmpeg = Join-Path $OutputDirectory 'ffmpeg.exe'
     $encoders = (& $publishedFfmpeg -hide_banner -encoders 2>&1 | Out-String)
     foreach ($requiredEncoder in @(
         'h264_nvenc', 'h264_qsv', 'h264_amf',
@@ -77,7 +86,12 @@ try {
     Expand-Archive -LiteralPath $archive -DestinationPath $expanded
     $packages = @(Get-ChildItem -LiteralPath $expanded -Directory)
     if ($packages.Count -ne 1) { throw 'The FFmpeg archive did not contain exactly one package directory.' }
-    Copy-FfmpegPackage $packages[0].FullName
+    Copy-FfmpegPackage `
+        -PackageRoot $packages[0].FullName `
+        -OutputDirectory $Destination `
+        -NoticePath $notice `
+        -OpenH264LicensePath $openH264License `
+        -ExpectedOpenH264LicenseHash $expectedOpenH264LicenseHash
 } finally {
     $resolvedExpanded = [IO.Path]::GetFullPath($expanded)
     if ($resolvedExpanded.StartsWith($temporaryBase, [StringComparison]::OrdinalIgnoreCase) -and
