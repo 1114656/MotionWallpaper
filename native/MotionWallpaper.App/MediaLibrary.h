@@ -4,12 +4,38 @@
 #include "../MotionWallpaper.Common/VariantCache.h"
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <vector>
 
 namespace motion::app
 {
+    inline constexpr uint32_t maximumImportedVideoLongEdge = 7680;
+    inline constexpr uint32_t maximumImportedVideoShortEdge = 4320;
+    inline constexpr uint32_t maximumImportedVideoFrameRate = 240;
+
+    // Treat 8K as UHD 7680x4320 and apply the same budget to portrait media.
+    // An aspect ratio alone must not let a dimension or total decode surface
+    // exceed that envelope.
+    [[nodiscard]] constexpr bool video_import_dimensions_allowed(
+        uint32_t width, uint32_t height) noexcept
+    {
+        if (!width || !height) return false;
+        auto longEdge = width > height ? width : height;
+        auto shortEdge = width > height ? height : width;
+        return longEdge <= maximumImportedVideoLongEdge &&
+            shortEdge <= maximumImportedVideoShortEdge;
+    }
+
+    [[nodiscard]] constexpr bool video_import_frame_rate_allowed(
+        uint32_t numerator, uint32_t denominator) noexcept
+    {
+        return numerator && denominator &&
+            static_cast<uint64_t>(numerator) <=
+                static_cast<uint64_t>(maximumImportedVideoFrameRate) * denominator;
+    }
+
     enum class DeleteMode { RecycleBin, Permanent };
 
     enum class MediaCatalogSort { Name, Newest, Size, Kind };

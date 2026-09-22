@@ -623,13 +623,16 @@ namespace motion::agent
         auto longEdge = (std::max)(width, height);
         auto shortEdge = (std::min)(width, height);
         if (softwarePlaybackTarget) {
-            if (softwareFallbackAllowed && width && height && targetFps &&
-                pixelRate <= static_cast<uint64_t>(1920) * 1080 * 60 &&
-                longEdge <= 1920 && shortEdge <= 1080 && targetFps <= 60) {
-                return { VideoTranscodeCandidate{
-                    VideoTranscodeBackend::softwareOpenH264, {}, false } };
+            // Compatibility copies are always bounded, broadly decodable
+            // H.264. Prefer a precisely bound hardware encoder when one is
+            // available, but retain OpenH264 as the final machine-independent
+            // fallback. Software decoding is still attempted with each
+            // hardware encoder if the source itself cannot use that GPU.
+            if (!softwareFallbackAllowed || !width || !height || !targetFps ||
+                pixelRate > static_cast<uint64_t>(1920) * 1080 * 60 ||
+                longEdge > 1920 || shortEdge > 1080 || targetFps > 60) {
+                return {};
             }
-            return {};
         }
 
         std::stable_sort(adapters.begin(), adapters.end(), [](auto const& left, auto const& right) {

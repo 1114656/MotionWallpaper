@@ -915,6 +915,13 @@ namespace
             !motion::agent::performance_copy_preview_required(
                 motion::agent::RuntimeAction::ScreensaverPlay, true),
             "static performance previews are not scoped to required desktop routes");
+        require(motion::agent::compatibility_copy_requires_renderer_stop(
+                true, true) &&
+            !motion::agent::compatibility_copy_requires_renderer_stop(
+                true, false) &&
+            !motion::agent::compatibility_copy_requires_renderer_stop(
+                false, true),
+            "an undecodable compatibility source can still deadlock its own first-frame barrier");
 
         using motion::agent::optimization_renderer_is_static;
         using motion::agent::RuntimeAction;
@@ -1998,6 +2005,28 @@ namespace
             "portrait CPU playback no longer preserves source aspect ratio");
     }
 
+    void video_import_limits_allow_8k_and_240_fps()
+    {
+        require(motion::app::video_import_dimensions_allowed(7680, 4320) &&
+            motion::app::video_import_dimensions_allowed(4320, 7680) &&
+            motion::app::video_import_dimensions_allowed(3840, 2160),
+            "valid landscape, portrait, or 4K video was rejected by the 8K import limit");
+        require(!motion::app::video_import_dimensions_allowed(7681, 4320) &&
+            !motion::app::video_import_dimensions_allowed(7680, 4321) &&
+            !motion::app::video_import_dimensions_allowed(8192, 4320) &&
+            !motion::app::video_import_dimensions_allowed(0, 4320),
+            "video outside the UHD 8K envelope passed import validation");
+        require(motion::app::video_import_frame_rate_allowed(240, 1) &&
+            motion::app::video_import_frame_rate_allowed(240000, 1001) &&
+            motion::app::video_import_frame_rate_allowed(239760, 1000),
+            "a valid 240 or 239.76 FPS video was rejected");
+        require(!motion::app::video_import_frame_rate_allowed(241, 1) &&
+            !motion::app::video_import_frame_rate_allowed(240001, 1000) &&
+            !motion::app::video_import_frame_rate_allowed(0, 1) &&
+            !motion::app::video_import_frame_rate_allowed(60, 0),
+            "an invalid or above-240 FPS video passed import validation");
+    }
+
     void variant_requests_use_last_writer_wins(fs::path const& root)
     {
         auto mediaDirectory = root / L"variant-request-order";
@@ -2397,6 +2426,16 @@ namespace
         require(cpuPlayback.size() == 1 &&
             cpuPlayback[0].backend == VideoTranscodeBackend::softwareOpenH264,
             "CPU playback copy did not force the broadly decodable H.264 encoder");
+        auto acceleratedCpuPlayback = motion::agent::video_transcode_backend_order({
+            VideoTranscodeAdapter{ 0x10de, 8ULL * 1024 * 1024 * 1024,
+                0, 60, 61, true }
+        }, 1920, 1080, 60, true, true, true);
+        require(acceleratedCpuPlayback.size() == 2 &&
+            acceleratedCpuPlayback[0].backend == VideoTranscodeBackend::nvidiaNvenc &&
+            acceleratedCpuPlayback[1].backend == VideoTranscodeBackend::softwareOpenH264 &&
+            motion::agent::video_transcode_backend_codec(
+                acceleratedCpuPlayback[0].backend, true) == VideoTranscodeCodec::H264,
+            "CPU playback copy did not prefer hardware H.264 before its software fallback");
         require(motion::agent::video_transcode_backend_order(
             {}, 1920, 1080, 60, true, false, true).empty(),
             "HDR or high-bit-depth video was destructively converted for CPU playback");
@@ -4030,6 +4069,7 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(manual_selection_wins_over_group_randomization());
         RUN_TEST(identical_media_share_one_renderer());
         RUN_TEST(video_variant_policy_preserves_quality_priority());
+        RUN_TEST(video_import_limits_allow_8k_and_240_fps());
         RUN_TEST(variant_requests_use_last_writer_wins(root));
         RUN_TEST(same_mode_variant_retry_rejects_stale_worker(root));
         RUN_TEST(video_transcoder_fails_closed_without_backend(root));

@@ -98,6 +98,17 @@ namespace motion::agent
         return action == RuntimeAction::DesktopPlay && performanceCopyRequired;
     }
 
+    // An automatic cpu-smooth copy exists specifically because the current
+    // Renderer route cannot decode the source. Asking that failed route to
+    // freeze creates a deadlock before either a poster or a stopped state can
+    // become the generation barrier. Stop only that route first; the original
+    // file remains untouched.
+    [[nodiscard]] constexpr bool compatibility_copy_requires_renderer_stop(
+        bool performanceCopyRequired, bool softwarePlaybackTarget) noexcept
+    {
+        return performanceCopyRequired && softwarePlaybackTarget;
+    }
+
     // A transcode may run only after every old source route is known to be
     // stationary or gone. Desktop playback needs its explicit poster/first-
     // frame barrier; freeze/pause need their target ACK; stopped playback must

@@ -849,6 +849,10 @@ namespace motion::agent
                         softwarePlaybackTarget ? rate.softwarePlaybackConversionAllowed :
                             rate.softwareFallbackAllowed,
                         softwarePlaybackTarget });
+                    if (softwarePlaybackTarget) {
+                        append_log(logRoot_, L"源视频无法直接播放，已排队生成 H.264 兼容副本: " +
+                            source.filename().wstring());
+                    }
                     condition_.notify_one();
                     queued = true;
                 } else if (mayEnqueue && !activeCurrent && queued) {
@@ -1796,6 +1800,9 @@ namespace motion::agent
                     };
                 }
                 VideoTranscodeCodec selectedCodec{};
+                auto copyLabel = request.softwarePlaybackTarget
+                    ? std::wstring(L"H.264 兼容副本")
+                    : std::wstring(L"优化副本");
                 auto result = transcode_video(
                     ffmpeg_,
                     *stableSource, temporary, request.width, request.height, targetFps,
@@ -1808,7 +1815,8 @@ namespace motion::agent
                     return result;
                 }
                 if (result != VideoTranscodeResult::succeeded) {
-                    append_log(logRoot_, L"优化 " + std::to_wstring(targetFps) + L" FPS 不可用: " + error);
+                    append_log(logRoot_, copyLabel + L" " +
+                        std::to_wstring(targetFps) + L" FPS 不可用: " + error);
                     removeTemporaryIfTrusted();
                     return result;
                 }
@@ -1845,7 +1853,7 @@ namespace motion::agent
                 }
                 if (!matchingDimensions || !matchingRate || !matchingCodec ||
                     !matchingVisualMetadata || !matchingDuration || !decodesFirstFrame) {
-                    append_log(logRoot_, L"优化副本校验失败（实际 " +
+                    append_log(logRoot_, copyLabel + L"校验失败（实际 " +
                         std::to_wstring(actual.width) + L"x" + std::to_wstring(actual.height) + L", " +
                         std::to_wstring(actual.numerator) + L"/" + std::to_wstring(actual.denominator) +
                         L" FPS，时长 " + std::to_wstring(actual.duration100ns / 10'000) +
@@ -1871,7 +1879,8 @@ namespace motion::agent
                     return finalControl == VideoTranscodeControl::paused
                         ? VideoTranscodeResult::paused : VideoTranscodeResult::cancelled;
                 }
-                append_log(logRoot_, L"优化副本实际帧率: " + std::to_wstring(targetFps) + L" FPS；编码后端: " +
+                append_log(logRoot_, copyLabel + L"实际帧率: " +
+                    std::to_wstring(targetFps) + L" FPS；编码后端: " +
                     (selectedBackend.empty() ? std::wstring(L"未知") : selectedBackend) + L"。");
                 if (!current_variant(*stableSource, destinationAccess->path)) {
                     RemoveVariantIfUnleased(request.destination, nullptr, true);

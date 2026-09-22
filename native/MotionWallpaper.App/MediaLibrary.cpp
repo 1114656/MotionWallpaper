@@ -419,10 +419,18 @@ namespace
                 static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, mediaType.put()));
             UINT32 width{}, height{};
             winrt::check_hresult(MFGetAttributeSize(mediaType.get(), MF_MT_FRAME_SIZE, &width, &height));
-            if (!width || !height || width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
-                height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
-                static_cast<uint64_t>(width) * height > maximumDecodedPixels) {
-                throw std::runtime_error("video dimensions exceed safety limit");
+            if (!motion::app::video_import_dimensions_allowed(width, height)) {
+                throw std::runtime_error("video resolution exceeds 8K import limit");
+            }
+            UINT32 frameRateNumerator{}, frameRateDenominator{};
+            winrt::check_hresult(MFGetAttributeRatio(mediaType.get(), MF_MT_FRAME_RATE,
+                &frameRateNumerator, &frameRateDenominator));
+            if (!frameRateNumerator || !frameRateDenominator) {
+                throw std::runtime_error("video frame rate is invalid");
+            }
+            if (!motion::app::video_import_frame_rate_allowed(
+                    frameRateNumerator, frameRateDenominator)) {
+                throw std::runtime_error("video frame rate exceeds 240 FPS import limit");
             }
             MFShutdown();
         } catch (...) {

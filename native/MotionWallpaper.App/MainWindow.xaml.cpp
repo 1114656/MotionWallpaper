@@ -1294,9 +1294,14 @@ namespace winrt::MotionWallpaper::implementation
             motion::valid_id(pendingSelectionMediaId) &&
             desired.first == pendingSelectionGroupId && desired.second == pendingSelectionMediaId &&
             (desired.first != summaryGroupId || desired.second != summaryMediaId);
-        if (selectionPending) {
+        if (selectionPending ||
+            (!motion::valid_id(summaryGroupId) && motion::valid_id(desired.first) &&
+                motion::valid_id(desired.second))) {
             // A click must be visible immediately even while the Agent waits for
             // the Renderer first-frame ACK or prepares an optimization version.
+            // After an App restart there is no local pending marker, so also
+            // fall back to the durable desired selection when the Agent has no
+            // previously confirmed route to publish.
             summaryGroupId = desired.first;
             summaryMediaId = desired.second;
         }
@@ -2741,10 +2746,28 @@ namespace winrt::MotionWallpaper::implementation
                     completedBytes += fileBytes;
                     ++completedFiles;
                 }
-            } catch (...) {
+            } catch (std::exception const& error) {
                 // Import() aborts its current temporary directory by throwing
                 // after observing the cancellation flag. That is a successful
                 // user cancellation, not a media-format or I/O failure.
+                if (!cancellation->load(std::memory_order_acquire)) {
+                    auto reason = std::string_view(error.what());
+                    if (kind == "video" &&
+                        reason == "video resolution exceeds 8K import limit") {
+                        errorMessage = L"视频超过 UHD 8K 上限（横屏 7680×4320、竖屏 4320×7680），未导入。";
+                    } else if (kind == "video" &&
+                        reason == "video frame rate exceeds 240 FPS import limit") {
+                        errorMessage = L"视频超过 240 FPS 上限，未导入。";
+                    } else if (kind == "video" &&
+                        reason == "video frame rate is invalid") {
+                        errorMessage = L"无法读取有效的视频帧率，未导入。";
+                    } else {
+                        errorMessage = kind == "video"
+                            ? L"导入失败。请确认文件格式受支持且媒体库可写。"
+                            : L"图片导入失败。请确认格式受 Windows 图像组件支持。";
+                    }
+                }
+            } catch (...) {
                 if (!cancellation->load(std::memory_order_acquire)) {
                     errorMessage = kind == "video"
                         ? L"导入失败。请确认文件格式受支持且媒体库可写。"

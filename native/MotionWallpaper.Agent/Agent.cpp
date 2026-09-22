@@ -34,6 +34,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1009,6 +1010,42 @@ namespace
                 ready = renderer->second->TargetReady() && ready;
             }
             return ready;
+        }
+
+        // A compatibility target without a poster cannot ask its failed
+        // source route to produce a first frame. Stop the complete renderer
+        // route (including any displays sharing it), release its playback
+        // lease, and remove it from the desired set. Other independent routes
+        // remain alive while the bounded H.264 copy is generated.
+        [[nodiscard]] bool StopDisplays(
+            std::vector<std::string> const& displayIds)
+        {
+            acknowledgedPresentationKey_.clear();
+            std::vector<std::wstring> keys;
+            for (auto const& displayId : displayIds) {
+                auto route = desiredDisplayKeys_.find(displayId);
+                if (route != desiredDisplayKeys_.end() &&
+                    std::find(keys.begin(), keys.end(), route->second) == keys.end()) {
+                    keys.push_back(route->second);
+                }
+            }
+            bool stopped = true;
+            for (auto const& key : keys) {
+                auto renderer = renderers_.find(key);
+                bool routeStopped = renderer == renderers_.end() ||
+                    renderer->second->Stop();
+                stopped = routeStopped && stopped;
+                if (!routeStopped) continue;
+                if (renderer != renderers_.end()) renderers_.erase(renderer);
+                desiredKeys_.erase(std::remove(desiredKeys_.begin(),
+                    desiredKeys_.end(), key), desiredKeys_.end());
+                for (auto display = desiredDisplayKeys_.begin();
+                    display != desiredDisplayKeys_.end();) {
+                    if (display->second == key) display = desiredDisplayKeys_.erase(display);
+                    else ++display;
+                }
+            }
+            return stopped;
         }
 
         [[nodiscard]] bool TargetReady() const
@@ -2726,19 +2763,41 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 performanceCopyWasRequired = waitingForPerformanceCopy;
 
                 auto performanceCopyPreviewOutputs = outputs;
+                std::vector<std::string> compatibilityCopyStoppedDisplayIds;
+                std::vector<std::string> compatibilityCopyNoPreviewDisplayIds;
                 if (waitingForPerformanceCopy) {
                     for (auto& output : performanceCopyPreviewOutputs) {
                         if (!output.performanceCopyRequired) continue;
                         auto poster = media_poster_by_id(
                             wallpapers, output.groupId, output.mediaId);
+                        bool posterAvailable = !poster.path.empty();
+                        if (motion::agent::compatibility_copy_requires_renderer_stop(
+                                output.performanceCopyRequired,
+                                output.softwarePlaybackTarget) &&
+                            !output.displayId.empty()) {
+                            compatibilityCopyStoppedDisplayIds.push_back(output.displayId);
+                        }
                         if (!poster.path.empty()) {
                             poster.playbackLease = videoOptimizer->AcquirePlaybackLease(poster.path);
                             output.media = std::move(poster);
                             output.decodeAdapter.clear();
                             output.softwarePlaybackTarget = false;
                             output.playbackFrameRateCap = 0;
+                        } else if (motion::agent::compatibility_copy_requires_renderer_stop(
+                                output.performanceCopyRequired,
+                                output.softwarePlaybackTarget) && !posterAvailable &&
+                            !output.displayId.empty()) {
+                            compatibilityCopyNoPreviewDisplayIds.push_back(output.displayId);
                         }
                     }
+                    performanceCopyPreviewOutputs.erase(std::remove_if(
+                        performanceCopyPreviewOutputs.begin(),
+                        performanceCopyPreviewOutputs.end(), [&](auto const& output) {
+                            return std::find(compatibilityCopyNoPreviewDisplayIds.begin(),
+                                compatibilityCopyNoPreviewDisplayIds.end(),
+                                output.displayId) !=
+                                compatibilityCopyNoPreviewDisplayIds.end();
+                        }), performanceCopyPreviewOutputs.end());
                 }
 
                 if (settings.autoLockEnabled &&
@@ -2796,8 +2855,21 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         // freeze before a selected optimization can start. Do
                         // not rely on the later seamless-retirement path: a
                         // slow poster could otherwise overlap the whole encode.
-                        if (renderers.FreezeDisplays(
-                                performanceCopyDisplayIds)) {
+                        bool compatibilityRoutesStopped = renderers.StopDisplays(
+                            compatibilityCopyStoppedDisplayIds);
+                        std::vector<std::string> previewDisplayIds;
+                        std::copy_if(performanceCopyDisplayIds.begin(),
+                            performanceCopyDisplayIds.end(),
+                            std::back_inserter(previewDisplayIds),
+                            [&](auto const& displayId) {
+                                return std::find(
+                                    compatibilityCopyStoppedDisplayIds.begin(),
+                                    compatibilityCopyStoppedDisplayIds.end(),
+                                    displayId) ==
+                                    compatibilityCopyStoppedDisplayIds.end();
+                            });
+                        if (compatibilityRoutesStopped &&
+                            renderers.FreezeDisplays(previewDisplayIds)) {
                             performancePreviewStage =
                                 PerformancePreviewStage::PresentPreview;
                         }
@@ -2808,7 +2880,13 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         // Barrier 2: present posters (or decode only one legacy
                         // source frame) per pending display. Routes without a
                         // missing performance copy remain in DesktopPlay.
-                        if (sourcePresentationMayApply(
+                        bool compatibilityRoutesStopped = renderers.StopDisplays(
+                            compatibilityCopyStoppedDisplayIds);
+                        if (performanceCopyPreviewOutputs.empty()) {
+                            targetReady = compatibilityRoutesStopped &&
+                                renderers.RetiringRoutesStopped();
+                        } else if (compatibilityRoutesStopped &&
+                            sourcePresentationMayApply(
                                 Renderer::Target::DesktopPlay,
                                 performanceCopyPreviewOutputs, true)) {
                             renderers.Apply(Renderer::Target::DesktopPlay,
@@ -2970,6 +3048,31 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                             display.state == "failed") continue;
                         display.state = "applying";
                         display.reason = "freezing-previous-route";
+                    }
+                }
+                if (waitingForPerformanceCopy &&
+                    performancePreviewStage == PerformancePreviewStage::Ready &&
+                    !compatibilityCopyNoPreviewDisplayIds.empty()) {
+                    for (auto& display : currentDisplayStates) {
+                        if (std::find(compatibilityCopyNoPreviewDisplayIds.begin(),
+                                compatibilityCopyNoPreviewDisplayIds.end(),
+                                display.displayId) ==
+                            compatibilityCopyNoPreviewDisplayIds.end()) continue;
+                        auto output = std::find_if(outputs.begin(), outputs.end(),
+                            [&](auto const& candidate) {
+                                return candidate.displayId == display.displayId;
+                            });
+                        if (output == outputs.end()) continue;
+                        display.state = output->performanceCopyPending
+                            ? "optimizing" : "applying";
+                        display.reason = output->performanceCopyPending
+                            ? "compatibility-copy-pending"
+                            : "compatibility-copy-waiting";
+                        display.decodePath = "unavailable";
+                        display.decodeReason = "compatibility-copy-required";
+                        display.rendererProcessId = 0;
+                        display.canRetry = false;
+                        display.canRestartRenderer = false;
                     }
                 }
                 trayStatus = motion::agent::tray_status_with_renderer_health(
