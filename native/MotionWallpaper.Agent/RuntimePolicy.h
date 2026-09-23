@@ -78,10 +78,9 @@ namespace motion::agent
         return !onBattery && (priorityRequest || playbackIdle);
     }
 
-    // Active desktop playback must reflect the selected performance tier or
-    // cpu-smooth compatibility path. A source-file fallback is still safe for
-    // screensaver playback, but it must not appear ready while that copy is
-    // unavailable.
+    // Every visible playback mode uses the selected performance tier or the
+    // compatibility copy. A screen saver must not start the expensive source
+    // or cancel a partially encoded copy merely because the user became idle.
     [[nodiscard]] inline bool active_playback_waits_for_performance_copy(
         bool performanceCopyRequired,
         bool videoSourceFallback) noexcept
@@ -95,7 +94,28 @@ namespace motion::agent
     [[nodiscard]] constexpr bool performance_copy_preview_required(
         RuntimeAction action, bool performanceCopyRequired) noexcept
     {
-        return action == RuntimeAction::DesktopPlay && performanceCopyRequired;
+        return performanceCopyRequired &&
+            (action == RuntimeAction::DesktopPlay || action == RuntimeAction::ScreensaverPlay ||
+                action == RuntimeAction::DesktopFrozen || action == RuntimeAction::DesktopPaused);
+    }
+
+    // An undecodable source remains undecodable when a 30-second screen
+    // saver or a covered-desktop pause changes the presentation target.
+    // Keep its static preview and in-flight conversion across these changes.
+    [[nodiscard]] constexpr bool compatibility_copy_preview_required(
+        RuntimeAction action, bool compatibilityCopyRequired) noexcept
+    {
+        return performance_copy_preview_required(action, compatibilityCopyRequired);
+    }
+
+    // Locking and display power only govern presentation. Once Renderer has
+    // stopped, AC-powered preparation may finish without preventing Windows
+    // from locking, powering down the display, or suspending the machine.
+    [[nodiscard]] constexpr bool hidden_session_generation_allowed(
+        RuntimeAction action, bool onBattery, bool renderersStopped) noexcept
+    {
+        return !onBattery && renderersStopped &&
+            (action == RuntimeAction::Locked || action == RuntimeAction::DisplayOff);
     }
 
     // An automatic cpu-smooth copy exists specifically because the current
@@ -110,18 +130,22 @@ namespace motion::agent
     }
 
     // A transcode may run only after every old source route is known to be
-    // stationary or gone. Desktop playback needs its explicit poster/first-
-    // frame barrier; freeze/pause need their target ACK; stopped playback must
-    // have no active route at all. Retiring routes are checked in every case.
+    // stationary or gone. Live video routes need their explicit freeze ACK;
+    // stopped playback must have no active route. Static image routes do not
+    // own a video decoder and need not interrupt an in-flight encode.
     [[nodiscard]] constexpr bool optimization_renderer_is_static(
         RuntimeAction action, bool waitingForPerformanceCopy,
         bool previewBarrierReady, bool targetReady, bool hasActiveRoute,
-        bool retiringRoutesStopped, bool holdExistingRenderer = false) noexcept
+        bool retiringRoutesStopped, bool holdExistingRenderer = false,
+        bool allVideoRoutesStopped = false) noexcept
     {
-        if (holdExistingRenderer || !retiringRoutesStopped) return false;
-        if (waitingForPerformanceCopy) return previewBarrierReady;
+        if (holdExistingRenderer || (!retiringRoutesStopped && !allVideoRoutesStopped)) return false;
+        // A poster's ACK only confirms its visibility. If every video route
+        // is gone, waiting for that image to appear cannot make transcoding
+        // safer and must not cancel a task that survived a session transition.
+        if (waitingForPerformanceCopy) return previewBarrierReady || allVideoRoutesStopped;
         if (action == RuntimeAction::DesktopFrozen ||
-            action == RuntimeAction::DesktopPaused) return targetReady;
+            action == RuntimeAction::DesktopPaused) return targetReady || !hasActiveRoute;
         if (action == RuntimeAction::Stopped) return !hasActiveRoute;
         return false;
     }

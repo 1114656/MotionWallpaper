@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Destination
+    [string]$Destination,
+    [string]$SdkDestination
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,12 +26,13 @@ function Copy-FfmpegPackage {
     )
     $bin = Join-Path $PackageRoot 'bin'
     $license = Join-Path $PackageRoot 'LICENSE.txt'
-    if (-not (Test-Path -LiteralPath (Join-Path $bin 'ffmpeg.exe')) -or -not (Test-Path -LiteralPath $license)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $bin 'ffmpeg.exe')) -or
+        -not (Test-Path -LiteralPath (Join-Path $bin 'ffprobe.exe')) -or -not (Test-Path -LiteralPath $license)) {
         throw 'The FFmpeg package is incomplete.'
     }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
     Get-ChildItem -LiteralPath $bin -File | Where-Object {
-        $_.Extension -ieq '.dll' -or $_.Name -ieq 'ffmpeg.exe'
+        $_.Extension -ieq '.dll' -or $_.Name -ieq 'ffmpeg.exe' -or $_.Name -ieq 'ffprobe.exe'
     } | Copy-Item -Destination $OutputDirectory -Force
     Copy-Item -LiteralPath $license -Destination (Join-Path $OutputDirectory 'LICENSE-FFmpeg.txt') -Force
     Copy-Item -LiteralPath $NoticePath -Destination $OutputDirectory -Force
@@ -44,6 +46,11 @@ function Copy-FfmpegPackage {
     Copy-Item -LiteralPath $OpenH264LicensePath -Destination (Join-Path $OutputDirectory 'LICENSE-OpenH264.txt') -Force
 
     $publishedFfmpeg = Join-Path $OutputDirectory 'ffmpeg.exe'
+    $publishedFfprobe = Join-Path $OutputDirectory 'ffprobe.exe'
+    $probeVersion = (& $publishedFfprobe -version 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0 -or $probeVersion -notmatch '^ffprobe version ') {
+        throw 'The verified FFmpeg package does not provide a working ffprobe executable.'
+    }
     $encoders = (& $publishedFfmpeg -hide_banner -encoders 2>&1 | Out-String)
     foreach ($requiredEncoder in @(
         'h264_nvenc', 'h264_qsv', 'h264_amf',
@@ -86,6 +93,12 @@ try {
     Expand-Archive -LiteralPath $archive -DestinationPath $expanded
     $packages = @(Get-ChildItem -LiteralPath $expanded -Directory)
     if ($packages.Count -ne 1) { throw 'The FFmpeg archive did not contain exactly one package directory.' }
+    if ($SdkDestination) {
+        New-Item -ItemType Directory -Path $SdkDestination -Force | Out-Null
+        foreach ($directory in @('include', 'lib')) {
+            Copy-Item -LiteralPath (Join-Path $packages[0].FullName $directory) -Destination $SdkDestination -Recurse -Force
+        }
+    }
     Copy-FfmpegPackage `
         -PackageRoot $packages[0].FullName `
         -OutputDirectory $Destination `

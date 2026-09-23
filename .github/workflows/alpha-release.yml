@@ -132,12 +132,27 @@ jobs:
           '@
           }
           $notes = $notes.Replace('{{VALIDATION}}', $validation)
+          $versionNotes = "docs/RELEASE_$version.md"
+          if (Test-Path -LiteralPath $versionNotes) {
+            $notes = Get-Content -LiteralPath $versionNotes -Raw
+            $sourceRoot = "https://github.com/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_REF_NAME"
+            $notes = [regex]::Replace($notes, '\]\((?![a-zA-Z]+:|#)([^)]+)\)', {
+              param($match)
+              $path = $match.Groups[1].Value
+              if ($path.StartsWith('../')) {
+                return "]($sourceRoot/$($path.Substring(3)))"
+              }
+              return "]($sourceRoot/docs/$path)"
+            })
+          }
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -LiteralPath $notesPath -Value $notes -Encoding utf8
           $releaseArguments = @(
             'release', 'create', $env:GITHUB_REF_NAME,
             $installer, $installerChecksum, $archive, $checksum,
             '--repo', $env:GITHUB_REPOSITORY,
             '--title', "MotionWallpaper v$version（$($release.EditionName)）",
-            '--notes', $notes,
+            '--notes-file', $notesPath,
             '--verify-tag'
           )
           if ($release.IsPrerelease) { $releaseArguments += '--prerelease' }

@@ -135,6 +135,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $visualStudioPath 'VC\Auxiliary\VS\l
     $msbuildLibraryOverrides += '-p:VC_VS_LibraryPath_VC_VS_x64='
 }
 
+& (Join-Path $PSScriptRoot 'prepare-ffmpeg.ps1') -Destination (Join-Path $projectRoot 'native\x64\Release\MotionWallpaper.App\Tools\ffmpeg') -SdkDestination (Join-Path $projectRoot '.tools\ffmpeg-sdk')
 & $msbuild $solution -t:Restore "-m:$maximumBuildNodes" -nr:false @msbuildLibraryOverrides
 if ($LASTEXITCODE -ne 0) { throw "NuGet restore failed with exit code $LASTEXITCODE" }
 
@@ -142,6 +143,9 @@ if ($LASTEXITCODE -ne 0) { throw "NuGet restore failed with exit code $LASTEXITC
 if ($LASTEXITCODE -ne 0) { throw "Native build failed with exit code $LASTEXITCODE" }
 
 $testExecutable = Join-Path $projectRoot 'native\x64\Release\MotionWallpaper.Tests\MotionWallpaper.Tests.exe'
+# Import/probe integration tests use the exact tools shipped with the app,
+# including when CI skips publishing the UI payload.
+& (Join-Path $PSScriptRoot 'prepare-ffmpeg.ps1') -Destination (Join-Path (Split-Path -Parent $testExecutable) 'Tools\ffmpeg')
 & $testExecutable
 if ($LASTEXITCODE -ne 0) { throw "Native tests failed with exit code $LASTEXITCODE" }
 

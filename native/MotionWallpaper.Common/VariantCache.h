@@ -17,6 +17,13 @@
 
 namespace motion
 {
+    [[nodiscard]] inline int variant_policy_version(std::wstring_view name) noexcept
+    {
+        if (name.ends_with(L"-v7.mp4")) return 7;
+        if (name.ends_with(L"-v6.mp4")) return 6;
+        if (name.ends_with(L"-v5.mp4")) return 5;
+        return 0;
+    }
     enum class VariantProgressState
     {
         none,
@@ -92,7 +99,7 @@ namespace motion
             if (entry.fileName.empty() || !entry.bytes) continue;
             if (!best || rank(entry) < rank(*best) ||
                 (rank(entry) == rank(*best) &&
-                    entry.fileName.ends_with(L"-v5.mp4") && !best->fileName.ends_with(L"-v5.mp4"))) {
+                    variant_policy_version(entry.fileName) > variant_policy_version(best->fileName))) {
                 best = &entry;
             }
         }
@@ -114,7 +121,7 @@ namespace motion
                 std::error_code itemError;
                 if (!entries->is_regular_file(itemError) || itemError || !entries->file_size(itemError) || itemError) continue;
                 auto name = entries->path().filename().wstring();
-                if (!name.starts_with(L"cpu-smooth-") || !name.ends_with(L"-v5.mp4")) continue;
+                if (!name.starts_with(L"cpu-smooth-") || !variant_policy_version(name)) continue;
                 auto modified = entries->last_write_time(itemError);
                 if (itemError) continue;
                 if (best.empty() || modified > bestTime) {
@@ -198,6 +205,10 @@ namespace motion
                 auto name = entries->path().filename().wstring();
                 if (!name.starts_with(prefix) || name == keepFileName ||
                     name.ends_with(L".part.mp4") || entries->path().extension() != L".mp4") continue;
+                // Keep completed v6 specifications across monitor/profile
+                // changes. Global quota/LRU removes unleased files instead of
+                // throwing away a usable copy each time the topology changes.
+                if (variant_policy_version(name) >= 6) continue;
                 bool removed = removeCandidate
                     ? removeCandidate(entries->path())
                     : std::filesystem::remove(entries->path(), itemError);
@@ -698,12 +709,27 @@ namespace motion
         return complete_variant_generation(mediaDirectory, current);
     }
 
+    inline std::string variant_failure_mode(std::string_view record)
+    {
+        auto mode = record.substr(0, record.find('\n'));
+        return mode == "balanced" || mode == "power-saver" || mode == "cpu-smooth" ? std::string(mode) : std::string{};
+    }
+
+    inline bool variant_failure_context_matches(std::string_view record,
+        std::string_view mode, std::string_view context)
+    {
+        auto newline = record.find('\n');
+        return !context.empty() && newline != std::string_view::npos &&
+            record.substr(0, newline) == mode && record.substr(newline + 1) == context;
+    }
+
     inline bool fail_variant_generation(std::filesystem::path const& mediaDirectory,
-        VariantGenerationRequest const& expected) noexcept
+        VariantGenerationRequest const& expected, std::string const& context = {}) noexcept
     {
         auto locked = lock_variant_request(mediaDirectory, expected);
         if (!locked) return false;
-        if (!write_small_file(variant_failed_path(mediaDirectory), expected.mode)) return false;
+        if (!write_small_file(variant_failed_path(mediaDirectory), expected.mode +
+            (context.empty() ? std::string{} : "\n" + context))) return false;
         if (!mark_locked_request_for_deletion(locked.get())) {
             std::error_code ignored;
             std::filesystem::remove(variant_failed_path(mediaDirectory), ignored);
@@ -732,8 +758,10 @@ namespace motion
             result.queued = !result.requestedMode.empty();
             result.paused = result.queued && variant_generation_paused(mediaDirectory);
             auto progress = read_variant_progress(mediaDirectory);
-            if (result.queued && progress && progress->mode == result.requestedMode &&
-                progress->requestId == request.requestId) {
+            bool internalProgress = !request && progress && progress->mode == "cpu-smooth" &&
+                progress->requestId.empty();
+            if (progress && ((result.queued && progress->mode == result.requestedMode &&
+                    progress->requestId == request.requestId) || internalProgress)) {
                 result.waitingForPower = !result.paused &&
                     progress->state == VariantProgressState::waitingForPower;
                 result.progressPercent = progress->percent;
@@ -754,8 +782,7 @@ namespace motion
                 char value[32]{};
                 DWORD read{};
                 if (failure && ReadFile(failure.get(), value, sizeof(value) - 1, &read, nullptr)) {
-                    std::string mode(value, value + read);
-                    if (mode == "balanced" || mode == "power-saver") result.failedMode = std::move(mode);
+                    result.failedMode = variant_failure_mode(std::string_view(value, read));
                 }
             }
             result.balancedSuppressed = variant_generation_suppressed(mediaDirectory, "balanced");

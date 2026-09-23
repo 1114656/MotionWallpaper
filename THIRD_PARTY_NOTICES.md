@@ -4,7 +4,7 @@ MotionWallpaper 的 MIT License 仅适用于本仓库的原创源代码。第三
 
 ## FFmpeg
 
-可选的性能副本后端调用未经修改的 FFmpeg 可执行文件和动态链接库，来源为 BtbN Windows x64 LGPL shared build，按照 GNU LGPL v3 授权。二进制负载会在 `Tools/ffmpeg` 中保留对应许可证和声明。
+性能副本后端调用未经修改的 FFmpeg 可执行文件；系统缺少解码器时，原画播放器动态加载同目录的 FFmpeg 共享库作为备用解码器。二者均来源于固定版本的 BtbN Windows x64 LGPL shared build，按照 GNU LGPL v3 授权。二进制负载会在 `Tools/ffmpeg` 中保留对应许可证和声明，不向 Windows 注册系统解码器。
 
 - 项目主页：https://ffmpeg.org/
 - 构建分发：https://github.com/BtbN/FFmpeg-Builds

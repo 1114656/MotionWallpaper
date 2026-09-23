@@ -1,7 +1,4 @@
 #include <windows.h>
-#include <mfapi.h>
-#include <mfidl.h>
-#include <mfreadwrite.h>
 #include <wincodec.h>
 #include <winrt/base.h>
 
@@ -16,6 +13,7 @@
 
 #include "ThumbnailGenerator.h"
 #include "../MotionWallpaper.Common/Common.h"
+#include "../MotionWallpaper.Common/MediaProbe.h"
 
 namespace fs = std::filesystem;
 
@@ -128,37 +126,14 @@ namespace
             std::error_code ignored;
             fs::remove(temporary, ignored);
             auto arguments = std::vector<std::wstring>{
-                ffmpeg.wstring(), L"-nostdin", L"-hide_banner", L"-loglevel", L"error", L"-y",
+                L"-nostdin", L"-hide_banner", L"-loglevel", L"error", L"-y",
+                L"-threads", L"2", L"-filter_threads", L"1",
                 L"-ss", L"0", L"-i", source.wstring(), L"-map", L"0:v:0", L"-frames:v", L"1",
                 L"-vf", L"scale=480:270:force_original_aspect_ratio=decrease",
                 L"-pix_fmt", L"rgb24", L"-f", L"image2", temporary.wstring()
             };
-            auto command = motion::build_command_line(arguments);
-            STARTUPINFOW startup{ sizeof(startup) };
-            startup.dwFlags = STARTF_USESHOWWINDOW;
-            startup.wShowWindow = SW_HIDE;
-            PROCESS_INFORMATION process{};
-            if (!CreateProcessW(ffmpeg.c_str(), command.data(), nullptr, nullptr, FALSE,
-                CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, ffmpeg.parent_path().c_str(),
-                &startup, &process)) return false;
-            motion::unique_handle processHandle(process.hProcess);
-            motion::unique_handle threadHandle(process.hThread);
-            motion::unique_handle job(CreateJobObjectW(nullptr, nullptr));
-            if (job) {
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                if (!SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
-                    !AssignProcessToJobObject(job.get(), processHandle.get())) job.reset();
-            }
-            auto wait = WaitForSingleObject(processHandle.get(), 30'000);
-            if (wait != WAIT_OBJECT_0) {
-                TerminateProcess(processHandle.get(), ERROR_TIMEOUT);
-                WaitForSingleObject(processHandle.get(), 2000);
-                fs::remove(temporary, ignored);
-                return false;
-            }
-            DWORD exitCode{};
-            if (!GetExitCodeProcess(processHandle.get(), &exitCode) || exitCode || !suitable_cover(temporary)) {
+            if (!motion::media_tool_detail::run_bounded(ffmpeg, arguments, 30'000) ||
+                    !suitable_cover(temporary)) {
                 fs::remove(temporary, ignored);
                 return false;
             }
@@ -208,97 +183,9 @@ namespace motion::app
 
     bool ThumbnailGenerator::GenerateVideoCover(fs::path const& source, fs::path const& destination)
     {
-        if (FAILED(MFStartup(MF_VERSION))) return false;
-        bool succeeded = false;
-        auto temporary = destination;
-        temporary += L".tmp";
-        try {
-            winrt::com_ptr<IMFAttributes> attributes;
-            winrt::check_hresult(MFCreateAttributes(attributes.put(), 2));
-            winrt::check_hresult(attributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE));
-            winrt::check_hresult(attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE));
-            winrt::com_ptr<IMFSourceReader> reader;
-            winrt::check_hresult(MFCreateSourceReaderFromURL(source.c_str(), attributes.get(), reader.put()));
-            winrt::check_hresult(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE));
-            winrt::check_hresult(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE));
-
-            winrt::com_ptr<IMFMediaType> native;
-            winrt::check_hresult(reader->GetNativeMediaType(
-                static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, native.put()));
-            UINT nativeWidth{}, nativeHeight{};
-            winrt::check_hresult(MFGetAttributeSize(
-                native.get(), MF_MT_FRAME_SIZE, &nativeWidth, &nativeHeight));
-            auto [requestedWidth, requestedHeight] = thumbnail_size(nativeWidth, nativeHeight);
-
-            winrt::com_ptr<IMFMediaType> requested;
-            winrt::check_hresult(MFCreateMediaType(requested.put()));
-            winrt::check_hresult(requested->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
-            winrt::check_hresult(requested->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32));
-            winrt::check_hresult(MFSetAttributeSize(
-                requested.get(), MF_MT_FRAME_SIZE, requestedWidth, requestedHeight));
-            winrt::check_hresult(reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, requested.get()));
-
-            winrt::com_ptr<IMFSample> sample;
-            for (int attempt = 0; attempt < 120 && !sample; ++attempt) {
-                DWORD stream{}, flags{};
-                LONGLONG timestamp{};
-                winrt::check_hresult(reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &stream, &flags, &timestamp, sample.put()));
-                if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
-            }
-            if (!sample) throw winrt::hresult_error(E_FAIL);
-
-            winrt::com_ptr<IMFMediaType> actual;
-            winrt::check_hresult(reader->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), actual.put()));
-            UINT width{}, height{};
-            winrt::check_hresult(MFGetAttributeSize(actual.get(), MF_MT_FRAME_SIZE, &width, &height));
-            LONG sourceStride{};
-            UINT32 strideValue{};
-            if (SUCCEEDED(actual->GetUINT32(MF_MT_DEFAULT_STRIDE, &strideValue))) sourceStride = static_cast<LONG>(strideValue);
-            else winrt::check_hresult(MFGetStrideForBitmapInfoHeader(MFVideoFormat_RGB32.Data1, width, &sourceStride));
-
-            winrt::com_ptr<IMFMediaBuffer> buffer;
-            winrt::check_hresult(sample->ConvertToContiguousBuffer(buffer.put()));
-            BYTE* sourceBytes{};
-            DWORD maximum{}, current{};
-            winrt::check_hresult(buffer->Lock(&sourceBytes, &maximum, &current));
-            bool bufferLocked = true;
-            UINT targetStride{};
-            std::vector<BYTE> pixels;
-            try {
-                if (width > UINT_MAX / 4) throw winrt::hresult_error(E_INVALIDARG);
-                targetStride = width * 4;
-                uint64_t pixelBytes = static_cast<uint64_t>(targetStride) * height;
-                uint64_t sourceRowBytes = sourceStride < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(sourceStride)) : static_cast<uint64_t>(sourceStride);
-                uint64_t requiredBytes = height ? sourceRowBytes * (height - 1) + targetStride : 0;
-                if (!height || pixelBytes > UINT_MAX || sourceRowBytes < targetStride || requiredBytes > current) {
-                    throw winrt::hresult_error(E_INVALIDARG);
-                }
-                pixels.resize(static_cast<size_t>(pixelBytes));
-                auto row = sourceBytes;
-                if (sourceStride < 0) row += static_cast<size_t>(height - 1) * static_cast<size_t>(-static_cast<int64_t>(sourceStride));
-                for (UINT y = 0; y < height; ++y) {
-                    memcpy(pixels.data() + static_cast<size_t>(y) * targetStride, row, targetStride);
-                    row += sourceStride;
-                }
-                auto unlockResult = buffer->Unlock();
-                bufferLocked = false;
-                winrt::check_hresult(unlockResult);
-            } catch (...) {
-                if (bufferLocked) buffer->Unlock();
-                throw;
-            }
-
-            auto imaging = imaging_factory();
-            winrt::com_ptr<IWICBitmap> bitmap;
-            winrt::check_hresult(imaging->CreateBitmapFromMemory(width, height, GUID_WICPixelFormat32bppBGR,
-                targetStride, static_cast<UINT>(pixels.size()), pixels.data(), bitmap.put()));
-            write_thumbnail(bitmap.get(), destination);
-            succeeded = true;
-        } catch (...) {
-            std::error_code ignored;
-            fs::remove(temporary, ignored);
-        }
-        MFShutdown();
-        return succeeded || generate_video_cover_with_ffmpeg(source, destination);
+        // Third-party system decoders can block inside synchronous ReadSample.
+        // Keep all video decoding in the bounded FFmpeg child, including the
+        // first attempt; a missing tool or timeout leaves the cover unavailable.
+        return generate_video_cover_with_ffmpeg(source, destination);
     }
 }

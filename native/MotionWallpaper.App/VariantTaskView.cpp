@@ -42,11 +42,11 @@ namespace motion::app
         bool taskWaitingForPower = item.status.waitingForPower ||
             (waitingForPower && !item.status.generating);
         std::wstring stateLabel;
-        if (item.status.paused) stateLabel = L"已暂停";
+        if (item.status.paused) stateLabel = L"已停止 · 再次生成会从头开始";
         else if (item.status.generating) stateLabel = L"正在优化";
         else if (taskWaitingForPower) stateLabel = L"等待接通电源";
         else stateLabel = L"等待优化";
-        if (item.status.progressKnown) {
+        if (item.status.progressKnown && !item.status.paused) {
             stateLabel += L" · " + std::to_wstring(item.status.progressPercent) + L"%";
         }
         if (item.status.generating && item.status.estimatedRemainingKnown) {
@@ -69,8 +69,10 @@ namespace motion::app
                 card.progress, hstring(context + L"，" + stateLabel));
         }
         if (card.pause) {
-            auto actionLabel = item.status.paused ? std::wstring(L"继续") : std::wstring(L"暂停");
+            auto actionLabel = item.status.paused ? std::wstring(L"重新生成") : std::wstring(L"停止");
             card.pause.Content(box_value(actionLabel));
+            ToolTipService::SetToolTip(card.pause, box_value(item.status.paused
+                ? L"从头生成完整副本" : L"停止本次生成；下次会从头开始，原文件保留"));
             // The click handler reads this current value rather than capturing
             // the state that existed when the card was first constructed.
             card.pause.Tag(box_value(item.status.paused));

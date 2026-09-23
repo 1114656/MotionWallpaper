@@ -1,4 +1,6 @@
 #include "VideoTranscoder.h"
+#include "VideoTranscodeColorPolicy.h"
+#include "VideoGpuProbe.h"
 
 #include "../MotionWallpaper.Common/Common.h"
 
@@ -16,6 +18,8 @@
 #include <cstdio>
 #include <limits>
 #include <optional>
+#include <mutex>
+#include <set>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -31,50 +35,24 @@ namespace
     constexpr uint64_t softwarePixelRateLimit =
         static_cast<uint64_t>(2560) * 1440 * 60;
 
-    std::vector<motion::agent::VideoTranscodeAdapter> installed_adapters(bool& succeeded)
+    std::vector<motion::agent::VideoTranscodeAdapter> installed_adapters(bool& succeeded,
+        std::function<bool()> const& cancelled)
     {
-        std::vector<motion::agent::VideoTranscodeAdapter> result;
-        ComPtr<IDXGIFactory1> factory;
-        succeeded = SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
-        if (!succeeded) return result;
-        for (UINT index = 0;; ++index) {
-            ComPtr<IDXGIAdapter1> adapter;
-            auto status = factory->EnumAdapters1(index, &adapter);
-            if (status == DXGI_ERROR_NOT_FOUND) break;
-            if (FAILED(status)) {
-                succeeded = false;
-                result.clear();
-                return result;
-            }
-            DXGI_ADAPTER_DESC1 description{};
-            if (FAILED(adapter->GetDesc1(&description)) ||
-                (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
-            result.push_back({ description.VendorId,
-                static_cast<uint64_t>(description.DedicatedVideoMemory), index,
-                description.AdapterLuid.HighPart, description.AdapterLuid.LowPart, true });
-        }
-        return result;
+        auto inventory = motion::agent::video_gpu_inventory_bounded(cancelled);
+        succeeded = inventory.succeeded;
+        return inventory.adapters;
     }
 
     std::optional<uint32_t> current_dxgi_adapter_index(
-        motion::agent::VideoTranscodeAdapter const& expected)
+        motion::agent::VideoTranscodeAdapter const& expected,
+        std::function<bool()> const& cancelled)
     {
         if (!expected.identityKnown) return std::nullopt;
-        ComPtr<IDXGIFactory1> factory;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || !factory) {
-            return std::nullopt;
-        }
-        for (UINT index = 0;; ++index) {
-            ComPtr<IDXGIAdapter1> adapter;
-            auto status = factory->EnumAdapters1(index, &adapter);
-            if (status == DXGI_ERROR_NOT_FOUND) break;
-            if (FAILED(status) || !adapter) return std::nullopt;
-            DXGI_ADAPTER_DESC1 description{};
-            if (FAILED(adapter->GetDesc1(&description))) continue;
-            if (description.VendorId == expected.vendorId &&
-                description.AdapterLuid.HighPart == expected.luidHigh &&
-                description.AdapterLuid.LowPart == expected.luidLow) {
-                return index;
+        auto inventory = motion::agent::video_gpu_inventory_bounded(cancelled);
+        for (auto const& adapter : inventory.adapters) {
+            if (adapter.vendorId == expected.vendorId && adapter.luidHigh == expected.luidHigh &&
+                adapter.luidLow == expected.luidLow) {
+                return adapter.dxgiAdapterIndex;
             }
         }
         return std::nullopt;
@@ -89,52 +67,54 @@ namespace
         return std::clamp(estimate, 4'000u, 60'000u);
     }
 
-    uint64_t probe_duration_100ns(fs::path const& source) noexcept
+    std::wstring source_download_format(motion::VideoProbeInfo const& source)
     {
-        if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) return 0;
-        struct MediaFoundationShutdown
-        {
-            ~MediaFoundationShutdown() { MFShutdown(); }
-        } shutdown;
+        // D3D11/QSV 4:2:0 decode surfaces are determined from the probed
+        // pixel format, not a container extension or an inferred profile.
+        if (source.pixelFormat == "yuv420p" || source.pixelFormat == "nv12") return L"nv12";
+        if (source.pixelFormat == "yuv420p10le" || source.pixelFormat == "p010le") return L"p010le";
+        return {};
+    }
 
-        ComPtr<IMFSourceReader> reader;
-        if (FAILED(MFCreateSourceReaderFromURL(source.c_str(), nullptr, &reader))) return 0;
-        PROPVARIANT duration{};
-        PropVariantInit(&duration);
-        auto status = reader->GetPresentationAttribute(
-            static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE), MF_PD_DURATION, &duration);
-        uint64_t result{};
-        if (SUCCEEDED(status)) {
-            if (duration.vt == VT_UI8) result = duration.uhVal.QuadPart;
-            else if (duration.vt == VT_I8 && duration.hVal.QuadPart > 0) {
-                result = static_cast<uint64_t>(duration.hVal.QuadPart);
-            }
-        }
-        PropVariantClear(&duration);
-        return result;
+    std::mutex encoderFailureMutex;
+    std::set<std::wstring> encoderDriverFailures;
+
+    std::wstring encoder_failure_key(fs::path const& ffmpeg,
+        motion::agent::VideoTranscodeCandidate const& candidate)
+    {
+        if (!candidate.adapterBound || !candidate.adapter.driverVersion) return {};
+        std::error_code error;
+        auto stamp = fs::last_write_time(ffmpeg, error);
+        if (error) return {};
+        auto size = fs::file_size(ffmpeg, error);
+        if (error) return {};
+        return ffmpeg.wstring() + L"|" + std::to_wstring(stamp.time_since_epoch().count()) +
+            L"|" + std::to_wstring(size) + L"|" + std::to_wstring(candidate.adapter.luidHigh) +
+            L":" + std::to_wstring(candidate.adapter.luidLow) + L"|" +
+            std::to_wstring(candidate.adapter.driverVersion) + L"|" +
+            std::to_wstring(static_cast<int>(candidate.backend));
     }
 
     void append_system_memory_input(std::vector<std::wstring>& arguments,
-        fs::path const& source, uint32_t width, uint32_t height, uint32_t targetFps,
-        std::wstring const& format)
+        fs::path const& source, uint32_t, uint32_t, std::wstring const& frameRate,
+        std::wstring const& format, std::wstring const& colorFilter)
     {
         arguments.insert(arguments.end(), {
             // This is an input codec option: cap frame-threaded decoding before
-            // FFmpeg opens a high-frame-rate source. Together with
-            // -filter_threads it prevents a background copy from consuming
-            // nearly every logical processor while preserving full decoding.
+            // FFmpeg opens a high-frame-rate source. Bound decoded frame
+            // buffers independently of the more parallel filter stage.
             L"-threads:v", L"4", L"-i", source.wstring(),
-            L"-map", L"0:v:0", L"-map_metadata", L"0", L"-an", L"-vf",
-            L"fps=" + std::to_wstring(targetFps) + L",scale=" +
-                std::to_wstring(width) + L":" + std::to_wstring(height) +
-                L":flags=lanczos,format=" + format
+            L"-map", L"0:v:0", L"-map_metadata", L"-1", L"-an", L"-vf",
+            L"fps=" + frameRate + L"," + colorFilter + L",format=" + format
         });
     }
 
     void append_hardware_upload_input(std::vector<std::wstring>& arguments,
-        fs::path const& source, uint32_t width, uint32_t height, uint32_t targetFps,
+        fs::path const& source, uint32_t width, uint32_t height, std::wstring const& frameRate,
         std::wstring const& hardwareType, std::wstring const& deviceName,
-        uint32_t dxgiAdapterIndex, std::wstring const& format, bool hardwareDecode)
+        uint32_t dxgiAdapterIndex, std::wstring const& format, bool hardwareDecode,
+        std::wstring const& downloadFormat, std::wstring const& colorFilter, bool upload = true,
+        bool gpuScale = false)
     {
         std::wstring specification;
         if (hardwareType == L"qsv") {
@@ -163,12 +143,21 @@ namespace
             arguments.insert(arguments.end(), { L"-threads:v", L"4" });
         }
         arguments.insert(arguments.end(), {
-            L"-i", source.wstring(), L"-map", L"0:v:0", L"-map_metadata", L"0", L"-an", L"-vf"
+            L"-i", source.wstring(), L"-map", L"0:v:0", L"-map_metadata", L"-1", L"-an", L"-vf"
         });
-        auto filter = L"fps=" + std::to_wstring(targetFps);
-        if (hardwareDecode) filter += L",hwdownload,format=" + format;
-        filter += L",scale=" + std::to_wstring(width) + L":" + std::to_wstring(height) +
-            L":flags=lanczos,format=" + format + L",hwupload";
+        auto filter = L"fps=" + frameRate;
+        if (gpuScale) {
+            // Same color/bit-depth/aspect contract: keep decode surfaces on
+            // the selected physical GPU through resize and hardware encode.
+            filter += hardwareType == L"qsv" ? L",scale_qsv=w=" : L",scale_d3d11=width=";
+            filter += std::to_wstring(width) + (hardwareType == L"qsv" ? L":h=" : L":height=") + std::to_wstring(height) +
+                L":format=nv12,setsar=1,sidedata=mode=delete";
+            arguments.push_back(std::move(filter));
+            return;
+        }
+        if (hardwareDecode) filter += L",hwdownload,format=" + downloadFormat;
+        filter += L"," + colorFilter + L",format=" + format;
+        if (upload) filter += L",hwupload";
         arguments.push_back(std::move(filter));
     }
 
@@ -188,69 +177,92 @@ namespace
         fs::path const& destination,
         uint32_t width,
         uint32_t height,
-        uint32_t targetFps,
+        uint32_t,
         motion::agent::VideoTranscodeCandidate const& candidate,
         motion::agent::VideoTranscodeCodec codec,
         motion::agent::VideoTranscodeRateControl const& rate,
-        bool hardwareDecode)
+        bool hardwareDecode, std::wstring const& downloadFormat,
+        std::wstring const& colorFilter, std::wstring const& frameRate, bool preview = false,
+        bool gpuScale = false, uint32_t cudaIndex = 0)
     {
         using motion::agent::VideoTranscodeBackend;
         using motion::agent::VideoTranscodeCodec;
         std::vector<std::wstring> arguments{
             ffmpeg.wstring(), L"-nostdin", L"-hide_banner", L"-loglevel", L"info", L"-nostats",
-            L"-stats_period", L"0.5", L"-progress", L"pipe:1", L"-filter_threads", L"2", L"-y"
+            L"-stats_period", L"0.5", L"-progress", L"pipe:1", L"-filter_threads",
+            std::to_wstring(motion::agent::video_transcode_worker_threads(std::thread::hardware_concurrency())), L"-y"
         };
         bool h264 = codec == VideoTranscodeCodec::H264;
         auto backend = candidate.backend;
         switch (backend) {
         case VideoTranscodeBackend::nvidiaNvenc:
-            append_hardware_upload_input(arguments, source, width, height, targetFps,
-                L"d3d11va", L"mwm_nvenc", candidate.adapter.dxgiAdapterIndex,
-                h264 ? L"nv12" : L"p010le", hardwareDecode);
+            if (gpuScale) {
+                arguments.insert(arguments.end(), {
+                    L"-init_hw_device", L"cuda=mwm_cuda:" + std::to_wstring(cudaIndex), L"-filter_hw_device", L"mwm_cuda",
+                    L"-hwaccel", L"cuda", L"-hwaccel_device", L"mwm_cuda", L"-hwaccel_output_format", L"cuda",
+                    L"-i", source.wstring(), L"-map", L"0:v:0", L"-map_metadata", L"-1", L"-an", L"-vf",
+                    L"fps=" + frameRate + L",scale_cuda=w=" + std::to_wstring(width) + L":h=" + std::to_wstring(height) +
+                    L":format=nv12:interp_algo=lanczos:passthrough=0,setsar=1,sidedata=mode=delete"
+                });
+            } else {
+                append_hardware_upload_input(arguments, source, width, height, frameRate,
+                    L"d3d11va", L"mwm_nvenc", candidate.adapter.dxgiAdapterIndex,
+                    h264 ? L"nv12" : L"p010le", hardwareDecode, downloadFormat, colorFilter);
+            }
             arguments.insert(arguments.end(), {
                 L"-c:v", h264 ? L"h264_nvenc" : L"hevc_nvenc",
-                L"-preset", L"p5", L"-tune", L"hq",
-                L"-profile:v", h264 ? L"high" : L"main10", L"-rc", L"vbr", L"-cq", L"21",
-                L"-spatial-aq", L"1", L"-temporal-aq", L"1"
+                L"-preset", L"p4", L"-tune", L"hq",
+                L"-profile:v", h264 ? L"high" : L"main10", L"-rc", L"vbr"
             });
             append_bounded_rate(arguments, rate);
             break;
         case VideoTranscodeBackend::intelQsv:
-            append_hardware_upload_input(arguments, source, width, height, targetFps,
+            append_hardware_upload_input(arguments, source, width, height, frameRate,
                 L"qsv", L"mwm_qsv", candidate.adapter.dxgiAdapterIndex,
-                h264 ? L"nv12" : L"p010le", hardwareDecode);
+                h264 ? L"nv12" : L"p010le", hardwareDecode, downloadFormat, colorFilter, true, gpuScale);
             arguments.insert(arguments.end(), {
                 L"-c:v", h264 ? L"h264_qsv" : L"hevc_qsv",
-                L"-preset", L"slow", L"-profile:v", h264 ? L"high" : L"main10",
-                L"-scenario", L"archive", L"-global_quality", L"21"
+                L"-preset", L"medium", L"-profile:v", h264 ? L"high" : L"main10"
             });
             append_bounded_rate(arguments, rate);
             break;
         case VideoTranscodeBackend::amdAmf:
-            append_hardware_upload_input(arguments, source, width, height, targetFps,
+            append_hardware_upload_input(arguments, source, width, height, frameRate,
                 L"d3d11va", L"mwm_amf", candidate.adapter.dxgiAdapterIndex,
-                h264 ? L"nv12" : L"p010le", hardwareDecode);
+                h264 ? L"nv12" : L"p010le", hardwareDecode, downloadFormat, colorFilter, true, gpuScale);
             arguments.insert(arguments.end(), {
                 L"-c:v", h264 ? L"h264_amf" : L"hevc_amf",
-                L"-usage", L"high_quality", L"-quality", L"quality",
+                L"-usage", L"transcoding", L"-quality", L"balanced",
                 L"-profile:v", h264 ? L"high" : L"main10"
             });
             if (!h264) arguments.insert(arguments.end(), { L"-bitdepth", L"10" });
             arguments.insert(arguments.end(), {
-                L"-rc", L"qvbr", L"-qvbr_quality_level", L"21", L"-vbaq", L"1"
+                L"-rc", L"vbr_peak"
             });
             append_bounded_rate(arguments, rate);
             break;
         case VideoTranscodeBackend::softwareOpenH264:
-            append_system_memory_input(arguments, source, width, height, targetFps, L"yuv420p");
+            if (hardwareDecode) {
+                // An unavailable hardware encoder does not imply an unusable
+                // decoder. Keep HEVC decoding on the bound GPU when possible.
+                append_hardware_upload_input(arguments, source, width, height, frameRate,
+                    L"d3d11va", L"mwm_decode", candidate.adapter.dxgiAdapterIndex,
+                    L"yuv420p", true, downloadFormat, colorFilter, false);
+            } else {
+                append_system_memory_input(arguments, source, width, height, frameRate, L"yuv420p", colorFilter);
+            }
             arguments.insert(arguments.end(), {
-                L"-c:v", L"libopenh264", L"-profile:v", L"high", L"-threads", L"2"
+                L"-c:v", L"libopenh264", L"-profile:v", L"high", L"-threads",
+                std::to_wstring(motion::agent::video_transcode_worker_threads(std::thread::hardware_concurrency(), 8))
             });
             append_bounded_rate(arguments, rate);
             break;
         }
+        if (preview) arguments.insert(arguments.end(), { L"-t", L"2" });
         arguments.insert(arguments.end(), {
-            L"-r", std::to_wstring(targetFps), L"-fps_mode", L"cfr", L"-tag:v",
+            L"-color_primaries", L"bt709", L"-color_trc", L"bt709",
+            L"-colorspace", L"bt709", L"-color_range", L"tv",
+            L"-r", frameRate, L"-fps_mode", L"cfr", L"-tag:v",
             h264 ? L"avc1" : L"hvc1",
             L"-movflags", L"+faststart", destination.wstring()
         });
@@ -316,9 +328,22 @@ namespace
             return furthestProcessedMicroseconds_;
         }
 
+        [[nodiscard]] bool DriverIncompatible() const noexcept { return driverIncompatible_; }
+        [[nodiscard]] std::string const& Diagnostics() const noexcept { return diagnostics_; }
+
     private:
         void ParseLine(std::string_view line)
         {
+            driverIncompatible_ = driverIncompatible_ ||
+                motion::agent::video_transcode_driver_incompatible(line);
+            if (line.find("Error") != std::string_view::npos ||
+                line.find("error") != std::string_view::npos ||
+                line.find("Invalid") != std::string_view::npos ||
+                motion::agent::video_transcode_driver_incompatible(line)) {
+                diagnostics_.append(line);
+                diagnostics_ += '\n';
+                if (diagnostics_.size() > 4096) diagnostics_.erase(0, diagnostics_.size() - 4096);
+            }
             auto duration = line.find("Duration: ");
             if (duration != std::string_view::npos) {
                 auto begin = duration + std::string_view("Duration: ").size();
@@ -371,6 +396,8 @@ namespace
         uint64_t durationMicroseconds_{};
         uint64_t furthestProcessedMicroseconds_{};
         std::string buffer_;
+        std::string diagnostics_;
+        bool driverIncompatible_{};
     };
 
     motion::agent::VideoTranscodeResult run_ffmpeg(
@@ -383,11 +410,12 @@ namespace
         uint64_t fallbackDurationMicroseconds,
         motion::agent::VideoTranscodeProgressCallback const& progress,
         uint64_t& resolvedDurationMicroseconds,
-        bool& stalled)
+        bool& stalled, bool& driverIncompatible, uint32_t maximumWallTimeMs = 0)
     {
         using namespace motion::agent;
         using SteadyClock = std::chrono::steady_clock;
         stalled = false;
+        driverIncompatible = false;
         auto command = motion::build_command_line(arguments);
 
         SECURITY_ATTRIBUTES inheritable{ sizeof(inheritable), nullptr, TRUE };
@@ -418,7 +446,7 @@ namespace
         startup.hStdError = progressWrite.get();
         PROCESS_INFORMATION process{};
         if (!CreateProcessW(ffmpeg.c_str(), command.data(), nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW | CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | NORMAL_PRIORITY_CLASS,
             nullptr, ffmpeg.parent_path().c_str(), &startup, &process)) {
             error = L"无法启动 FFmpeg 优化后端";
             return VideoTranscodeResult::failed;
@@ -440,10 +468,12 @@ namespace
         PROCESS_POWER_THROTTLING_STATE powerThrottling{};
         powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
         powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-        powerThrottling.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        // The user-selected copy is a finite foreground-priority job. Keep
+        // playback's power policy separate and opt this worker out of EcoQoS.
+        powerThrottling.StateMask = 0;
         SetProcessInformation(processHandle.get(), ProcessPowerThrottling,
             &powerThrottling, sizeof(powerThrottling));
-        MEMORY_PRIORITY_INFORMATION memoryPriority{ MEMORY_PRIORITY_LOW };
+        MEMORY_PRIORITY_INFORMATION memoryPriority{ MEMORY_PRIORITY_NORMAL };
         SetProcessInformation(processHandle.get(), ProcessMemoryPriority,
             &memoryPriority, sizeof(memoryPriority));
 
@@ -501,6 +531,7 @@ namespace
 
         DWORD waitResult{};
         auto lastPipeActivity = SteadyClock::now();
+        auto startedAt = lastPipeActivity;
         auto lastTimelineAdvance = lastPipeActivity;
         uint64_t furthestTimeline{};
         bool hardwareBackend = backend != VideoTranscodeBackend::softwareOpenH264;
@@ -533,7 +564,8 @@ namespace
                 // activity additionally covers demux/device initialization.
                 // Bound both silence and endlessly-chatty zero-progress hangs
                 // so a wedged hardware driver cannot pin the optimizer forever.
-                if (now - lastPipeActivity >= pipeIdleTimeout ||
+                if ((maximumWallTimeMs && now - startedAt >= std::chrono::milliseconds(maximumWallTimeMs)) ||
+                    now - lastPipeActivity >= pipeIdleTimeout ||
                     now - lastTimelineAdvance >= timelineStallTimeout) {
                     stopAndConfirm(ERROR_TIMEOUT);
                     drainProgress();
@@ -561,6 +593,12 @@ namespace
         if (!GetExitCodeProcess(processHandle.get(), &exitCode)) {
             error = L"无法读取 FFmpeg 优化任务状态";
             return VideoTranscodeResult::failed;
+        }
+        driverIncompatible = progressReader.DriverIncompatible();
+        if (exitCode != 0) {
+            error = video_transcode_backend_name(backend) + L" 编码失败（退出码 " +
+                std::to_wstring(exitCode) + L"）: " +
+                motion::utf8_to_wide(progressReader.Diagnostics());
         }
         return exitCode == 0 ? VideoTranscodeResult::succeeded : VideoTranscodeResult::unsupported;
     }
@@ -616,7 +654,7 @@ namespace motion::agent
         uint32_t height,
         uint32_t targetFps,
         bool adapterProbeSucceeded,
-        bool softwareFallbackAllowed,
+        bool,
         bool softwarePlaybackTarget)
     {
         auto pixelRate = static_cast<uint64_t>(width) * height * targetFps;
@@ -628,7 +666,7 @@ namespace motion::agent
             // available, but retain OpenH264 as the final machine-independent
             // fallback. Software decoding is still attempted with each
             // hardware encoder if the source itself cannot use that GPU.
-            if (!softwareFallbackAllowed || !width || !height || !targetFps ||
+            if (!width || !height || !targetFps ||
                 pixelRate > static_cast<uint64_t>(1920) * 1080 * 60 ||
                 longEdge > 1920 || shortEdge > 1080 || targetFps > 60) {
                 return {};
@@ -658,7 +696,7 @@ namespace motion::agent
             for (auto const& adapter : adapters) appendAdapter(adapter);
         }
 
-        if (softwareFallbackAllowed && width && height && targetFps && pixelRate <= softwarePixelRateLimit &&
+        if (width && height && targetFps && pixelRate <= softwarePixelRateLimit &&
             longEdge <= 2560 && shortEdge <= 1440 && targetFps <= 60) {
             // The software fallback must remain playable on stock Windows
             // systems that do not have an optional HEVC decoder installed.
@@ -678,9 +716,14 @@ namespace motion::agent
         return L"未知后端";
     }
 
-    bool video_candidate_decodes_first_frame(fs::path const& candidate) noexcept
+    int run_video_first_frame_probe(fs::path const& candidate) noexcept
     {
         try {
+            auto comStatus = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            if (FAILED(comStatus) && comStatus != RPC_E_CHANGED_MODE) return 2;
+            struct ComShutdown { bool owned; ~ComShutdown() { if (owned) CoUninitialize(); } } com{ SUCCEEDED(comStatus) };
+            if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) return 2;
+            struct MfShutdown { ~MfShutdown() { MFShutdown(); } } mf;
             auto decodesAs = [&](GUID const& subtype, bool enableVideoProcessing) {
                 ComPtr<IMFAttributes> attributes;
                 if (FAILED(MFCreateAttributes(&attributes, 2))) return false;
@@ -735,9 +778,24 @@ namespace motion::agent
             // NV12 covers stock 8-bit H.264/HEVC output. P010 preserves a
             // Main10 decoder path, while RGB32 gives the source reader one
             // final presentation-friendly conversion route.
-            return decodesAs(MFVideoFormat_NV12, false) ||
+            return (decodesAs(MFVideoFormat_NV12, false) ||
                 decodesAs(MFVideoFormat_P010, false) ||
-                decodesAs(MFVideoFormat_ARGB32, true);
+                decodesAs(MFVideoFormat_ARGB32, true)) ? 0 : 3;
+        } catch (...) {
+            return 3;
+        }
+    }
+
+    bool video_candidate_decodes_first_frame(fs::path const& candidate,
+        std::function<bool()> const& cancelled) noexcept
+    {
+        try {
+            std::wstring executable(32768, L'\0');
+            auto length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+            if (!length || length >= executable.size()) return false;
+            executable.resize(length);
+            return motion::media_tool_detail::run_bounded(executable,
+                { L"--probe-video-first-frame", candidate.wstring() }, 10000, cancelled).has_value();
         } catch (...) {
             return false;
         }
@@ -759,7 +817,9 @@ namespace motion::agent
         VideoTranscodeProgressCallback const& progress,
         VideoTranscodeCandidateValidator const& validateCandidate,
         VideoTranscodeCodec* selectedCodec,
-        VideoTranscodePathAccess const& pathAccess)
+        VideoTranscodePathAccess const& pathAccess,
+        std::function<void(std::wstring const&)> const& diagnostic,
+        VideoTranscodeCandidateValidator const& validatePreview)
     {
         if (selectedBackend) selectedBackend->clear();
         std::error_code fileError;
@@ -777,11 +837,35 @@ namespace motion::agent
             error = L"无法读取源视频大小";
             return VideoTranscodeResult::failed;
         }
-        auto effectiveDuration100ns = sourceDuration100ns
-            ? sourceDuration100ns : probe_duration_100ns(source);
+        std::shared_ptr<void> probeAccess;
+        if (pathAccess) {
+            probeAccess = pathAccess();
+            if (!probeAccess) return VideoTranscodeResult::cancelled;
+        }
+        auto cancelled = [&] { return control() != VideoTranscodeControl::running; };
+        auto sourceInfo = motion::probe_video(ffmpeg, source, 10000, cancelled);
+        if (!sourceInfo) {
+            auto state = control();
+            if (state != VideoTranscodeControl::running) return state == VideoTranscodeControl::paused
+                ? VideoTranscodeResult::paused : VideoTranscodeResult::cancelled;
+            error = L"无法探测源视频；请检查随程序分发的 ffprobe 与视频文件";
+            return VideoTranscodeResult::unsupported;
+        }
+        probeAccess.reset();
+        auto colorPlan = video_transcode_color_plan(*sourceInfo, width, height);
+        if (!colorPlan) {
+            error = L"源视频色彩信息不明确或不受支持，无法安全转换为 SDR 副本";
+            return VideoTranscodeResult::unsupported;
+        }
+        if (diagnostic) {
+            if (colorPlan->toneMapped) diagnostic(L"HDR 副本采用线性光色调映射，输出为 8-bit BT.709 SDR");
+            else if (colorPlan->assumedSdr) diagnostic(L"源视频部分色彩标记缺失，按常见 SDR 视频约定转换为 BT.709");
+        }
+        auto effectiveDuration100ns = sourceInfo->duration100ns ? sourceInfo->duration100ns : sourceDuration100ns;
+        auto frameRate = video_transcode_frame_rate(*sourceInfo, targetFps);
 
         bool adapterProbeSucceeded{};
-        auto adapters = installed_adapters(adapterProbeSucceeded);
+        auto adapters = installed_adapters(adapterProbeSucceeded, cancelled);
         auto candidates = video_transcode_backend_order(std::move(adapters),
             width, height, targetFps, adapterProbeSucceeded, softwareFallbackAllowed,
             softwarePlaybackTarget);
@@ -797,9 +881,21 @@ namespace motion::agent
         }
 
         std::wstring attemptedBackends;
+        auto downloadFormat = source_download_format(*sourceInfo);
+        std::vector<VideoTranscodeCandidate> decoderCandidates;
+        for (auto const& candidate : candidates) {
+            if (candidate.adapterBound) decoderCandidates.push_back(candidate);
+        }
+        std::set<VideoTranscodeBackend> incompatibleDrivers;
         uint32_t attempt{};
         for (auto const& candidate : candidates) {
             auto backend = candidate.backend;
+            if (incompatibleDrivers.contains(backend)) continue;
+            auto failureKey = encoder_failure_key(ffmpeg, candidate);
+            if (!failureKey.empty()) {
+                std::lock_guard lock(encoderFailureMutex);
+                if (encoderDriverFailures.contains(failureKey)) continue;
+            }
             auto codec = video_transcode_backend_codec(backend, softwareFallbackAllowed);
             auto backendName = video_transcode_backend_name(backend);
             if (backend != VideoTranscodeBackend::softwareOpenH264) {
@@ -815,21 +911,39 @@ namespace motion::agent
             attemptedBackends += backendName;
 
             bool hardwareEncoder = backend != VideoTranscodeBackend::softwareOpenH264;
-            auto decodeAttempts = hardwareEncoder ? 2u : 1u;
+            bool canHardwareDecode = !downloadFormat.empty() &&
+                (hardwareEncoder || !decoderCandidates.empty());
+            auto hardwareDecodeAttempts = canHardwareDecode
+                ? hardwareEncoder ? 1u : static_cast<uint32_t>(decoderCandidates.size()) : 0u;
+            bool tryGpuScale = hardwareEncoder && canHardwareDecode &&
+                video_gpu_scale_eligible(*sourceInfo, width, height);
+            auto decodeAttempts = hardwareDecodeAttempts + 1u + (tryGpuScale ? 1u : 0u);
             for (uint32_t decodeAttempt = 0; decodeAttempt < decodeAttempts; ++decodeAttempt) {
-                bool hardwareDecode = hardwareEncoder && decodeAttempt == 0;
+                bool gpuScale = tryGpuScale && decodeAttempt == 0;
+                auto decoderIndex = decodeAttempt - (tryGpuScale && decodeAttempt ? 1u : 0u);
+                bool hardwareDecode = gpuScale || decoderIndex < hardwareDecodeAttempts;
+                uint32_t cudaIndex{};
+                if (gpuScale && backend == VideoTranscodeBackend::nvidiaNvenc) {
+                    auto ordinal = video_cuda_device_bounded(candidate.adapter, cancelled);
+                    if (!ordinal) continue;
+                    cudaIndex = *ordinal;
+                }
                 auto state = control();
                 if (state != VideoTranscodeControl::running) {
                     return state == VideoTranscodeControl::paused
                         ? VideoTranscodeResult::paused : VideoTranscodeResult::cancelled;
                 }
                 auto boundCandidate = candidate;
+                if (!hardwareEncoder && hardwareDecode) {
+                    boundCandidate.adapter = decoderCandidates[decoderIndex].adapter;
+                    boundCandidate.adapterBound = true;
+                }
                 if (boundCandidate.adapterBound) {
                     // Re-resolve immediately before every actual process start;
                     // the DXGI ordinal may change between a fast hardware-
                     // decode rejection and the bounded compatibility attempt.
-                    auto currentIndex = current_dxgi_adapter_index(candidate.adapter);
-                    if (!currentIndex) break;
+                    auto currentIndex = current_dxgi_adapter_index(boundCandidate.adapter, cancelled);
+                    if (!currentIndex) continue;
                     boundCandidate.adapter.dxgiAdapterIndex = *currentIndex;
                 }
                 std::shared_ptr<void> attemptAccess;
@@ -843,12 +957,62 @@ namespace motion::agent
                 fileError.clear();
                 fs::remove(destination, fileError);
                 auto arguments = transcode_arguments(ffmpeg, source, destination, width, height,
-                    targetFps, boundCandidate, codec, rate, hardwareDecode);
+                    targetFps, boundCandidate, codec, rate, hardwareDecode, downloadFormat, colorPlan->filter, frameRate, true, gpuScale, cudaIndex);
                 auto resolvedDurationMicroseconds = effectiveDuration100ns / 10;
                 bool stalled{};
+                bool driverIncompatible{};
                 ++attempt;
+                // Exercise the exact decode/filter/encode/container/Windows
+                // playback chain on two seconds before spending minutes on a
+                // complete file. The preview lives only at the unpublished
+                // temporary destination and is overwritten by the real job.
                 auto result = run_ffmpeg(ffmpeg, arguments, control, error, backend, attempt,
-                    resolvedDurationMicroseconds, progress, resolvedDurationMicroseconds, stalled);
+                    resolvedDurationMicroseconds, {}, resolvedDurationMicroseconds, stalled,
+                    driverIncompatible, 45000);
+                if (result == VideoTranscodeResult::succeeded) {
+                    bool previewValid{};
+                    if (validatePreview) {
+                        previewValid = validatePreview(destination, backend, codec);
+                    } else {
+                        auto previewInfo = motion::probe_video(ffmpeg, destination, 10000, cancelled);
+                        previewValid = previewInfo && previewInfo->codecName == "h264" &&
+                            previewInfo->bitDepth == 8 && previewInfo->pixelFormat == "yuv420p" &&
+                            previewInfo->width == width && previewInfo->height == height &&
+                            previewInfo->colorTransfer == "bt709" && previewInfo->colorPrimaries == "bt709" &&
+                            previewInfo->colorSpace == "bt709" && previewInfo->colorRange == "tv" &&
+                            video_candidate_decodes_first_frame(destination, cancelled);
+                    }
+                    if (!previewValid) {
+                        error = backendName + L" 的短片段预检未通过输出格式或 Windows 播放验证";
+                        result = VideoTranscodeResult::unsupported;
+                    } else {
+                        // The preflight is a separate process. Resolve LUID
+                        // again before starting the full encode, since hotplug
+                        // may have reordered DXGI ordinals during validation.
+                        auto currentIndex = boundCandidate.adapterBound
+                            ? current_dxgi_adapter_index(boundCandidate.adapter, cancelled) : std::optional<uint32_t>{ 0 };
+                        if (currentIndex && gpuScale && backend == VideoTranscodeBackend::nvidiaNvenc) {
+                            auto ordinal = video_cuda_device_bounded(boundCandidate.adapter, cancelled);
+                            if (!ordinal) currentIndex.reset();
+                            else cudaIndex = *ordinal;
+                        }
+                        if (!currentIndex) {
+                            error = backendName + L" 在短片段预检后已不可用";
+                            result = VideoTranscodeResult::unsupported;
+                        } else {
+                            if (boundCandidate.adapterBound) boundCandidate.adapter.dxgiAdapterIndex = *currentIndex;
+                            arguments = transcode_arguments(ffmpeg, source, destination, width, height,
+                                targetFps, boundCandidate, codec, rate, hardwareDecode, downloadFormat, colorPlan->filter, frameRate, false, gpuScale, cudaIndex);
+                            if (diagnostic) diagnostic(gpuScale
+                                ? L"生成优先：硬件解码、GPU 缩放与硬件编码保持在同一显卡，省去内存往返"
+                                : L"生成优先：兼容色彩转换，滤镜线程数 " +
+                                    std::to_wstring(video_transcode_worker_threads(std::thread::hardware_concurrency())));
+                            result = run_ffmpeg(ffmpeg, arguments, control, error, backend, attempt,
+                                resolvedDurationMicroseconds, progress, resolvedDurationMicroseconds, stalled,
+                                driverIncompatible);
+                        }
+                    }
+                }
                 if (!effectiveDuration100ns && resolvedDurationMicroseconds <= UINT64_MAX / 10) {
                     effectiveDuration100ns = resolvedDurationMicroseconds * 10;
                 }
@@ -868,14 +1032,27 @@ namespace motion::agent
                 }
                 if (result != VideoTranscodeResult::succeeded) {
                     fs::remove(destination, fileError);
+                    if (diagnostic && !error.empty()) diagnostic(error);
+                    if (driverIncompatible) {
+                        incompatibleDrivers.insert(backend);
+                        std::lock_guard lock(encoderFailureMutex);
+                        if (encoderDriverFailures.size() >= 128) encoderDriverFailures.clear();
+                        for (auto const& sameBackend : candidates) {
+                            if (sameBackend.backend != backend ||
+                                sameBackend.adapter.driverVersion != candidate.adapter.driverVersion) continue;
+                            auto key = encoder_failure_key(ffmpeg, sameBackend);
+                            if (!key.empty()) encoderDriverFailures.insert(std::move(key));
+                        }
+                        break;
+                    }
                     // A timed-out driver/encoder should not receive another
                     // long-running attempt. A fast hardware-decode rejection
                     // is safe to retry with bounded software decoding.
-                    if (stalled) break;
+                    if (stalled && hardwareEncoder && !gpuScale) break;
                     continue;
                 }
                 if (boundCandidate.adapterBound) {
-                    auto currentIndex = current_dxgi_adapter_index(boundCandidate.adapter);
+                    auto currentIndex = current_dxgi_adapter_index(boundCandidate.adapter, cancelled);
                     if (!currentIndex || *currentIndex != boundCandidate.adapter.dxgiAdapterIndex) {
                         fs::remove(destination, fileError);
                         break;
@@ -891,11 +1068,12 @@ namespace motion::agent
                 }
                 if (validateCandidate && !validateCandidate(destination, backend, codec)) {
                     fs::remove(destination, fileError);
+                    if (gpuScale) continue;
                     break;
                 }
                 if (selectedBackend) {
                     *selectedBackend = backendName + (hardwareDecode
-                        ? L"（硬件解码）" : L"（兼容解码）");
+                        ? gpuScale ? L"（硬件解码、GPU 缩放）" : L"（硬件解码）" : L"（兼容解码）");
                 }
                 if (selectedCodec) *selectedCodec = codec;
                 // Timeline progress remains capped at 99 here. The optimizer

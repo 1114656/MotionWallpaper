@@ -11,6 +11,7 @@
 #include "../MotionWallpaper.Agent/SharedRendererPolicy.h"
 #include "../MotionWallpaper.Agent/TrayControlPolicy.h"
 #include "../MotionWallpaper.Agent/VideoOptimizer.h"
+#include "../MotionWallpaper.Agent/VideoGpuProbe.h"
 #include "../MotionWallpaper.Agent/VideoVariantPolicy.h"
 #include "../MotionWallpaper.Agent/VideoTranscoder.h"
 #include "../MotionWallpaper.Renderer/ResidencyPolicy.h"
@@ -25,6 +26,22 @@
 #include "../MotionWallpaper.App/LibraryMigration.h"
 #include "../MotionWallpaper.App/MediaLibrary.h"
 #include "LibraryBackupTests.h"
+#include "TranscodeLifecycleTests.h"
+#include "VideoTranscodeColorTests.h"
+#include "VideoStillPreviewTests.h"
+#include "MediaProbeTests.h"
+#include "OriginalPlaybackRecoveryTests.h"
+#include "OriginalPlaybackTests.h"
+#include "SessionAndDiagnosticTests.h"
+#include "StartupEnvironmentTests.h"
+#include "VideoGpuProbeTests.h"
+#include "RendererPipeTests.h"
+#include "SwapChainTimingTests.h"
+#include "DisplayRefreshRoutingTests.h"
+#include "SoftwareVideoTransferTests.h"
+#include "ArchitectureRegressionTests.h"
+#include "BuiltinVideoTests.h"
+#include "../MotionWallpaper.Common/MediaProbe.h"
 
 #include <winrt/base.h>
 
@@ -912,9 +929,9 @@ namespace
                 motion::agent::RuntimeAction::DesktopPlay, true) &&
             !motion::agent::performance_copy_preview_required(
                 motion::agent::RuntimeAction::DesktopPlay, false) &&
-            !motion::agent::performance_copy_preview_required(
+            motion::agent::performance_copy_preview_required(
                 motion::agent::RuntimeAction::ScreensaverPlay, true),
-            "static performance previews are not scoped to required desktop routes");
+            "required performance previews do not survive the screen saver");
         require(motion::agent::compatibility_copy_requires_renderer_stop(
                 true, true) &&
             !motion::agent::compatibility_copy_requires_renderer_stop(
@@ -925,6 +942,17 @@ namespace
 
         using motion::agent::optimization_renderer_is_static;
         using motion::agent::RuntimeAction;
+        for (auto action : { RuntimeAction::DesktopPlay, RuntimeAction::ScreensaverPlay,
+                RuntimeAction::DesktopPaused, RuntimeAction::DesktopFrozen }) {
+            require(motion::agent::compatibility_copy_preview_required(action, true),
+                "a screen saver or desktop pause interrupted the compatibility conversion");
+            require(!motion::agent::compatibility_copy_preview_required(action, false),
+                "a playable video was unnecessarily held on its preview");
+        }
+        for (auto action : { RuntimeAction::Stopped, RuntimeAction::Locked, RuntimeAction::DisplayOff }) {
+            require(!motion::agent::compatibility_copy_preview_required(action, true),
+                "a compatibility preview ignored stopped, locked, or powered-off state");
+        }
         require(!optimization_renderer_is_static(RuntimeAction::DesktopPlay,
                 true, false, false, true, true) &&
             !optimization_renderer_is_static(RuntimeAction::DesktopPlay,
@@ -1092,7 +1120,7 @@ namespace
         auto prepare = optimizer.find("void Prepare(fs::path const& source");
         auto prepareEnd = optimizer.find("void InvalidateChoices()", prepare);
         auto durableCheck = optimizer.find("if (!durableRequestIsCurrent()) return;", prepare);
-        auto sourceProbe = optimizer.find("source_rate(*stableSource)", prepare);
+        auto sourceProbe = optimizer.find("source_rate(ffmpeg_, *stableSource)", prepare);
         auto clearFailure = optimizer.find("failed_.erase(key)", prepare);
         require(prepare != std::string::npos && prepareEnd != std::string::npos &&
             durableCheck != std::string::npos && sourceProbe != std::string::npos &&
@@ -1186,14 +1214,14 @@ namespace
         require(agent.find("if (!output.media.playbackLease)") != std::string::npos,
             "static-image paths can reach Renderer without an external-library identity lease");
         require(agent.find("void ReapExited()") != std::string::npos &&
-            agent.find("renderer->ReapExited()") != std::string::npos,
+            agent.find("->ReapExited()") != std::string::npos,
             "an exited transition renderer can pin its playback variant indefinitely");
 
 
         auto publish = optimizer.find(
             "MoveFileExW(temporary.c_str(), destinationAccess->path.c_str()");
         auto decodeProbe = optimizer.find(
-            "bool decodesFirstFrame = video_candidate_decodes_first_frame(temporary)");
+            "bool decodesFirstFrame = video_candidate_decodes_first_frame(temporary, validationCancelled)");
         require(publish != std::string::npos &&
             decodeProbe != std::string::npos && decodeProbe < publish &&
             optimizer.find("validateCandidate, &selectedCodec", prepare) < publish &&
@@ -1202,16 +1230,14 @@ namespace
             optimizer.find("fs::rename(temporary, request.destination") == std::string::npos,
             "a completed performance copy is still published through a delete/rename gap");
         auto candidateVisualCheck = optimizer.find(
-            "preservesSourceVisualMetadata(actual, codec)", prepare);
+            "actual.matchesSdrOutput && actual.duration100ns > 0", prepare);
         auto finalVisualCheck = optimizer.find(
-            "matchingVisualMetadata = preservesSourceVisualMetadata(actual, selectedCodec)",
+            "matchingVisualMetadata = actual.matchesSdrOutput",
             candidateVisualCheck);
-        require(optimizer.find("MF_MT_TRANSFER_FUNCTION") != std::string::npos &&
-            optimizer.find("MF_MT_VIDEO_PRIMARIES") != std::string::npos &&
-            optimizer.find("MF_MT_MPEG2_PROFILE") != std::string::npos &&
+        require(optimizer.find("video_matches_sdr_output(") != std::string::npos &&
             candidateVisualCheck != std::string::npos && finalVisualCheck != std::string::npos &&
             candidateVisualCheck < finalVisualCheck && finalVisualCheck < publish,
-            "candidate/final acceptance can drop known colour metadata or HEVC Main10 profile");
+            "candidate/final acceptance does not enforce the SDR output contract");
         auto finalControlBeforePublish = optimizer.rfind("finalControl = control()", publish);
         auto finalControlAfterPublish = optimizer.find("finalControl = control()", publish);
         auto accepted = optimizer.find("accepted = TryAdoptVariant(");
@@ -1314,8 +1340,9 @@ namespace
         auto composition = renderer.find("if (compositionChanged)");
         auto preserve = renderer.find("if (!captureForFreeze)", composition);
         auto reset = renderer.find("frozenSurface.Reset()", preserve);
-        auto frameComplete = renderer.find("lastTimestamp_ = timestamp", composition);
-        require(composition != std::string::npos && preserve < reset && reset < frameComplete,
+        auto frameComplete = renderer.find("return presented && allReady", composition);
+        require(composition != std::string::npos && frameComplete != std::string::npos &&
+            preserve < reset && reset < frameComplete,
             "the first Freeze/Pause frame still discards its low-memory compaction surface");
 
         auto compact = renderer.find("bool compacted = presenter.Compact()");
@@ -1638,7 +1665,7 @@ namespace
         require(branch != std::string::npos, "performance-copy wait branch disappeared");
         auto freezeBarrier = agent.find("renderers.FreezeDisplays(", branch);
         auto previewApply = agent.find(
-            "renderers.Apply(Renderer::Target::DesktopPlay", freezeBarrier);
+            "renderers.Apply(previewTarget,", freezeBarrier);
         auto sourceIdleBarrier = agent.rfind(
             "sourcePresentationMayApply(", previewApply);
         auto normalPlaybackBranch = agent.find("switch (state)", previewApply);
@@ -1666,7 +1693,9 @@ namespace
                 std::string::npos,
             "performance preview still globally freezes unrelated displays");
         require(agent.find("media_poster_by_id(") != std::string::npos &&
-            agent.find("poster.playbackLease = videoOptimizer->AcquirePlaybackLease(poster.path)") !=
+            agent.find("optimizer.AcquirePlaybackLease(poster)") !=
+                std::string::npos &&
+            agent.find("optimizer.ResolveStillPreview(video.path)") !=
                 std::string::npos,
             "the optimization preview no longer prefers a trusted static poster");
         require(agent.find("cloned_or_projected_display_active()") != std::string::npos &&
@@ -1714,7 +1743,7 @@ namespace
             optimizer.find("D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2") != std::string::npos &&
             optimizer.find("D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0") != std::string::npos,
             "automatic playback no longer checks source-specific D3D11 decoder configurations");
-        require(agent.find("SourceHardwareDecodeAdapter(") != std::string::npos &&
+        require(agent.find("SourceHardwareDecodeCandidates(") != std::string::npos &&
             agent.find("output.decodeAdapter") != std::string::npos &&
             agent.find("routesWithoutHardwareDecode") != std::string::npos &&
             agent.find("AutoDecodeRouteRejected(") != std::string::npos &&
@@ -1907,24 +1936,79 @@ namespace
             "primary-only routing lost output load or unexpectedly retained monitor routes");
     }
 
-    void video_variant_policy_preserves_quality_priority()
+    void compatibility_preparation_preserves_pending_poster_routes()
     {
+        using motion::agent::compatibility_renderer_routes_to_stop;
+        std::map<std::string, std::wstring> displays{
+            { "display-1", L"source" }, { "display-2", L"source" },
+            { "display-3", L"unrelated-video" }, { "display-4", L"existing-image" }
+        };
+        std::map<std::wstring, std::string> kinds{
+            { L"source", "video" }, { L"unrelated-video", "video" },
+            { L"existing-image", "image" }
+        };
+        auto isStaticImage = [&](auto const& key) {
+            auto found = kinds.find(key);
+            return found != kinds.end() && found->second == "image";
+        };
+        std::vector<std::string> pending{ "display-1", "display-2", "display-4", "missing" };
+        auto stopped = compatibility_renderer_routes_to_stop(pending, displays, isStaticImage);
+        require(stopped == std::vector<std::wstring>{ L"source" },
+            "compatibility preparation stopped an image/unrelated route or stopped a shared video twice");
+
+        // The next Apply launches a shared poster, but its asynchronous first
+        // frame ACK has not arrived. Repeated policy ticks must retain it so
+        // the preview barrier can settle and release the transcode worker.
+        displays["display-1"] = displays["display-2"] = L"pending-poster";
+        kinds[L"pending-poster"] = "image";
+        for (int tick = 0; tick < 8; ++tick) {
+            require(compatibility_renderer_routes_to_stop(pending, displays, isStaticImage).empty(),
+                "a compatibility policy retry retired the pending poster before its first frame ACK");
+        }
+
+        // Switching to another unsupported video while a copy is pending
+        // must still retire that new source; a one-time stop flag is unsafe.
+        displays["display-1"] = L"replacement-source";
+        kinds[L"replacement-source"] = "video";
+        stopped = compatibility_renderer_routes_to_stop(pending, displays, isStaticImage);
+        require(stopped == std::vector<std::wstring>{ L"replacement-source" },
+            "a replacement video escaped retirement or stopped the other display's poster");
+
+        kinds.erase(L"replacement-source");
+        require(compatibility_renderer_routes_to_stop(pending, displays, isStaticImage) == stopped,
+            "a missing renderer prevented stale route cleanup");
+        require(compatibility_renderer_routes_to_stop({}, displays, isStaticImage).empty(),
+            "an empty compatibility target list retired an unrelated renderer");
+    }
+
+    void video_variant_policy_uses_sdr_output_contract()
+    {
+        auto cpuBudget = motion::agent::video_cpu_frame_rate_cap(30);
+        auto softwareBalanced = motion::agent::video_variant_decision("cpu-smooth", 1920, 1080,
+            240000, 1001, cpuBudget);
+        require(softwareBalanced.targetFps == 30 &&
+            motion::agent::video_cpu_frame_rate_cap(165) == 60 &&
+            motion::agent::video_cpu_frame_rate_cap(0) == 60,
+            "software compatibility playback enlarged its already-calculated CPU frame-rate budget");
+        require(motion::agent::video_frame_rate_cap("power-saver", 0) == 60 &&
+            motion::agent::video_frame_rate_cap("power-saver", 24) == 24 &&
+            motion::agent::video_frame_rate_cap("balanced", 0) == 60 &&
+            motion::agent::video_frame_rate_cap("balanced", UINT32_MAX) == UINT32_MAX &&
+            motion::agent::video_frame_rate_cap("original", 165) == 0,
+            "display refresh rate policy defaulted, overflowed, or capped original playback incorrectly");
         using motion::agent::VideoSourceCodec;
         using motion::agent::VideoHardwareDecodeProfile;
-        require(motion::agent::video_software_fallback_allowed(VideoSourceCodec::Hevc, true, 1),
-            "8-bit HEVC Main unexpectedly lost the bounded software fallback");
-        require(!motion::agent::video_software_fallback_allowed(VideoSourceCodec::Hevc, true, 2),
-            "HEVC Main10 was allowed to fall through to an 8-bit software encoder");
-        require(!motion::agent::video_software_fallback_allowed(VideoSourceCodec::Hevc, false, 0),
-            "unknown HEVC bit depth was treated as safe for 8-bit software encoding");
-        require(!motion::agent::video_software_fallback_allowed(VideoSourceCodec::H264, true, 100, true),
-            "HDR transfer metadata was ignored by the software fallback guard");
-        require(!motion::agent::video_software_fallback_allowed(VideoSourceCodec::Unknown, false, 0) &&
-            !motion::agent::video_software_fallback_allowed(VideoSourceCodec::Vp9, true, 2) &&
-            !motion::agent::video_software_fallback_allowed(VideoSourceCodec::Av1, true, 0),
-            "unknown or potentially high-bit-depth codecs were flattened into H.264");
-        require(!motion::agent::video_software_fallback_allowed(VideoSourceCodec::Unknown, false, 0, false, true),
-            "BT.2020 primaries were ignored by the software fallback guard");
+        require(motion::agent::video_matches_sdr_output("h264", "yuv420p", 8,
+                "bt709", "bt709", "bt709", "tv") &&
+            !motion::agent::video_matches_sdr_output("hevc", "yuv420p", 8,
+                "bt709", "bt709", "bt709", "tv") &&
+            !motion::agent::video_matches_sdr_output("h264", "yuv420p10le", 10,
+                "bt709", "bt709", "bt709", "tv") &&
+            !motion::agent::video_matches_sdr_output("h264", "yuv420p", 8,
+                "smpte2084", "bt2020", "bt2020nc", "tv") &&
+            !motion::agent::video_matches_sdr_output("h264", "yuv420p", 8,
+                "unknown", "unknown", "unknown", "unknown"),
+            "codec, bit depth and color must match the SDR output contract");
         require(motion::agent::video_hardware_decode_profile(
                 VideoSourceCodec::H264, true, 100) == VideoHardwareDecodeProfile::H264 &&
             motion::agent::video_hardware_decode_profile(
@@ -1936,44 +2020,46 @@ namespace
             motion::agent::video_hardware_decode_profile(
                 VideoSourceCodec::Av1, false, 0) == VideoHardwareDecodeProfile::Unsupported,
             "source codec/profile metadata no longer maps conservatively to D3D11 decoder profiles");
-        require(motion::agent::video_cpu_conversion_allowed(false, false) &&
-            !motion::agent::video_cpu_conversion_allowed(true, false) &&
-            !motion::agent::video_cpu_conversion_allowed(false, true),
-            "CPU compatibility copies no longer distinguish SDR Main10 from HDR/BT.2020");
-        require(motion::agent::video_variant_color_metadata_matches(
-                true, 16, true, 16, true, 9, true, 9) &&
-            !motion::agent::video_variant_color_metadata_matches(
-                true, 16, false, 0, true, 9, true, 9) &&
-            !motion::agent::video_variant_color_metadata_matches(
-                true, 16, true, 1, true, 9, true, 9) &&
-            !motion::agent::video_variant_color_metadata_matches(
-                true, 16, true, 16, true, 9, true, 1) &&
-            motion::agent::video_variant_color_metadata_matches(
-                false, 0, false, 0, false, 0, false, 0),
-            "a performance copy can lose or change known transfer/primaries metadata");
-        require(motion::agent::video_variant_is_hevc_main10(true, 2) &&
-            !motion::agent::video_variant_is_hevc_main10(true, 1) &&
-            !motion::agent::video_variant_is_hevc_main10(false, 2),
-            "HEVC performance-copy validation does not require a known Main10 profile");
         auto original = motion::agent::video_variant_decision("original");
         require(!original.targetFps && original.fileName.empty(), "original mode unexpectedly requested a proxy");
         auto balanced = motion::agent::video_variant_decision("balanced", 2560, 1440, 240, 1, 165);
-        require(balanced.targetFps == 120 && balanced.fileName == L"balanced-120-2560x1440-v5.mp4",
-            "balanced mode no longer targets the high-quality 120 FPS proxy");
+        require(balanced.targetFps == 165 && balanced.fileName == L"balanced-165-2560x1440-v7.mp4",
+            "balanced mode exceeded the display refresh budget");
         auto sixtyHertz = motion::agent::video_variant_decision("balanced", 2560, 1440, 240, 1, 60);
-        require(sixtyHertz.targetFps == 60 && sixtyHertz.fileName == L"balanced-60-2560x1440-v5.mp4",
-            "balanced mode generated frames the display cannot present");
-        auto powerSaver = motion::agent::video_variant_decision("power-saver", 2560, 1440, 240, 1, 165);
-        require(powerSaver.targetFps == 60 && powerSaver.fileName == L"power-saver-60-2560x1440-v5.mp4",
-            "power saver did not retain its explicit 60 FPS policy");
+        require(sixtyHertz.targetFps == 60 && sixtyHertz.fileName == L"balanced-60-2560x1440-v7.mp4",
+            "60 Hz balanced mode reused an old 90 FPS cache identity");
+        auto powerSaver = motion::agent::video_variant_decision("power-saver", 1920, 1080, 240, 1, 165);
+        require(powerSaver.targetFps == 165 && powerSaver.fileName == L"power-saver-165-1920x1080-v7.mp4",
+            "power saver incorrectly imposed a fixed frame-rate cap instead of the display refresh rate");
+        auto sixtyHertzPowerSaver = motion::agent::video_variant_decision("power-saver", 1920, 1080, 240, 1, 60);
+        require(sixtyHertzPowerSaver.targetFps == 60 &&
+            sixtyHertzPowerSaver.fileName == L"power-saver-60-1920x1080-v7.mp4",
+            "60 Hz power saver did not retain its 60 FPS cache identity");
         auto cpuSmooth = motion::agent::video_variant_decision("cpu-smooth", 1280, 720, 240, 1, 60);
-        require(cpuSmooth.targetFps == 60 && cpuSmooth.fileName == L"cpu-smooth-60-1280x720-v5.mp4",
+        require(cpuSmooth.targetFps == 60 && cpuSmooth.fileName == L"cpu-smooth-60-1280x720-v7.mp4",
             "software playback did not receive its isolated CPU-friendly cache identity");
         auto nativeRate = motion::agent::video_variant_decision("balanced", 2560, 1440, 30, 1, 165);
         require(nativeRate.targetFps == 30, "balanced mode inserted frames missing from the source");
+        motion::VideoProbeInfo fractionalSource;
+        fractionalSource.frameRateNumerator = 30000;
+        fractionalSource.frameRateDenominator = 1001;
+        auto fractional = motion::agent::video_variant_decision("balanced", 1280, 720, 30000, 1001, 60);
+        require(fractional.targetFps == 30 &&
+            motion::agent::video_transcode_frame_rate(fractionalSource, fractional.targetFps) == L"30000/1001",
+            "a fractional source below the display budget was rounded up into interpolated frames");
+        fractionalSource.frameRateNumerator = 122;
+        fractionalSource.frameRateDenominator = 5;
+        auto customFractional = motion::agent::video_variant_decision("power-saver", 1280, 720, 122, 5, 60);
+        require(customFractional.targetFps == 25 &&
+            motion::agent::video_transcode_frame_rate(fractionalSource, customFractional.targetFps) == L"122/5",
+            "an unusual fractional source below the display budget lost its native frame rate");
+        require(motion::agent::video_transcode_backend_order({}, 2560, 1440, 90).empty() &&
+            !motion::agent::video_transcode_backend_order({}, 2560, 1440, sixtyHertz.targetFps).empty(),
+            "2K 60 FPS lost its CPU fallback or 90 FPS bypassed the safety budget");
         require(motion::agent::video_variant_rate_matches(60'000, 1'001, 60),
             "59.94 FPS container rate was incorrectly rejected as non-60 FPS");
-        require(!motion::agent::video_variant_rate_matches(120, 1, 60),
+        require(!motion::agent::video_variant_rate_matches(90, 1, 60) &&
+            !motion::agent::video_variant_rate_matches(120, 1, 60),
             "a different performance tier passed the variant frame-rate check");
         require(motion::agent::video_variant_dimensions_match(3'840, 2'176, 3'840, 2'160),
             "valid HEVC coding-block padding was rejected");
@@ -2003,6 +2089,75 @@ namespace
         auto cpuPortrait = motion::agent::video_cpu_variant_dimensions(2'160, 3'840, 1'080, 1'920);
         require(cpuPortrait.first == 1'080 && cpuPortrait.second == 1'920,
             "portrait CPU playback no longer preserves source aspect ratio");
+        auto balancedBudget = motion::agent::video_sdr_variant_dimensions("balanced", 3840, 2160, 3840, 2160);
+        require(balancedBudget.first == 3840 && balancedBudget.second == 2160,
+            "balanced mode did not retain the physical display resolution");
+        auto balancedTwoK = motion::agent::video_sdr_variant_dimensions("balanced", 3840, 2160, 2560, 1440);
+        require(balancedTwoK.first == 2560 && balancedTwoK.second == 1440,
+            "balanced mode silently lowered a 2K display target to a power-saver resolution");
+        auto powerSaverBudget = motion::agent::video_sdr_variant_dimensions("power-saver", 3840, 2160, 3840, 2160);
+        require(powerSaverBudget.first == 1920 && powerSaverBudget.second == 1080,
+            "power saver exceeded its 1080p resolution budget");
+        auto cpuBudgetDimensions = motion::agent::video_sdr_variant_dimensions("cpu-smooth", 3840, 2160, 1280, 720);
+        require(cpuBudgetDimensions.first == 1280 && cpuBudgetDimensions.second == 720,
+            "CPU compatibility enlarged a lower hardware-specific resolution budget");
+        auto originalDimensions = motion::agent::video_sdr_variant_dimensions("original", 3840, 2160, 1920, 1080);
+        require(originalDimensions.first == 3840 && originalDimensions.second == 2160,
+            "original mode silently replaced the source dimensions");
+        auto smallSource = motion::agent::video_sdr_variant_dimensions("balanced", 640, 360, 3840, 2160);
+        require(smallSource.first == 640 && smallSource.second == 360,
+            "the SDR profile upscaled a low-resolution input");
+        auto smallPowerSaverSource = motion::agent::video_sdr_variant_dimensions("power-saver", 640, 360, 3840, 2160);
+        require(smallPowerSaverSource.first == 640 && smallPowerSaverSource.second == 360,
+            "power saver upscaled a low-resolution input");
+        auto portraitOnLandscape = motion::agent::video_sdr_variant_dimensions("power-saver", 2160, 3840, 1920, 1080);
+        require(portraitOnLandscape.first == 1920 && portraitOnLandscape.second == 1080,
+            "portrait media was scaled twice when fitted to a landscape display");
+        auto landscapeOnPortrait = motion::agent::video_sdr_variant_dimensions("power-saver", 3840, 2160, 1080, 1920);
+        require(landscapeOnPortrait.first == 1080 && landscapeOnPortrait.second == 1920,
+            "landscape media exceeded the portrait display budget");
+    }
+
+    void structured_video_probe_handles_real_metadata()
+    {
+        auto info = motion::parse_video_probe_json(R"({"streams":[{"codec_name":"hevc","profile":"Main 10","width":3840,"height":2160,"pix_fmt":"yuv420p10le","avg_frame_rate":"240000/1001","duration":"525.530","color_transfer":"smpte2084","color_primaries":"bt2020","color_space":"bt2020nc","color_range":"tv"}]})");
+        require(info && info->width == 3840 && info->height == 2160 && info->bitDepth == 10 &&
+            info->frameRateNumerator == 240000 && info->frameRateDenominator == 1001 &&
+            info->duration100ns == 5'255'300'000ULL && info->colorTransfer == "smpte2084",
+            "fractional Main10/HDR probe metadata was lost or misinterpreted");
+        auto fallback = motion::parse_video_probe_json(R"({"streams":[{"codec_name":"h264","width":640,"height":360,"pix_fmt":"yuv420p","avg_frame_rate":"0/0","r_frame_rate":"30000/1001","duration":"N/A"}],"format":{"duration":"2.002"}})");
+        require(fallback && fallback->bitDepth == 8 && fallback->frameRateNumerator == 30000 &&
+            fallback->frameRateDenominator == 1001 && fallback->duration100ns == 20'020'000,
+            "missing stream rate/duration did not use valid container fallbacks");
+        auto rotated = motion::parse_video_probe_json(R"({"streams":[{"codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30/1","tags":{"rotate":"0"},"side_data_list":[{"side_data_type":"Display Matrix","rotation":-90}]}]})");
+        require(rotated && rotated->rotationDegrees == 270 && rotated->width == 1920 && rotated->height == 1080,
+            "display matrix rotation was ignored or changed the decoder's coded dimensions");
+        auto legacyRotation = motion::parse_video_probe_json(R"({"streams":[{"codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30/1","tags":{"rotate":"450"}}]})");
+        require(legacyRotation && legacyRotation->rotationDegrees == 90 && fallback->rotationDegrees == 0,
+            "legacy rotation was not normalized or missing rotation was not zero");
+        for (auto rotation : { "45", "90junk", "2147483648" }) {
+            auto json = std::string(R"({"streams":[{"codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30/1","tags":{"rotate":")") + rotation + R"("}}]})";
+            require(!motion::parse_video_probe_json(json), "malformed rotation was accepted");
+        }
+        require(!motion::parse_video_probe_json("not json") &&
+            !motion::parse_video_probe_json(R"({"streams":[]})") &&
+            !motion::parse_video_probe_json(R"({"streams":[{"codec_name":"h264","width":4294967296,"height":360,"avg_frame_rate":"30/1"}]})") &&
+            !motion::parse_video_probe_json(R"({"streams":[{"codec_name":"h264","width":640,"height":360,"avg_frame_rate":"30/0"}]})"),
+            "malformed or overflowing probe metadata was accepted");
+    }
+
+    void current_sdr_cache_keeps_completed_specifications(fs::path const& root)
+    {
+        auto media = root / L"sdr-cache-specifications";
+        fs::create_directories(media / L"Variants");
+        for (auto name : { L"balanced-60-1920x1080-v7.mp4", L"balanced-30-1280x720-v7.mp4",
+                L"balanced-120-2560x1440-v5.mp4" }) {
+            std::ofstream(media / L"Variants" / name) << "test cache";
+        }
+        require(motion::retain_variant_profile(media, "balanced", L"balanced-60-1920x1080-v7.mp4") &&
+            fs::exists(media / L"Variants" / L"balanced-30-1280x720-v7.mp4") &&
+            !fs::exists(media / L"Variants" / L"balanced-120-2560x1440-v5.mp4"),
+            "changing displays evicted a completed current-policy copy or retained an obsolete policy");
     }
 
     void video_import_limits_allow_8k_and_240_fps()
@@ -2271,11 +2426,21 @@ namespace
                 fs::copy_options::overwrite_existing),
             "the optimizer integration source could not be staged");
         motion::agent::VideoOptimizer optimizer(optimizerRoot,
-            root / L"optimizer-policy-log", root / L"missing-application");
+            root / L"optimizer-policy-log", motion::executable_directory());
         optimizer.SetGenerationAllowed(false);
 
         auto balanced = optimizer.ResolveWithLease(
             optimizerSource, "balanced", 32, 32, 30, false, true);
+        auto probeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+        while (balanced.gpuProbePending && std::chrono::steady_clock::now() < probeDeadline) {
+            require(balanced.path == optimizerSource && balanced.performanceCopyRequired &&
+                !balanced.performanceCopyPending,
+                "pending GPU inventory allowed source playback or premature transcoding");
+            Sleep(20);
+            balanced = optimizer.ResolveWithLease(
+                optimizerSource, "balanced", 32, 32, 30, false, true);
+        }
+        require(!balanced.gpuProbePending, "GPU inventory did not settle within its bounded probe deadline");
         auto automaticRequest =
             motion::read_variant_generation_request(mediaDirectory);
         auto automaticStatus = motion::inspect_variant_cache(mediaDirectory);
@@ -2341,9 +2506,35 @@ namespace
             optimizerSource, "balanced", 32, 32, 30, false, true);
         require(failed.performanceCopyRequired &&
             !failed.performanceCopyPending &&
-            !motion::read_variant_generation_request(mediaDirectory) &&
-            fs::is_regular_file(motion::variant_failed_path(mediaDirectory)),
-            "Resolve recreated a failed automatic request");
+            motion::read_variant_generation_request(mediaDirectory).mode == "balanced" &&
+            !fs::is_regular_file(motion::variant_failed_path(mediaDirectory)),
+            "a legacy failure without an environment fingerprint permanently blocked automatic retry");
+        // Windows' H.264 decoder rejects a 32x32 OpenH264 stream; use the
+        // existing 64x64 source size for this real playback-validation case.
+        auto cached = mediaDirectory / L"Variants" / L"balanced-30-64x64-v7.mp4";
+        fs::create_directories(cached.parent_path());
+        std::ofstream(cached, std::ios::binary) << "truncated but nonempty performance copy";
+        require(fs::is_regular_file(cached) && fs::file_size(cached) > 0,
+            "the corrupt cache integration fixture was not created");
+        auto rejectedCache = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 64, 64, 30, false, false);
+        require(rejectedCache.path == optimizerSource && rejectedCache.performanceCopyRequired,
+            "a nonempty corrupt v7 cache was adopted as a usable performance copy");
+        std::wstring transcodeError;
+        auto regenerated = motion::agent::transcode_video(
+            motion::ffmpeg_executable_path(motion::executable_directory()), optimizerSource,
+            cached, 64, 64, 30,
+            [] { return motion::agent::VideoTranscodeControl::running; }, transcodeError);
+        if (regenerated != motion::agent::VideoTranscodeResult::succeeded) {
+            std::cerr << "SDR cache regeneration: " << motion::wide_to_utf8(transcodeError) << '\n';
+        }
+        require(regenerated == motion::agent::VideoTranscodeResult::succeeded,
+            "the replacement SDR integration cache could not be generated");
+        auto adopted = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 64, 64, 30, false, false);
+        require(adopted.path == cached && adopted.lease && !adopted.performanceCopyRequired,
+            "a repaired v7 cache inherited the old fingerprint's negative validation result");
+        adopted.lease.reset();
         optimizer.SetGenerationAllowed(true);
         require(optimizer.Quiesce(100),
             "an idle optimizer could not acknowledge the source-playback barrier");
@@ -2357,10 +2548,10 @@ namespace
         require(motion::agent::video_transcode_backend_codec(
             VideoTranscodeBackend::nvidiaNvenc, true) == VideoTranscodeCodec::H264 &&
             motion::agent::video_transcode_backend_codec(
-                VideoTranscodeBackend::nvidiaNvenc, false) == VideoTranscodeCodec::HevcMain10 &&
+                VideoTranscodeBackend::nvidiaNvenc, false) == VideoTranscodeCodec::H264 &&
             motion::agent::video_transcode_backend_codec(
                 VideoTranscodeBackend::softwareOpenH264, false) == VideoTranscodeCodec::H264,
-            "safe SDR and protected HDR work no longer select distinct output codecs");
+            "encoder availability changed the portable H.264 output contract");
 
         auto unboundedHevc = motion::agent::video_transcode_rate_control(
             2560, 1440, 60, VideoTranscodeCodec::HevcMain10);
@@ -2416,8 +2607,8 @@ namespace
         require(cpuOnly.size() == 1 &&
             cpuOnly[0].backend == VideoTranscodeBackend::softwareOpenH264,
             "CPU-only systems lost their bounded H.264 software encoder fallback");
-        require(motion::agent::video_transcode_backend_order({}, 1920, 1080, 60, true, false).empty(),
-            "an HDR or high-bit-depth source was allowed through the 8-bit software encoder");
+        require(!motion::agent::video_transcode_backend_order({}, 1920, 1080, 60, true, false).empty(),
+            "the old source-bit-depth flag disabled a tone-mapped SDR output");
         require(motion::agent::video_transcode_backend_order({}, 3840, 2160, 60).empty(),
             "unsafe 4K software encoding was scheduled on a CPU-only system");
 
@@ -2436,9 +2627,9 @@ namespace
             motion::agent::video_transcode_backend_codec(
                 acceleratedCpuPlayback[0].backend, true) == VideoTranscodeCodec::H264,
             "CPU playback copy did not prefer hardware H.264 before its software fallback");
-        require(motion::agent::video_transcode_backend_order(
+        require(!motion::agent::video_transcode_backend_order(
             {}, 1920, 1080, 60, true, false, true).empty(),
-            "HDR or high-bit-depth video was destructively converted for CPU playback");
+            "tone-mapped HDR input lost the bounded CPU encoder fallback");
 
         auto unknownProbe = motion::agent::video_transcode_backend_order({}, 2560, 1440, 120, false);
         require(unknownProbe.empty(),
@@ -2459,25 +2650,49 @@ namespace
             transcoder.find("candidate.adapter.dxgiAdapterIndex") != std::string::npos &&
             transcoder.find("L\":,child_device=\"") != std::string::npos &&
             transcoder.find("child_device_type=d3d11va") != std::string::npos &&
-            transcoder.find("current_dxgi_adapter_index(candidate.adapter)") !=
+            transcoder.find("current_dxgi_adapter_index(boundCandidate.adapter, cancelled)") !=
                 std::string::npos &&
             transcoder.find("if (!adapter.identityKnown) return") != std::string::npos,
             "hardware candidates no longer bind FFmpeg to their concrete DXGI identity");
         require(transcoder.find("L\"-hwaccel\"") != std::string::npos &&
             transcoder.find("L\"-hwaccel_device\", deviceName") != std::string::npos &&
             transcoder.find("L\"-hwaccel_output_format\"") != std::string::npos &&
-            transcoder.find("L\",hwdownload,format=\" + format") != std::string::npos &&
-            transcoder.find("decodeAttempts = hardwareEncoder ? 2u : 1u") != std::string::npos,
+            transcoder.find("L\",hwdownload,format=\" + downloadFormat") != std::string::npos &&
+            transcoder.find("decodeAttempts = hardwareDecodeAttempts + 1u") != std::string::npos &&
+            transcoder.find("decoderCandidates[decoderIndex].adapter") != std::string::npos,
             "bound hardware decode or its compatibility-decode retry was removed");
         require(transcoder.find("L\"-threads:v\", L\"4\"") != std::string::npos &&
-            transcoder.find("L\"-filter_threads\", L\"2\"") != std::string::npos,
+            transcoder.find("video_transcode_worker_threads(std::thread::hardware_concurrency())") != std::string::npos,
             "background software decode/scale parallelism is no longer bounded");
         require(transcoder.find("FurthestProcessedMicroseconds") != std::string::npos &&
             transcoder.find("lastPipeActivity") != std::string::npos &&
             transcoder.find("lastTimelineAdvance") != std::string::npos &&
             transcoder.find("stopAndConfirm(ERROR_TIMEOUT)") != std::string::npos &&
-            transcoder.find("if (stalled) break") != std::string::npos,
+            transcoder.find("if (stalled && hardwareEncoder && !gpuScale) break") != std::string::npos,
             "a stalled hardware backend can once again block all fallback candidates forever");
+        require(motion::agent::video_transcode_driver_incompatible(
+                "[h264_nvenc] Driver does not support the required nvenc API version. Required: 13.0 Found: 12.2") &&
+            !motion::agent::video_transcode_driver_incompatible("Invalid output format nv12 for hwframe download."),
+            "a decoder format error disabled the encoder, or an incompatible driver was retried");
+    }
+
+    void internal_compatibility_progress_is_visible(fs::path const& root)
+    {
+        auto media = root / L"internal-compatibility-progress";
+        fs::create_directories(media / L"Variants");
+        require(motion::write_variant_progress(media, "cpu-smooth",
+                motion::VariantProgressState::generating, 37, true),
+            "internal compatibility progress could not be written");
+        auto status = motion::inspect_variant_cache(media);
+        require(status.generating && status.progressKnown && status.progressPercent == 37 && !status.queued,
+            "internal compatibility progress was hidden behind an indefinite optimizing label");
+        require(motion::request_variant_generation(media, "balanced"), "explicit request failed");
+        // A stale internal callback must not supply progress for a new user task.
+        require(motion::write_variant_progress(media, "cpu-smooth",
+                motion::VariantProgressState::generating, 80, true), "stale progress setup failed");
+        status = motion::inspect_variant_cache(media);
+        require(status.requestedMode == "balanced" && !status.progressKnown,
+            "internal progress leaked into a superseding explicit task");
     }
 
     struct FrameSchedulerProbe
@@ -2485,6 +2700,8 @@ namespace
         static constexpr UINT message = WM_APP + 77;
         motion::renderer::FrameScheduler scheduler{ message };
         std::vector<std::chrono::steady_clock::time_point> ticks;
+        motion::renderer::FrameDeadline deadline;
+        bool precise{};
 
         static LRESULT CALLBACK WindowProc(HWND window, UINT event, WPARAM wParam, LPARAM lParam)
         {
@@ -2495,11 +2712,20 @@ namespace
                 SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
             }
             if (self && event == message) {
+                auto started = motion::renderer::FrameScheduler::Now100ns();
                 self->scheduler.TickHandled();
                 self->ticks.push_back(std::chrono::steady_clock::now());
                 // Approximate non-trivial frame transfer/presentation work.
-                Sleep(3);
-                if (self->ticks.size() < 30) self->scheduler.Start(window, 8);
+                if (self->precise) {
+                    // Sleep(3) can consume a 15.6ms system tick; use measured
+                    // CPU work so this test does not benchmark Sleep rounding.
+                    while (motion::renderer::FrameScheduler::Now100ns() - started < 30'000) YieldProcessor();
+                } else Sleep(3);
+                if (self->ticks.size() < 30) {
+                    if (self->precise) self->scheduler.StartAt(window, self->deadline.AfterFrame(started,
+                        motion::renderer::FrameScheduler::Now100ns(), 166'667));
+                    else self->scheduler.Start(window, 8);
+                }
                 return 0;
             }
             return DefWindowProcW(window, event, wParam, lParam);
@@ -2568,6 +2794,33 @@ namespace
         require(intervals.back() < 100, "real FrameScheduler produced a visible long-frame stall");
     }
 
+    void real_frame_deadlines_keep_processing_inside_the_frame_budget()
+    {
+        FrameSchedulerProbe probe;
+        probe.precise = true;
+        HWND window = CreateWindowExW(0, L"MotionWallpaper.Tests.FrameScheduler", L"", 0,
+            0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), &probe);
+        require(window != nullptr, "precise frame scheduler probe window failed");
+        probe.scheduler.StartAt(window, motion::renderer::FrameScheduler::Now100ns() + 10'000);
+        auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (probe.ticks.size() < 30 && std::chrono::steady_clock::now() < timeout) {
+            MSG pending{};
+            while (PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&pending);
+            MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+        probe.scheduler.Stop();
+        DestroyWindow(window);
+        require(probe.ticks.size() == 30, "precise frame scheduler stalled");
+        std::vector<int64_t> intervals;
+        for (size_t index = 1; index < probe.ticks.size(); ++index) intervals.push_back(
+            std::chrono::duration_cast<std::chrono::microseconds>(probe.ticks[index] - probe.ticks[index - 1]).count());
+        std::sort(intervals.begin(), intervals.end());
+        auto median = intervals[intervals.size() / 2];
+        std::cout << "    precise frame interval median-us " << median << '\n';
+        require(median >= 13'000 && median < 19'000,
+            "frame processing was added after the 60 FPS period instead of included within it");
+    }
+
     void adapter_policy_preserves_heavy_video_throughput()
     {
         require(!motion::renderer::prefer_high_performance_adapter(1920, 1080, 60, 1),
@@ -2630,11 +2883,11 @@ namespace
         require(motion::renderer::select_decode_path(L"hardware") == DecodePath::Hardware,
             "explicit hardware decode no longer selects the physical GPU path");
         require(motion::renderer::select_decode_path(L"software") == DecodePath::Software,
-            "explicit software decode no longer selects the WARP path");
+            "explicit software decode no longer selects the CPU path");
         require(motion::renderer::allows_software_device_fallback(DecodePath::Automatic) &&
             !motion::renderer::allows_software_device_fallback(DecodePath::Hardware) &&
-            !motion::renderer::allows_software_device_fallback(DecodePath::Software),
-            "software-device fallback is no longer restricted to automatic decode");
+            motion::renderer::allows_software_device_fallback(DecodePath::Software),
+            "WARP presentation fallback must remain available outside explicit hardware mode");
 
         auto sourceRoot = fs::absolute(fs::path(__FILE__)).parent_path().parent_path();
         std::ifstream rendererFile(sourceRoot / L"MotionWallpaper.Renderer" / L"Renderer.cpp",
@@ -2706,6 +2959,7 @@ namespace
         motion::unique_handle input;
         motion::unique_handle output;
         DWORD id{};
+        motion::unique_handle job;
 
         void Send(std::string const& value) const
         {
@@ -2715,7 +2969,8 @@ namespace
         }
     };
 
-    RendererProcess launch_hidden_image_renderer(fs::path const& root, std::wstring const& name)
+    RendererProcess launch_hidden_renderer(fs::path const& media, std::wstring const& kind,
+        std::wstring const& decode = L"auto", std::vector<std::wstring> const& monitors = {}, bool builtin = false)
     {
         auto renderer = motion::executable_directory().parent_path() / L"MotionWallpaper.App" / L"motionwallpaper-renderer.exe";
         if (!fs::is_regular_file(renderer)) {
@@ -2724,9 +2979,6 @@ namespace
                 L"MotionWallpaper.App" / L"motionwallpaper-renderer.exe";
         }
         require(fs::is_regular_file(renderer), "renderer executable was not built before integration tests");
-        auto image = root / name;
-        write_test_bitmap(image);
-
         SECURITY_ATTRIBUTES security{ sizeof(security), nullptr, TRUE };
         HANDLE inputReadRaw{}, inputWriteRaw{}, outputReadRaw{}, outputWriteRaw{};
         require(CreatePipe(&inputReadRaw, &inputWriteRaw, &security, 0) != FALSE, "renderer input pipe failed");
@@ -2736,8 +2988,11 @@ namespace
         SetHandleInformation(inputWrite.get(), HANDLE_FLAG_INHERIT, 0);
         SetHandleInformation(outputRead.get(), HANDLE_FLAG_INHERIT, 0);
 
-        auto command = motion::build_command_line({ renderer.wstring(), L"-hidden", L"-video", image.wstring(),
-            L"-kind", L"image", L"-decode", L"auto", L"-display", L"primary" });
+        std::vector<std::wstring> arguments{ renderer.wstring(), L"-hidden", L"-video", media.wstring(),
+            L"-kind", kind, L"-decode", decode, L"-display", monitors.empty() ? L"primary" : L"monitor" };
+        for (auto const& monitor : monitors) { arguments.push_back(L"-monitor"); arguments.push_back(monitor); }
+        if (builtin) arguments.push_back(L"-test-builtin");
+        auto command = motion::build_command_line(arguments);
         STARTUPINFOW startup{ sizeof(startup) };
         startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
         startup.wShowWindow = SW_HIDE;
@@ -2745,12 +3000,28 @@ namespace
         startup.hStdOutput = outputWrite.get();
         startup.hStdError = outputWrite.get();
         PROCESS_INFORMATION created{};
-        require(CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+        require(CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
             nullptr, renderer.parent_path().c_str(), &startup, &created) != FALSE, "renderer integration process failed to launch");
         motion::unique_handle process(created.hProcess), processThread(created.hThread);
+        motion::unique_handle job(CreateJobObjectW(nullptr, nullptr));
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!job || !SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
+            !AssignProcessToJobObject(job.get(), process.get()) || ResumeThread(processThread.get()) == DWORD(-1)) {
+            TerminateProcess(process.get(), ERROR_PROCESS_ABORTED);
+            WaitForSingleObject(process.get(), 2000);
+            throw std::runtime_error("renderer integration process could not be isolated");
+        }
         inputRead.reset();
         outputWrite.reset();
-        return { std::move(process), std::move(inputWrite), std::move(outputRead), created.dwProcessId };
+        return { std::move(process), std::move(inputWrite), std::move(outputRead), created.dwProcessId, std::move(job) };
+    }
+
+    RendererProcess launch_hidden_image_renderer(fs::path const& root, std::wstring const& name)
+    {
+        auto image = root / name;
+        write_test_bitmap(image);
+        return launch_hidden_renderer(image, L"image");
     }
 
     void stop_renderer(RendererProcess& renderer, uint64_t revision)
@@ -2761,6 +3032,82 @@ namespace
             control.revision == revision, "renderer did not acknowledge a clean integration-test stop");
         require(WaitForSingleObject(renderer.process.get(), 3000) == WAIT_OBJECT_0,
             "renderer integration process did not stop");
+    }
+
+    void real_video_renderer_separates_cpu_decode_and_gpu_presentation(fs::path const& root)
+    {
+        // Reuse the independently decoded H.264 fixture from the MF probe.
+        auto media = root / L"decode-probe-h264.mp4";
+        require(fs::is_regular_file(media), "real video Renderer fixture is missing");
+        auto displays = motion::enumerate_displays();
+        require(!displays.empty(), "video Renderer integration requires an active display");
+        // Exercise actual mixed-refresh outputs when present, without changing
+        // monitor layout or desktop wallpaper. A single-display machine still
+        // exercises two independent composition surfaces.
+        std::vector<std::wstring> monitors{ displays.front().deviceName,
+            displays.size() > 1 ? displays[1].deviceName : displays.front().deviceName };
+        for (bool builtin : {false,true}) for (auto const& decode : { std::wstring(L"software"), std::wstring(L"auto") }) {
+            auto renderer = launch_hidden_renderer(media, L"video", decode, monitors,builtin);
+            renderer.Send("desktop-play 1\n");
+            bool playing = false;
+            bool cpuPipeline = false;
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+            std::string diagnostic;
+            while (std::chrono::steady_clock::now() < deadline) {
+                auto line = read_protocol_line(renderer.output.get(), std::chrono::milliseconds(500));
+                diagnostic += line + "\n";
+                if (line.find("pipeline decode cpu presentation ") != std::string::npos &&
+                    line.find("transfer wic-upload") != std::string::npos) cpuPipeline = true;
+                if (builtin && line.find("status decode software builtin-ffmpeg-software") != std::string::npos) cpuPipeline = true;
+                auto ack = motion::protocol::parse_ack(line);
+                if (ack.channel == motion::protocol::AckChannel::Target && ack.revision == 1 && ack.state == "playing") {
+                    playing = true;
+                    break;
+                }
+                if (line.starts_with("error ")) break;
+            }
+            if (!playing) std::cerr << diagnostic;
+            require(playing, "real video Renderer did not present its first frame on both outputs");
+            require(decode != L"software" || cpuPipeline,
+                "software video Renderer did not use the CPU-to-presentation upload pipeline");
+            auto nextHeartbeat = [&]() {
+                auto heartbeatDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+                while (std::chrono::steady_clock::now() < heartbeatDeadline) {
+                    auto value = motion::protocol::parse_playback_heartbeat(
+                        read_protocol_line(renderer.output.get(), std::chrono::milliseconds(500)));
+                    if (value && value->revision == 1) return *value;
+                }
+                throw std::runtime_error("real Renderer stopped reporting playback progress after first frame");
+            };
+            auto firstProgress = nextHeartbeat();
+            auto progressStarted = std::chrono::steady_clock::now();
+            auto secondProgress = nextHeartbeat();
+            require(secondProgress.serial > firstProgress.serial && firstProgress.period100ns == 333'334,
+                "real playback heartbeat did not track all-output frames and native frame period");
+            auto elapsedSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - progressStarted).count();
+            require(secondProgress.serial - firstProgress.serial <=
+                static_cast<uint64_t>(std::ceil((elapsedSeconds + 0.15) * 30)) + 2,
+                "swap-chain readiness polling counted the same decoded frame more than once");
+            std::cout << "    video pipeline " << (decode == L"software" ? "software" : "auto") << ": " << diagnostic;
+            renderer.Send("desktop-freeze 2\n");
+            auto frozen = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
+            require(frozen.channel == motion::protocol::AckChannel::Target && frozen.revision == 2 && frozen.state == "frozen",
+                "video Renderer did not capture both outputs for freeze");
+            renderer.Send("desktop-play 3\n");
+            auto resumed = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
+            require(resumed.channel == motion::protocol::AckChannel::Target && resumed.revision == 3 && resumed.state == "playing",
+                "video Renderer did not resume after the frozen-surface handoff");
+            renderer.Send("desktop-freeze 4\n");
+            auto frozenAgain = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
+            require(frozenAgain.channel == motion::protocol::AckChannel::Target && frozenAgain.revision == 4 && frozenAgain.state == "frozen",
+                "video Renderer reused a stale first-freeze acknowledgement");
+            renderer.Send("desktop-freeze 5\n");
+            auto repeatedFreeze = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
+            require(repeatedFreeze.channel == motion::protocol::AckChannel::Target && repeatedFreeze.revision == 5 && repeatedFreeze.state == "frozen",
+                "consecutive freeze commands stalled the video Renderer");
+            stop_renderer(renderer, 6);
+        }
     }
 
     struct RendererWindowQuery
@@ -2933,10 +3280,10 @@ namespace
 
         probe.displayOn = false;
         SendMessageW(window, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
-        require(probe.displayOn && probe.topologyRevision == 1,
-            "automatic sleep resume did not restore display state and invalidate Renderer routes");
+        require(!probe.displayOn && probe.topologyRevision == 1,
+            "unattended sleep resume turned on the session display or failed to invalidate Renderer routes");
         SendMessageW(window, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0);
-        require(probe.topologyRevision == 2,
+        require(probe.displayOn && probe.topologyRevision == 2,
             "interactive sleep resume did not invalidate Renderer routes");
 
         SendMessageW(window, probe.taskbarCreated, 0, 0);
@@ -3116,6 +3463,8 @@ namespace
         runtime.decodeReason = "fallback-no-hardware-decoder";
         runtime.agentInstanceId = "dddddddd-dddd-dddd-dddd-dddddddddddd";
         runtime.agentProcessId = 4321;
+        runtime.performanceMode = "original";
+        runtime.activeSceneId = "work";
         runtime.displayStates = {
             { "DISPLAY#ONE", L"\\\\.\\DISPLAY1", L"Internal display",
                 runtime.activeGroupId, runtime.activeMediaId, "degraded",
@@ -3129,6 +3478,7 @@ namespace
         runtime.lastCommandAction = "restart-renderer";
         runtime.lastCommandSucceeded = true;
         runtime.lastCommandMessage = "renderer-restart-scheduled";
+        runtime.displayStates.front().errorDetail = "present 0x887A0005";
         motion::save_runtime(runtimePath, runtime);
 
         auto loaded = motion::load_runtime(runtimePath);
@@ -3136,6 +3486,7 @@ namespace
             loaded->displayStates == runtime.displayStates &&
             loaded->agentInstanceId == runtime.agentInstanceId &&
             loaded->agentProcessId == runtime.agentProcessId &&
+            loaded->performanceMode == "original" && loaded->activeSceneId == "work" &&
             loaded->lastCommandId == runtime.lastCommandId &&
             loaded->lastCommandAction == "restart-renderer" &&
             loaded->lastCommandSucceeded &&
@@ -3147,8 +3498,60 @@ namespace
             R"({"version":1,"activeGroupId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","activeMediaId":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","decodePath":"hardware","decodeReason":"","updatedAt":""})";
         auto legacy = motion::load_runtime(legacyPath);
         require(legacy && legacy->version == motion::runtime_schema_version &&
-            legacy->displayStates.empty() && legacy->lastCommandId.empty(),
+            legacy->displayStates.empty() && legacy->lastCommandId.empty() &&
+            legacy->performanceMode.empty() && legacy->activeSceneId.empty(),
             "runtime v1 compatibility was lost when per-display status was added");
+
+        std::ifstream runtimeInput(runtimePath, std::ios::binary);
+        std::string runtimeJson((std::istreambuf_iterator<char>(runtimeInput)), {});
+        runtimeInput.close();
+        {
+            auto oldJson = runtimeJson;
+            for (auto field : { std::string(",\"errorDetail\":\"present 0x887A0005\""),
+                    std::string(",\"errorDetail\":\"\"") }) {
+                auto at = oldJson.find(field);
+                require(at != std::string::npos, "runtime diagnostics fixture is missing its field");
+                oldJson.erase(at, field.size());
+            }
+            std::ofstream(legacyPath, std::ios::binary | std::ios::trunc) << oldJson;
+            auto oldRuntime = motion::load_runtime(legacyPath);
+            require(oldRuntime && oldRuntime->displayStates.size() == 2 &&
+                oldRuntime->displayStates.front().errorDetail.empty() &&
+                oldRuntime->displayStates.back().errorDetail.empty(),
+                "older v2 runtime without diagnostics is no longer readable");
+        }
+        for (auto invalid : { std::string("123"), std::string("\"bad\\nmessage\"") }) {
+            auto badJson = runtimeJson;
+            auto field = std::string("\"errorDetail\":\"present 0x887A0005\"");
+            badJson.replace(badJson.find(field), field.size(), "\"errorDetail\":" + invalid);
+            std::ofstream(legacyPath, std::ios::binary | std::ios::trunc) << badJson;
+            auto previous = runtime;
+            require(!motion::try_load_runtime(legacyPath, previous) &&
+                previous.displayStates == runtime.displayStates,
+                "invalid runtime diagnostics replaced the last known good state");
+        }
+        for (auto replacement : { std::string("null"), std::string("\"\"") }) {
+            auto oldJson = runtimeJson;
+            for (auto field : { std::string("\"performanceMode\":\"original\""),
+                    std::string("\"activeSceneId\":\"work\"") }) {
+                auto at = oldJson.find(field);
+                require(at != std::string::npos, "runtime context fixture did not serialize its fields");
+                oldJson.replace(at, field.size(), field.substr(0, field.find(':') + 1) + replacement);
+            }
+            std::ofstream(legacyPath, std::ios::binary | std::ios::trunc) << oldJson;
+            auto emptyContext = motion::load_runtime(legacyPath);
+            require(emptyContext && emptyContext->performanceMode.empty() && emptyContext->activeSceneId.empty(),
+                "empty legacy runtime mode/scene context was not backward compatible");
+        }
+        for (auto invalid : { std::string("\"cpu-smooth\""), std::string("123") }) {
+            auto badJson = runtimeJson;
+            auto field = std::string("\"performanceMode\":\"original\"");
+            badJson.replace(badJson.find(field), field.size(), "\"performanceMode\":" + invalid);
+            std::ofstream(legacyPath, std::ios::binary | std::ios::trunc) << badJson;
+            auto previous = runtime;
+            require(!motion::try_load_runtime(legacyPath, previous) && previous.performanceMode == "original" &&
+                previous.activeSceneId == "work", "invalid runtime context replaced the last known good state");
+        }
 
         auto controlPath = root / L"display-runtime" / L"runtime-command.json";
         auto requestId = motion::request_runtime_control(
@@ -3938,7 +4341,16 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (auto fixture = motion::tests::handle_startup_environment_test_command()) return *fixture;
+    if (auto fixture = motion::tests::handle_swap_chain_timing_test_command(argc, argv)) return *fixture;
+    if (auto fixture = motion::tests::handle_media_probe_test_command(argc, argv)) return *fixture;
+    if (auto probe = motion::agent::run_video_gpu_probe_cli(argc, argv); probe >= 0) return probe;
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    if (auto fixture = motion::tests::handle_builtin_video_test_command(argc,argv)) return *fixture;
+    if (auto fixture = motion::tests::handle_video_still_test_command(argc, argv)) return *fixture;
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--probe-video-first-frame") {
+        return motion::agent::run_video_first_frame_probe(argv[2]);
+    }
     if (argc == 5 && std::wstring_view(argv[1]) == L"--leave-library-migration") {
         auto identity = motion::capture_media_library_trust(argv[2]);
         if (!identity) return 70;
@@ -3956,24 +4368,41 @@ int wmain(int argc, wchar_t** argv)
         ExitProcess(71);
     }
     if (argc == 8 && (std::wstring_view(argv[1]) == L"--transcode-video" ||
+        std::wstring_view(argv[1]) == L"--transcode-reject-first-preview" ||
         std::wstring_view(argv[1]) == L"--transcode-main10-video" ||
         std::wstring_view(argv[1]) == L"--transcode-cpu-video")) {
         bool cpuPlayback = std::wstring_view(argv[1]) == L"--transcode-cpu-video";
         bool main10 = std::wstring_view(argv[1]) == L"--transcode-main10-video";
+        bool rejectFirstPreview = std::wstring_view(argv[1]) == L"--transcode-reject-first-preview";
+        uint32_t previews{};
+        std::wstring selectedBackend;
+        motion::agent::VideoTranscodeCandidateValidator previewValidator;
+        if (rejectFirstPreview) previewValidator = [&](fs::path const& path, auto, auto) {
+            if (++previews == 1) return false;
+            auto info = motion::probe_video(argv[2], path);
+            return info && info->codecName == "h264" && info->bitDepth == 8 &&
+                info->pixelFormat == "yuv420p" && info->colorTransfer == "bt709" &&
+                info->colorPrimaries == "bt709" && info->colorSpace == "bt709" && info->colorRange == "tv" &&
+                info->width == static_cast<uint32_t>(_wtoi(argv[5])) &&
+                info->height == static_cast<uint32_t>(_wtoi(argv[6])) &&
+                motion::agent::video_candidate_decodes_first_frame(path);
+        };
         std::wstring error;
         auto result = motion::agent::transcode_video(
             argv[2], argv[3], argv[4], static_cast<uint32_t>(_wtoi(argv[5])),
             static_cast<uint32_t>(_wtoi(argv[6])), static_cast<uint32_t>(_wtoi(argv[7])),
             [] { return motion::agent::VideoTranscodeControl::running; }, error,
-            nullptr, !main10, cpuPlayback, 0,
+            &selectedBackend, !main10, cpuPlayback, 0,
             [](motion::agent::VideoTranscodeProgress const& value) {
-                std::wcout << L"progress attempt=" << value.attempt << L" backend=" <<
-                    static_cast<uint32_t>(value.backend) << L" percent=" << value.percent <<
-                    L" processed_us=" << value.processedMicroseconds << L" duration_us=" <<
-                    value.durationMicroseconds << L" started=" << value.attemptStarted << L'\n';
-            });
-        std::wcout << static_cast<int>(result) << L" " << error << L'\n';
-        return result == motion::agent::VideoTranscodeResult::succeeded ? 0 : 3;
+                std::cout << "progress attempt=" << value.attempt << " backend=" <<
+                    static_cast<uint32_t>(value.backend) << " percent=" << value.percent <<
+                    " processed_us=" << value.processedMicroseconds << " duration_us=" <<
+                    value.durationMicroseconds << " started=" << value.attemptStarted << '\n';
+            }, {}, nullptr, {}, [](std::wstring const& message) { std::cout << motion::wide_to_utf8(message) << '\n'; }, previewValidator);
+        std::cout << "selected_backend=" << motion::wide_to_utf8(selectedBackend) << " validated_previews=" << previews << '\n';
+        std::cout << "selected_gpu_scale=" << (selectedBackend.find(L"GPU") != std::wstring::npos) << '\n';
+        std::cout << static_cast<int>(result) << " " << motion::wide_to_utf8(error) << '\n';
+        return result == motion::agent::VideoTranscodeResult::succeeded && (!rejectFirstPreview || previews >= 2) ? 0 : 3;
     }
     if (argc == 3 && std::wstring_view(argv[1]) == L"--write-settings") {
         motion::Settings settings;
@@ -4029,6 +4458,21 @@ int wmain(int argc, wchar_t** argv)
     } while (false)
     try {
         fs::create_directories(root);
+        RUN_TEST(motion::tests::startup_environment_rejects_unsupported_platforms(require));
+        RUN_TEST(motion::tests::startup_permissions_probe_preserves_files(root, require));
+        RUN_TEST(motion::tests::startup_handshake_reports_exit_timeout_and_identity(root, require));
+        RUN_TEST(motion::tests::video_gpu_probe_contracts());
+        RUN_TEST(motion::tests::display_refresh_reads_physical_rational_timing(require));
+        RUN_TEST(motion::tests::renderer_routes_share_decode_across_refresh_rates(require));
+        RUN_TEST(motion::tests::renderer_route_identity_tracks_refresh_and_hotplug(require));
+        RUN_TEST(motion::tests::output_progress_isolated_retry_and_freeze_barrier(require));
+        RUN_TEST(motion::tests::real_composition_swap_chain_contract_is_bounded(require));
+        RUN_TEST(motion::tests::cpu_decode_and_presentation_device_are_independent(require));
+        RUN_TEST(motion::tests::failed_display_does_not_pin_unrelated_renderer_generations(require));
+        RUN_TEST(motion::tests::playback_watchdog_distinguishes_stalls_stale_reports_and_slow_media(require));
+        RUN_TEST(motion::tests::frame_deadlines_account_for_processing_without_drift_or_bursts(require));
+        RUN_TEST(motion::tests::fill_geometry_preserves_visible_pixels_and_keeps_distinct_aspects(require));
+        RUN_TEST(motion::tests::software_bitmap_upload_preserves_pixels_and_rejects_mismatched_targets(require));
         RUN_TEST(application_data_location_preserves_portable_and_legacy_libraries(root));
         RUN_TEST(settings_round_trip_clears_empty_values(root));
         RUN_TEST(scene_profiles_and_layout_round_trip(root));
@@ -4053,6 +4497,12 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(normal_pause_keeps_decoder_hot());
         RUN_TEST(stable_agent_states_do_not_poll_at_twenty_hertz());
         RUN_TEST(battery_power_pauses_optional_variant_generation());
+        RUN_TEST(motion::tests::transcode_lifecycle_survives_session_transitions(require));
+        RUN_TEST(motion::tests::stopped_renderer_is_a_settled_pause(require));
+        RUN_TEST(motion::tests::original_playback_recovery_targets_confirmed_unique_media(require));
+        RUN_TEST(motion::tests::original_playback_has_a_bounded_first_frame_attempt(require));
+        RUN_TEST(motion::tests::original_failure_poster_preserves_identity_and_status(require));
+        RUN_TEST(motion::tests::log_rotation_closes_reader_and_serializes_writers(root, require));
         RUN_TEST(active_playback_waits_for_selected_performance_copy());
         RUN_TEST(pending_performance_copy_preserves_the_presented_frame());
         RUN_TEST(variant_progress_round_trips_and_resets(root));
@@ -4068,7 +4518,18 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(desktop_host_must_cover_the_virtual_screen());
         RUN_TEST(manual_selection_wins_over_group_randomization());
         RUN_TEST(identical_media_share_one_renderer());
-        RUN_TEST(video_variant_policy_preserves_quality_priority());
+        RUN_TEST(compatibility_preparation_preserves_pending_poster_routes());
+        RUN_TEST(internal_compatibility_progress_is_visible(root));
+        RUN_TEST(video_variant_policy_uses_sdr_output_contract());
+        RUN_TEST(structured_video_probe_handles_real_metadata());
+        RUN_TEST(motion::tests::media_probe_json_repeated_worker_lifetimes(require));
+        RUN_TEST(motion::tests::media_probe_child_output_is_bounded(require));
+        RUN_TEST(motion::tests::media_probe_timeout_and_cancel_reap_children(root, require));
+        RUN_TEST(motion::tests::transcode_color_and_rate_contracts());
+        RUN_TEST(motion::tests::transcode_completion_priority_and_gpu_scaling());
+        RUN_TEST(motion::tests::video_still_resolution_and_color(require));
+        RUN_TEST(motion::tests::video_still_real_extraction_cache_and_leases(root, require));
+        RUN_TEST(current_sdr_cache_keeps_completed_specifications(root));
         RUN_TEST(video_import_limits_allow_8k_and_240_fps());
         RUN_TEST(variant_requests_use_last_writer_wins(root));
         RUN_TEST(same_mode_variant_retry_rejects_stale_worker(root));
@@ -4076,14 +4537,22 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(media_foundation_candidate_probe_decodes_a_real_first_frame(root));
         RUN_TEST(video_transcoder_orders_vendor_backends_and_bounds_software_fallback());
         RUN_TEST(frame_scheduler_uses_real_interval());
+        RUN_TEST(real_frame_deadlines_keep_processing_inside_the_frame_budget());
         RUN_TEST(adapter_policy_preserves_heavy_video_throughput());
         RUN_TEST(renderer_ack_channels_are_isolated());
         RUN_TEST(decode_modes_have_distinct_fallback_contracts());
+        RUN_TEST(real_video_renderer_separates_cpu_decode_and_gpu_presentation(root));
+        RUN_TEST(motion::tests::builtin_video_clock_pixels_and_resume(root,require));
         RUN_TEST(selected_media_reaches_real_renderer_first_frame(root));
         RUN_TEST(renderer_crash_recovery_reaches_first_frame_again(root));
         RUN_TEST(renderer_display_change_exit_and_relaunch_is_cross_process(root));
         RUN_TEST(real_renderer_enters_screensaver_and_returns_on_wake(root));
         RUN_TEST(safe_agent_system_event_messages_trigger_recovery());
+        RUN_TEST(motion::tests::session_connection_never_implies_unlock(require));
+        RUN_TEST(motion::tests::renderer_error_details_are_bounded_and_exact(require));
+        RUN_TEST(motion::tests::renderer_pipe_stop_preserves_buffered_error(require));
+        RUN_TEST(motion::tests::renderer_pipe_stop_does_not_wait_for_inherited_writer(require));
+        RUN_TEST(motion::tests::renderer_pipe_reader_discards_oversize_lines(require));
         RUN_TEST(screensaver_input_wake_is_immediate_in_runtime_state_machine());
         RUN_TEST(renderer_process_uses_typed_acks(root));
         RUN_TEST(renderer_exits_when_agent_pipe_closes(root));

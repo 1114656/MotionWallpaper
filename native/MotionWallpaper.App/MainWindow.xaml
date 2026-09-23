@@ -97,6 +97,7 @@
                                 <Button x:Name="RestartRendererButton" Grid.Column="2" Content="重启渲染" Click="RestartRenderer_Click" IsEnabled="False" VerticalAlignment="Center" />
                             </Grid>
                             <StackPanel x:Name="DisplayRuntimeCards" Spacing="8" />
+                            <StackPanel x:Name="OriginalPlaybackWarnings" Spacing="8" Visibility="Collapsed" />
                         </StackPanel>
                     </Border>
 
@@ -164,7 +165,7 @@
                         <Grid ColumnSpacing="28">
                             <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                             <Border Padding="16,12" MinHeight="72" Style="{StaticResource CardStyle}"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="32" /><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xE950;" Style="{StaticResource SettingIconStyle}" /><TextBlock Grid.Column="1" Text="视频解码" FontWeight="SemiBold" VerticalAlignment="Center" /><ComboBox x:Name="DecodeMode" Grid.Column="2" Style="{StaticResource SettingsComboBoxStyle}" SelectionChanged="Policy_Changed"><ComboBoxItem Content="自动选择（推荐）" Tag="auto" /><ComboBoxItem Content="硬件解码" Tag="hardware" /><ComboBoxItem Content="软件解码" Tag="software" /></ComboBox></Grid></Border>
-                            <Border Grid.Column="1" Padding="16,12" MinHeight="72" Style="{StaticResource CardStyle}"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="32" /><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xE9D9;" Style="{StaticResource SettingIconStyle}" /><TextBlock Grid.Column="1" Text="壁纸性能" FontWeight="SemiBold" VerticalAlignment="Center" /><ComboBox x:Name="PerformanceMode" Grid.Column="2" Style="{StaticResource SettingsComboBoxStyle}" SelectionChanged="Policy_Changed"><ComboBoxItem Content="自动平衡（推荐）" Tag="balanced" /><ComboBoxItem Content="原画优先" Tag="original" /><ComboBoxItem Content="低功耗" Tag="power-saver" /></ComboBox></Grid></Border>
+                            <Border Grid.Column="1" Padding="16,12" MinHeight="72" Style="{StaticResource CardStyle}"><Grid ColumnSpacing="10"><Grid.ColumnDefinitions><ColumnDefinition Width="32" /><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /></Grid.ColumnDefinitions><FontIcon Glyph="&#xE9D9;" Style="{StaticResource SettingIconStyle}" /><TextBlock Grid.Column="1" Text="壁纸性能" FontWeight="SemiBold" VerticalAlignment="Center" /><ComboBox x:Name="PerformanceMode" ToolTipService.ToolTip="节能：最高1080p，跟随显示器刷新率；平衡：显示器分辨率和刷新率；均不超过源视频规格。原画直接播放源文件。" Grid.Column="2" Style="{StaticResource SettingsComboBoxStyle}" SelectionChanged="Policy_Changed"><ComboBoxItem Content="平衡 · 匹配显示器" Tag="balanced" /><ComboBoxItem Content="原画直出" Tag="original" /><ComboBoxItem Content="节能 · 1080p" Tag="power-saver" /></ComboBox></Grid></Border>
                         </Grid>
                     </StackPanel>
                 </StackPanel>

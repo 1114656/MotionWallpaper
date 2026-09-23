@@ -9,6 +9,7 @@
     <Keyword>Win32Proj</Keyword>
     <RootNamespace>MotionWallpaperAgent</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.19045.0</WindowsTargetPlatformMinVersion>
     <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -30,6 +31,8 @@
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="Agent.cpp" /><ClCompile Include="VideoOptimizer.cpp" /></ItemGroup>
   <ItemGroup><Manifest Include="app.manifest" /></ItemGroup>
+  <ItemGroup><ClInclude Include="VideoGpuProbe.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="VideoStillPreview.h" /></ItemGroup>
   <ItemGroup><ResourceCompile Include="MotionWallpaper.Agent.rc" /></ItemGroup>
   <ItemGroup><ClInclude Include="CoveragePolicy.h" /><ClInclude Include="LibraryMigrationProtocol.h" /><ClInclude Include="PlaybackCapabilityPolicy.h" /><ClInclude Include="RandomSelectionPolicy.h" /><ClInclude Include="resource.h" /><ClInclude Include="RuntimeEventPolicy.h" /><ClInclude Include="RuntimeStatusPolicy.h" /><ClInclude Include="SharedRendererPolicy.h" /><ClInclude Include="TrayControlPolicy.h" /><ClInclude Include="VideoOptimizer.h" /><ClInclude Include="VideoTranscoder.h" /><ClInclude Include="VideoVariantPolicy.h" /><ClInclude Include="..\MotionWallpaper.Protocol\RendererProtocol.h" /></ItemGroup>
   <ItemGroup>
@@ -38,5 +41,6 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2526" />
   </ItemGroup>
   <ItemGroup><ProjectReference Include="..\MotionWallpaper.Common\MotionWallpaper.Common.vcxproj"><Project>{8E8B0D7C-63C7-4D90-A08E-8F15AA760E39}</Project></ProjectReference><ProjectReference Include="..\MotionWallpaper.Core\MotionWallpaper.Core.vcxproj"><Project>{B154C177-6898-485C-82C8-9BE027E466F8}</Project></ProjectReference></ItemGroup>
+  <ItemGroup><ClInclude Include="RendererLifecyclePolicy.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

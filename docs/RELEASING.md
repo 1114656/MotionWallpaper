@@ -20,7 +20,7 @@ MotionWallpaper 支持 `x.y.z-alpha.n` 预发布版本和 `x.y.z` 正式版本�
 2. 执行 `scripts\package-release.ps1` 和 `scripts\build-installer.ps1 -SkipBuild`，要求两种分发物验证通过。
 3. 确认两种负载只包含简体中文和英文资源，且不包含 `Wallpapers`、`Config`、日志、调试符号和本机测试证据；同时必须包含 `msvcp140.dll`、`msvcp140_atomic_wait.dll`、`vcruntime140.dll` 和 `vcruntime140_1.dll`。
 4. 确认主程序、Agent、Renderer 和安装器的 `FileVersion` 为 VERSION 对应的四段数字版本，`ProductVersion` 保留完整版本文本。
-5. 在 Windows 10 2004（19041）或更高版本、未全局安装 VC++ Redistributable 的干净 x64 环境中启动安装版和便携版，验证 App-local 运行库生效。
+5. 在 Windows 10 22H2（19045）或 Windows 11、未全局安装 VC++ Redistributable 的干净 x64 环境中启动安装版和便携版，验证 App-local 运行库生效。
 6. 静默安装到临时自定义目录，验证程序、设置、日志与默认壁纸数据集中位于 `App`，随后测试旧数据迁移、升级和卸载。
 7. 确认安装阶段先把旧 LocalAppData 复制到非权威 staging，再以路径、类型、64 位大小和 SHA-256 双向校验，完全一致后才原子发布；旧源始终作为回滚副本保留。复制中断或暂时无法完成时必须启用 `legacy-data-fallback.mode` 并继续使用可验证的旧数据根；junction/reparse point、两个非一致数据根等歧义必须写入 `legacy-data-conflict.mode`，App/Agent 均不得自动选择、遍历或写入任一数据根，也不得自动启动半迁移安装。卸载会删除默认 `App\Wallpapers`、设置、日志和开机启动注册表值，但不递归删除任何安装目录外路径。还应把旧 LocalAppData 路径重新用作外置媒体库后再卸载，确认其中数据完整保留。
 8. 上传安装 EXE、便携 ZIP 及匹配的 `.sha256` 文件；仅 Alpha 版本标记为 Pre-release，稳定版本创建普通 GitHub Release。

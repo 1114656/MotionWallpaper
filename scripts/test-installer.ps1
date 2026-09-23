@@ -22,7 +22,7 @@ if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
 
 $temporaryBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
 $testRoot = Join-Path $temporaryBase ("MotionWallpaper-installer-test-" + [guid]::NewGuid().ToString('N'))
-$installRoot = Join-Path $testRoot 'custom install path'
+$installRoot = Join-Path $testRoot 'custom 中文 install path'
 $crashInstallRoot = Join-Path $testRoot 'interrupted migration install path'
 $raceInstallRoot = Join-Path $testRoot 'post-preflight race install path'
 $retryInstallRoot = Join-Path $testRoot 'fallback retry install path'
@@ -41,6 +41,10 @@ $compiler = Join-Path $root '.tools\InnoSetup\ISCC.exe'
 $installerScript = Join-Path $root 'installer\MotionWallpaper.iss'
 $smokeInstaller = Join-Path $testRoot 'MotionWallpaper-installer-smoke.exe'
 $faultSmokeInstaller = Join-Path $testRoot 'MotionWallpaper-installer-fault-smoke.exe'
+$startupValueName = 'MotionWallpaper-Installer-Smoke-Test-' + [guid]::NewGuid().ToString('N')
+$startupRegistryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$ownedStubProcess = $null
+$otherStubProcess = $null
 
 function Get-AssociatedIconHash([string]$Path) {
     $icon = [Drawing.Icon]::ExtractAssociatedIcon($Path)
@@ -71,16 +75,48 @@ try {
 
     & $compiler "/DMyAppVersion=$version" "/DMyAppFileVersion=$fileVersion" '/DMyAppName=MotionWallpaper-Installer-Smoke-Test' `
         '/DMyAppId={{1D39CB35-4E75-46D0-B117-934E57415E50}' `
+        "/DMyStartupValueName=$startupValueName" `
         "/DLegacyDataRoot=$legacyRoot" '/DInstallerSmokeTest=1' "/O$testRoot" '/FMotionWallpaper-installer-smoke' $installerScript
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $smokeInstaller -PathType Leaf)) {
         throw "隔离测试安装器编译失败，退出码：$LASTEXITCODE"
     }
     & $compiler "/DMyAppVersion=$version" "/DMyAppFileVersion=$fileVersion" '/DMyAppName=MotionWallpaper-Installer-Smoke-Test' `
         '/DMyAppId={{1D39CB35-4E75-46D0-B117-934E57415E50}' `
+        "/DMyStartupValueName=$startupValueName" `
         "/DLegacyDataRoot=$legacyRoot" '/DInstallerSmokeTest=1' '/DInstallerMigrationFaultAfterConfig=1' `
         "/O$testRoot" '/FMotionWallpaper-installer-fault-smoke' $installerScript
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $faultSmokeInstaller -PathType Leaf)) {
         throw "迁移故障注入安装器编译失败，退出码：$LASTEXITCODE"
+    }
+
+    $missingMediaRoot = Join-Path $testRoot 'missing media components'
+    $missingMediaLog = Join-Path $testRoot 'missing-media.log'
+    $missingMedia = Start-Process -FilePath $smokeInstaller -ArgumentList @(
+        '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCLOSEAPPLICATIONS',
+        '/TESTMISSINGMEDIAFOUNDATION', "/DIR=`"$missingMediaRoot`"", "/LOG=`"$missingMediaLog`""
+    ) -WindowStyle Hidden -Wait -PassThru
+    if ($missingMedia.ExitCode -eq 0 -or
+        (Test-Path -LiteralPath (Join-Path $missingMediaRoot 'App\MotionWallpaper.exe')) -or
+        [IO.File]::ReadAllText($missingMediaLog) -notmatch 'Media Feature Pack') {
+        throw '缺少媒体组件的隔离注入没有在安装前拒绝并提示官方 Media Feature Pack。'
+    }
+
+    # A file occupying a required data directory is a real unwritable-layout
+    # case and does not require changing the user's ACLs or system directories.
+    $blockedRoot = Join-Path $testRoot 'unwritable data layout'
+    New-Item -ItemType Directory -Path (Join-Path $blockedRoot 'App') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $blockedRoot 'App\Config'), 'keep this existing file')
+    $blockedLog = Join-Path $testRoot 'unwritable-layout.log'
+    $blockedInstall = Start-Process -FilePath $smokeInstaller -ArgumentList @(
+        '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCLOSEAPPLICATIONS',
+        "/DIR=`"$blockedRoot`"", "/LOG=`"$blockedLog`""
+    ) -WindowStyle Hidden -Wait -PassThru
+    if ($blockedInstall.ExitCode -eq 0 -or
+        [IO.File]::ReadAllText((Join-Path $blockedRoot 'App\Config')) -ne 'keep this existing file' -or
+        (Test-Path -LiteralPath (Join-Path $blockedRoot 'App\MotionWallpaper.exe')) -or
+        [IO.File]::ReadAllText($blockedLog) -notmatch 'must be writable') {
+        $diagnosis = Get-Content -LiteralPath $blockedLog -Tail 35 | Out-String
+        throw "不可写数据目录布局没有在安装前被准确拒绝，或覆盖了既有文件。退出码 $($blockedInstall.ExitCode)`n$diagnosis"
     }
 
     $install = Start-Process -FilePath $smokeInstaller -ArgumentList @(
@@ -166,6 +202,47 @@ try {
         throw "安装负载缺少中英文资源：$($muiRoots -join ', ')"
     }
 
+    # Changing /DIR on an existing install must not seed a new install from
+    # the old LocalAppData fixture and lose the current authoritative library.
+    $changedRoot = Join-Path $testRoot 'different upgrade destination'
+    $changedLog = Join-Path $testRoot 'changed-upgrade-directory.log'
+    $changedInstall = Start-Process -FilePath $smokeInstaller -ArgumentList @(
+        '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCLOSEAPPLICATIONS',
+        "/DIR=`"$changedRoot`"", "/LOG=`"$changedLog`""
+    ) -WindowStyle Hidden -Wait -PassThru
+    if ($changedInstall.ExitCode -eq 0 -or
+        (Test-Path -LiteralPath (Join-Path $changedRoot 'App\MotionWallpaper.exe')) -or
+        [IO.File]::ReadAllText($changedLog) -notmatch 'existing installation directory') {
+        throw '改目录升级没有被阻止，或未清楚说明应保留原安装位置。'
+    }
+
+    # Use inert, isolated executables with the real image names. No installed
+    # MotionWallpaper application, Agent, Renderer, or production Run value is
+    # launched or modified by this lifecycle regression.
+    $stubSource = Join-Path $testRoot 'WaitingProcess.cs'
+    $stubExecutable = Join-Path $testRoot 'WaitingProcess.exe'
+    [IO.File]::WriteAllText($stubSource,
+        'internal static class WaitingProcess { private static void Main() { System.Threading.Thread.Sleep(180000); } }')
+    $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    & $csc /nologo /target:winexe "/out:$stubExecutable" $stubSource
+    if ($LASTEXITCODE -ne 0) { throw "隔离进程样本编译失败：$LASTEXITCODE" }
+    $ownedStubPath = Join-Path $appRoot 'motionwallpaper-renderer.exe'
+    $otherStubRoot = Join-Path $testRoot 'other installation'
+    New-Item -ItemType Directory -Path $otherStubRoot -Force | Out-Null
+    $otherStubPath = Join-Path $otherStubRoot 'motionwallpaper-renderer.exe'
+    Copy-Item -LiteralPath $stubExecutable -Destination $ownedStubPath -Force
+    Copy-Item -LiteralPath $stubExecutable -Destination $otherStubPath -Force
+    $ownedStubProcess = Start-Process -FilePath $ownedStubPath -WindowStyle Hidden -PassThru
+    $otherStubProcess = Start-Process -FilePath $otherStubPath -WindowStyle Hidden -PassThru
+    Start-Sleep -Milliseconds 300
+    if ($ownedStubProcess.HasExited -or $otherStubProcess.HasExited) {
+        throw '隔离进程样本未保持运行，无法验收卸载范围。'
+    }
+    New-Item -Path $startupRegistryPath -Force | Out-Null
+    $otherStartupCommand = '"' + (Join-Path $otherStubRoot 'motionwallpaper-agent.exe') + '"'
+    New-ItemProperty -LiteralPath $startupRegistryPath -Name $startupValueName `
+        -Value $otherStartupCommand -PropertyType String -Force | Out-Null
+
     if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
         throw '安装后缺少卸载程序。'
     }
@@ -181,6 +258,18 @@ try {
         '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
     ) -WindowStyle Hidden -Wait -PassThru
     if ($uninstall.ExitCode -ne 0) { throw "静默卸载失败，退出码：$($uninstall.ExitCode)" }
+    $ownedStubProcess.Refresh()
+    $otherStubProcess.Refresh()
+    if (-not $ownedStubProcess.HasExited -or $otherStubProcess.HasExited) {
+        throw '卸载没有停止本安装进程，或错误停止了另一目录的同名进程。'
+    }
+    $preservedStartup = Get-ItemPropertyValue -LiteralPath $startupRegistryPath -Name $startupValueName
+    if ($preservedStartup -ne $otherStartupCommand) {
+        throw '卸载错误删除或修改了指向另一目录的启动项。'
+    }
+    Stop-Process -Id $otherStubProcess.Id -Force
+    $otherStubProcess.WaitForExit()
+    $otherStubProcess = $null
     Start-Sleep -Milliseconds 500
     if (Test-Path -LiteralPath $installRoot) {
         throw "卸载后仍残留安装目录：$installRoot"
@@ -250,10 +339,16 @@ try {
         (Test-Path -LiteralPath (Join-Path $crashAppRoot 'Wallpapers\.legacy-migration-owner.mode') -PathType Leaf)) {
         throw '中断恢复完成后的 fallback/complete 状态优先级不正确。'
     }
+    $ownedStartupCommand = '"' + (Join-Path $crashAppRoot 'motionwallpaper-agent.exe') + '"'
+    New-ItemProperty -LiteralPath $startupRegistryPath -Name $startupValueName `
+        -Value $ownedStartupCommand -PropertyType String -Force | Out-Null
     $crashUninstall = Start-Process -FilePath $crashUninstaller -ArgumentList @(
         '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
     ) -WindowStyle Hidden -Wait -PassThru
     if ($crashUninstall.ExitCode -ne 0) { throw "中断恢复场景卸载失败，退出码：$($crashUninstall.ExitCode)" }
+    if ((Get-Item -LiteralPath $startupRegistryPath).GetValueNames() -contains $startupValueName) {
+        throw '卸载没有删除仍指向本安装目录的启动项。'
+    }
     if (-not (Test-Path -LiteralPath (Join-Path $legacyRoot 'Config\settings.json') -PathType Leaf) -or
         -not (Test-Path -LiteralPath (Join-Path $legacyRoot 'Wallpapers\Groups\legacy-group\group.json') -PathType Leaf) -or
         -not (Test-Path -LiteralPath $crashConfigRecovery[0].FullName -PathType Container)) {
@@ -423,8 +518,15 @@ try {
         throw '卸载器沿 junction 删除了外部数据。'
     }
 
-    Write-Host "安装器冒烟测试通过：中英文资源、App-local VC++ Runtime、版本资源、OpenH264 许可、单目录数据、原子 staging、双目录发布中断恢复、transaction ownership 抢占保护、双标记重试、旧数据回滚与失败回退、自定义路径、junction 拒绝、外置媒体保留和卸载清理均正常。"
+    Write-Host "安装器冒烟测试通过：媒体组件检查、不可写目录拒绝、改目录升级阻止、同名进程/启动项隔离、中英文资源、App-local VC++ Runtime、版本资源、单目录数据、迁移中断恢复、transaction ownership 抢占保护、双标记重试、junction 拒绝、外置媒体保留和卸载清理均正常。"
 } finally {
+    foreach ($stubProcess in @($ownedStubProcess, $otherStubProcess)) {
+        if ($null -ne $stubProcess) {
+            $stubProcess.Refresh()
+            if (-not $stubProcess.HasExited) { Stop-Process -Id $stubProcess.Id -Force }
+        }
+    }
+    Remove-ItemProperty -LiteralPath $startupRegistryPath -Name $startupValueName -ErrorAction SilentlyContinue
     foreach ($remainingUninstaller in @($uninstaller, $crashUninstaller, $raceUninstaller, $retryUninstaller)) {
         if (Test-Path -LiteralPath $remainingUninstaller -PathType Leaf) {
             Start-Process -FilePath $remainingUninstaller -ArgumentList @(

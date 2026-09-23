@@ -1,5 +1,10 @@
-MotionWallpaper invokes an unmodified FFmpeg executable as an optional,
-separate background media-preparation tool.
+MotionWallpaper invokes an unmodified FFmpeg executable as a separate
+background media-preparation tool. Its optional built-in playback fallback
+also dynamically loads the accompanying unmodified avformat, avcodec,
+avutil and swscale shared libraries through their public C interfaces.
+No codec is registered in Windows and no FFmpeg library is statically linked
+into MotionWallpaper. Compatible replacement shared libraries can be placed
+in Tools/ffmpeg; retain the required ABI and dependent DLLs.
 
 Build distribution: BtbN/FFmpeg-Builds, Windows x64 LGPL shared build 8.1
 Project: https://github.com/BtbN/FFmpeg-Builds

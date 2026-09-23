@@ -23,6 +23,9 @@
 #ifndef LegacyDataRoot
   #define LegacyDataRoot "{localappdata}\MotionWallpaper"
 #endif
+#ifndef MyStartupValueName
+  #define MyStartupValueName "MotionWallpaper"
+#endif
 
 [Setup]
 AppId={#MyAppId}
@@ -35,7 +38,7 @@ DisableProgramGroupPage=yes
 DisableDirPage=no
 UsePreviousAppDir=yes
 PrivilegesRequired=lowest
-MinVersion=10.0.19041
+MinVersion=10.0.19045
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\artifacts
@@ -80,12 +83,6 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\App\{#MyAppExeName}"; Worki
 [Run]
 Filename: "{app}\App\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; WorkingDir: "{app}\App"; Flags: nowait postinstall skipifsilent; Check: LegacyMigrationAllowsAppLaunch
 
-#ifndef InstallerSmokeTest
-[UninstallRun]
-Filename: "{cmd}"; Parameters: "/C taskkill /F /T /IM MotionWallpaper.exe >nul 2>&1 & taskkill /F /T /IM motionwallpaper-agent.exe >nul 2>&1 & taskkill /F /T /IM motionwallpaper-renderer.exe >nul 2>&1 & exit /B 0"; Flags: runhidden waituntilterminated; RunOnceId: "StopMotionWallpaper"
-Filename: "{cmd}"; Parameters: "/C reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v MotionWallpaper /f >nul 2>&1 & exit /B 0"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveStartupEntry"
-#endif
-
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\App\Config"
 Type: filesandordirs; Name: "{app}\App\Wallpapers"
@@ -110,6 +107,10 @@ const
   MW_INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
   MW_INVALID_HANDLE_VALUE = $FFFFFFFF;
   MW_MIGRATION_OWNER_MARKER = '.legacy-migration-owner.mode';
+  MW_PROCESS_TERMINATE = $00000001;
+  MW_PROCESS_QUERY_LIMITED_INFORMATION = $00001000;
+  MW_SYNCHRONIZE = $00100000;
+  MW_RUN_KEY = 'Software\Microsoft\Windows\CurrentVersion\Run';
 
 var
   MigrationAllowsAppLaunch: Boolean;
@@ -139,6 +140,20 @@ function MWMoveFileEx(const ExistingFileName, NewFileName: String;
 procedure MWExitProcess(ExitCode: LongWord);
   external 'ExitProcess@kernel32.dll stdcall';
 
+function MWOpenProcess(DesiredAccess: LongWord; InheritHandle: Boolean;
+  ProcessId: LongWord): LongWord;
+  external 'OpenProcess@kernel32.dll stdcall';
+
+function MWQueryFullProcessImageName(Process: LongWord; Flags: LongWord;
+  FileName: String; var Size: LongWord): Boolean;
+  external 'QueryFullProcessImageNameW@kernel32.dll stdcall';
+
+function MWTerminateProcess(Process: LongWord; ExitCode: LongWord): Boolean;
+  external 'TerminateProcess@kernel32.dll stdcall';
+
+function MWWaitForSingleObject(Handle, Milliseconds: LongWord): LongWord;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+
 function InitializeSetup(): Boolean;
 begin
   MigrationAllowsAppLaunch := True;
@@ -162,6 +177,192 @@ begin
   end;
 end;
 #endif
+
+function SameInstallPath(const Left, Right: String): Boolean;
+begin
+  Result := CompareText(RemoveBackslash(ExpandFileName(Left)),
+    RemoveBackslash(ExpandFileName(Right))) = 0;
+end;
+
+function PreviousInstallationDirectory(): String;
+var
+  Key: String;
+begin
+  Result := '';
+  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
+    ExpandConstant('{#MyAppId}') + '_is1';
+  if not RegQueryStringValue(HKCU64, Key, 'Inno Setup: App Path', Result) then
+    RegQueryStringValue(HKCU64, Key, 'InstallLocation', Result);
+end;
+
+function MediaFoundationAvailable(): Boolean;
+begin
+  { Check the native system directory, not a redistributable DLL beside Setup.
+    Media Foundation is an OS optional feature and must not be bundled here. }
+  Result := FileExists(ExpandConstant('{sys}\mfplat.dll')) and
+    FileExists(ExpandConstant('{sys}\mfreadwrite.dll'));
+#ifdef InstallerSmokeTest
+  if InstallerSmokeSwitchPresent('/TESTMISSINGMEDIAFOUNDATION') then Result := False;
+#endif
+end;
+
+function DirectoryAllowsWrites(const DirectoryName: String): Boolean;
+var
+  Parent, NextParent, Probe: String;
+begin
+  Result := False;
+  Log('Checking writable installation directory: ' + DirectoryName);
+  Parent := ExpandFileName(DirectoryName);
+  while not DirExists(Parent) do
+  begin
+    if FileExists(Parent) then Exit;
+    NextParent := ExtractFileDir(RemoveBackslash(Parent));
+    if (NextParent = '') or SameInstallPath(NextParent, Parent) then Exit;
+    Parent := NextParent;
+  end;
+  Probe := AddBackslash(Parent) + '.motionwallpaper-write-test-' +
+    IntToStr(MWGetCurrentProcessId()) + '.tmp';
+  if FileExists(Probe) then Exit;
+  if SaveStringToFile(Probe, 'MotionWallpaper installation write check', False) then
+    Result := DeleteFile(Probe);
+end;
+
+function InstallPreflightError(): String;
+var
+  PreviousDirectory, TargetDirectory: String;
+begin
+  Result := '';
+  if not MediaFoundationAvailable() then
+  begin
+    Result := '缺少 Windows Media Foundation 媒体组件，暂时无法运行动态壁纸。' + #13#10 +
+      'Windows 10/11 N 请在“设置 → 应用 → 可选功能”中安装 Media Feature Pack，重启后重新安装。' + #13#10 +
+      'Missing Windows Media Foundation. On Windows N, install Media Feature Pack from Settings > Apps > Optional features, then restart Windows.' + #13#10 +
+      'https://support.microsoft.com/windows/experience/platform-variants/media-feature-pack-for-windows-n';
+    Exit;
+  end;
+  TargetDirectory := ExpandConstant('{app}');
+  Log('Checking previous installation before upgrade: ' + TargetDirectory);
+  PreviousDirectory := PreviousInstallationDirectory();
+  if (PreviousDirectory <> '') and not SameInstallPath(PreviousDirectory, TargetDirectory) then
+  begin
+    Result := '检测到已有安装，本次升级必须保留原安装位置：' + PreviousDirectory + #13#10 +
+      '如需释放原磁盘空间，请先在应用内“移动位置”迁移媒体库并备份，再保留原安装位置升级。安装器不会从旧备份猜测或迁移当前数据。' + #13#10 +
+      'Keep the existing installation directory when upgrading. Move the media library inside the app and back up your data first; changing the installation directory during an upgrade is not supported.';
+    Exit;
+  end;
+  if not DirectoryAllowsWrites(TargetDirectory) or
+    not DirectoryAllowsWrites(AddBackslash(TargetDirectory) + 'App') or
+    not DirectoryAllowsWrites(AddBackslash(TargetDirectory) + 'App\Config') or
+    not DirectoryAllowsWrites(AddBackslash(TargetDirectory) + 'App\Wallpapers') then
+  begin
+    Result := '安装目录不可写，或配置/媒体库位置被同名文件占用：' + TargetDirectory + #13#10 +
+      '程序将配置、日志和默认媒体库存放在安装目录内。请选择当前用户可以写入的目录，避免只读目录；不要仅以管理员身份启动来掩盖权限问题。' + #13#10 +
+      'The installation directory must be writable by the user running MotionWallpaper. Choose a writable folder; a file must not occupy App, Config, or Wallpapers.';
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := InstallPreflightError();
+  if Result <> '' then Log('MotionWallpaper preflight rejected installation: ' + Result);
+end;
+
+function OwnedExecutablePath(const FileName: String): Boolean;
+var
+  AppRoot: String;
+begin
+  AppRoot := AddBackslash(ExpandConstant('{app}\App'));
+  Result := SameInstallPath(FileName, AppRoot + '{#MyAppExeName}') or
+    SameInstallPath(FileName, AppRoot + 'motionwallpaper-agent.exe') or
+    SameInstallPath(FileName, AppRoot + 'motionwallpaper-renderer.exe') or
+    SameInstallPath(FileName, AppRoot + 'Tools\ffmpeg\ffmpeg.exe') or
+    SameInstallPath(FileName, AppRoot + 'Tools\ffmpeg\ffprobe.exe');
+end;
+
+procedure StopOwnedProcess(ProcessId: LongWord);
+var
+  Handle, NameLength: LongWord;
+  FileName: String;
+begin
+  { Bind verification and termination to the same process handle so a reused
+    PID can never cause an unrelated process to be terminated. }
+  Handle := MWOpenProcess(MW_PROCESS_QUERY_LIMITED_INFORMATION or
+    MW_PROCESS_TERMINATE or MW_SYNCHRONIZE, False, ProcessId);
+  if Handle = 0 then Exit;
+  try
+    NameLength := 32768;
+    SetLength(FileName, NameLength);
+    if not MWQueryFullProcessImageName(Handle, 0, FileName, NameLength) then Exit;
+    SetLength(FileName, NameLength);
+    if not OwnedExecutablePath(FileName) then Exit;
+    Log('Stopping process owned by this installation: ' + FileName);
+    if MWTerminateProcess(Handle, 0) then MWWaitForSingleObject(Handle, 5000);
+  finally
+    MWCloseHandle(Handle);
+  end;
+end;
+
+procedure StopInstallationProcesses();
+var
+  Locator, Service, Processes, ProcessObject: Variant;
+  Index, Phase: Integer;
+  ProcessName: String;
+begin
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('', 'root\CIMV2');
+    Processes := Service.ExecQuery('SELECT ProcessId, Name FROM Win32_Process WHERE ' +
+      'Name="motionwallpaper-agent.exe" OR Name="{#MyAppExeName}" OR ' +
+      'Name="motionwallpaper-renderer.exe" OR Name="ffmpeg.exe" OR Name="ffprobe.exe"');
+    { Stop the Agent first so it cannot relaunch a renderer while uninstalling. }
+    for Phase := 0 to 1 do
+      for Index := 0 to Processes.Count - 1 do
+      begin
+        ProcessObject := Processes.ItemIndex(Index);
+        ProcessName := ProcessObject.Name;
+        if ((Phase = 0) and (CompareText(ProcessName, 'motionwallpaper-agent.exe') = 0)) or
+          ((Phase = 1) and (CompareText(ProcessName, 'motionwallpaper-agent.exe') <> 0)) then
+          StopOwnedProcess(ProcessObject.ProcessId);
+      end;
+  except
+    { Never fall back to taskkill /IM: another installation may be running. }
+    Log('Could not enumerate installation processes: ' + GetExceptionMessage());
+  end;
+end;
+
+procedure RemoveOwnedStartupEntry();
+var
+  Command, Executable: String;
+  EndQuote: Integer;
+begin
+  if not RegQueryStringValue(HKCU, MW_RUN_KEY, '{#MyStartupValueName}', Command) then Exit;
+  Command := Trim(Command);
+  if Command = '' then Exit;
+  if Command[1] = '"' then
+  begin
+    Executable := Copy(Command, 2, Length(Command) - 1);
+    EndQuote := Pos('"', Executable);
+    if EndQuote = 0 then Exit;
+    Executable := Copy(Executable, 1, EndQuote - 1);
+  end
+  else
+    Executable := Command;
+  if SameInstallPath(Executable, ExpandConstant('{app}\App\motionwallpaper-agent.exe')) then
+  begin
+    Log('Removing startup entry owned by this installation.');
+    RegDeleteValue(HKCU, MW_RUN_KEY, '{#MyStartupValueName}');
+  end
+  else Log('Keeping startup entry owned by a different installation.');
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    StopInstallationProcesses();
+    RemoveOwnedStartupEntry();
+  end;
+end;
 
 function WriteDurableMarkerAtomic(const MarkerPath, Value: String): Boolean;
 var

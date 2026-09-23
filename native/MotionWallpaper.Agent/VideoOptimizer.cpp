@@ -2,8 +2,10 @@
 
 #include "VideoTranscoder.h"
 #include "VideoVariantPolicy.h"
+#include "VideoStillPreview.h"
 #include "../MotionWallpaper.Common/Common.h"
 #include "../MotionWallpaper.Common/VariantCache.h"
+#include "../MotionWallpaper.Common/MediaProbe.h"
 #include "../MotionWallpaper.Renderer/AdapterPolicy.h"
 
 #include <windows.h>
@@ -35,83 +37,106 @@ using namespace winrt;
 
 namespace
 {
-    struct SourceVisualMetadata
-    {
-        uint32_t profile{};
-        uint32_t transferFunction{};
-        uint32_t primaries{};
-        bool profileKnown{};
-        bool transferFunctionKnown{};
-        bool primariesKnown{};
-    };
-
     struct SourceRate
     {
         uint32_t numerator{};
         uint32_t denominator{};
         uint32_t width{};
         uint32_t height{};
+        uint32_t encodedWidth{};
+        uint32_t encodedHeight{};
         uint64_t duration100ns{};
-        bool softwareFallbackAllowed{ true };
-        bool softwarePlaybackConversionAllowed{ true };
-        bool softwarePlaybackFriendly{};
+        bool matchesSdrOutput{};
+        uint32_t profile{};
+        bool profileKnown{};
         motion::agent::VideoSourceCodec codec{ motion::agent::VideoSourceCodec::Unknown };
-        SourceVisualMetadata visual;
     };
 
-    SourceRate source_rate(fs::path const& source)
+    struct VariantValidationSpec
     {
-        com_ptr<IMFSourceReader> reader;
-        if (FAILED(MFCreateSourceReaderFromURL(source.c_str(), nullptr, reader.put()))) return {};
-        com_ptr<IMFMediaType> type;
-        if (FAILED(reader->GetNativeMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, type.put()))) return {};
-        SourceRate result;
-        PROPVARIANT duration{};
-        PropVariantInit(&duration);
-        if (SUCCEEDED(reader->GetPresentationAttribute(static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE),
-            MF_PD_DURATION, &duration))) {
-            if (duration.vt == VT_UI8) result.duration100ns = duration.uhVal.QuadPart;
-            else if (duration.vt == VT_I8 && duration.hVal.QuadPart > 0) {
-                result.duration100ns = static_cast<uint64_t>(duration.hVal.QuadPart);
+        uint32_t width{}, height{}, targetFps{};
+        uint64_t duration100ns{};
+        bool operator==(VariantValidationSpec const&) const = default;
+    };
+
+    struct VariantFileFingerprint
+    {
+        motion::FilesystemObjectIdentity identity;
+        uint64_t size{}, modified{};
+        bool operator==(VariantFileFingerprint const&) const = default;
+    };
+
+    struct VariantValidationEntry
+    {
+        VariantFileFingerprint source;
+        VariantFileFingerprint variant;
+        VariantValidationSpec specification;
+        bool valid{};
+    };
+
+    std::optional<VariantFileFingerprint> variant_file_fingerprint(HANDLE file) noexcept
+    {
+        BY_HANDLE_FILE_INFORMATION information{};
+        if (!GetFileInformationByHandle(file, &information) ||
+            (information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return {};
+        VariantFileFingerprint result;
+        result.size = (static_cast<uint64_t>(information.nFileSizeHigh) << 32) | information.nFileSizeLow;
+        result.modified = (static_cast<uint64_t>(information.ftLastWriteTime.dwHighDateTime) << 32) |
+            information.ftLastWriteTime.dwLowDateTime;
+        FILE_ID_INFO identity{};
+        if (GetFileInformationByHandleEx(file, FileIdInfo, &identity, sizeof(identity))) {
+            result.identity.volumeSerialNumber = identity.VolumeSerialNumber;
+            std::copy(std::begin(identity.FileId.Identifier), std::end(identity.FileId.Identifier),
+                result.identity.fileId.begin());
+        } else {
+            // FAT/exFAT may not expose FILE_ID_INFO. The handle's volume and
+            // 64-bit file index still distinguish ordinary replacements.
+            result.identity.volumeSerialNumber = information.dwVolumeSerialNumber;
+            auto index = (static_cast<uint64_t>(information.nFileIndexHigh) << 32) | information.nFileIndexLow;
+            for (size_t byte = 0; byte < sizeof(index); ++byte) {
+                result.identity.fileId[byte] = static_cast<uint8_t>(index >> (byte * 8));
             }
         }
-        PropVariantClear(&duration);
-        if (FAILED(MFGetAttributeRatio(type.get(), MF_MT_FRAME_RATE, &result.numerator, &result.denominator))) return {};
-        MFGetAttributeSize(type.get(), MF_MT_FRAME_SIZE, &result.width, &result.height);
-        GUID subtype{};
-        UINT32 profile{};
-        bool subtypeKnown = SUCCEEDED(type->GetGUID(MF_MT_SUBTYPE, &subtype));
-        bool hasProfile = SUCCEEDED(type->GetUINT32(MF_MT_MPEG2_PROFILE, &profile));
-        UINT32 transferFunction{};
-        bool transferFunctionKnown = SUCCEEDED(
-            type->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transferFunction));
-        bool hdrTransfer = transferFunctionKnown &&
-            (transferFunction == MFVideoTransFunc_2084 || transferFunction == MFVideoTransFunc_HLG);
-        UINT32 primaries{};
-        bool primariesKnown = SUCCEEDED(type->GetUINT32(MF_MT_VIDEO_PRIMARIES, &primaries));
-        bool bt2020Primaries = primariesKnown &&
-            primaries == MFVideoPrimaries_BT2020;
-        auto codec = subtypeKnown && (subtype == MFVideoFormat_HEVC || subtype == MFVideoFormat_HEVC_ES)
-            ? motion::agent::VideoSourceCodec::Hevc
-            : subtypeKnown && (subtype == MFVideoFormat_H264 || subtype == MFVideoFormat_H264_ES)
-                ? motion::agent::VideoSourceCodec::H264
-                : subtypeKnown && subtype == MFVideoFormat_VP90
-                    ? motion::agent::VideoSourceCodec::Vp9
-                    : subtypeKnown && subtype == MFVideoFormat_AV1
-                        ? motion::agent::VideoSourceCodec::Av1
-                : motion::agent::VideoSourceCodec::Unknown;
-        result.codec = codec;
-        result.visual = { profile, transferFunction, primaries,
-            hasProfile, transferFunctionKnown, primariesKnown };
-        result.softwareFallbackAllowed = motion::agent::video_software_fallback_allowed(
-            codec, hasProfile, profile, hdrTransfer, bt2020Primaries);
-        // The internal CPU playback copy may reduce SDR 10-bit material to
-        // 8-bit because the source remains untouched. HDR/BT.2020 requires an
-        // explicit tone-mapping policy and must never be silently flattened.
-        result.softwarePlaybackConversionAllowed = motion::agent::video_cpu_conversion_allowed(
-            hdrTransfer, bt2020Primaries);
-        result.softwarePlaybackFriendly = codec == motion::agent::VideoSourceCodec::H264 &&
-            result.softwareFallbackAllowed;
+        return result.size ? std::optional<VariantFileFingerprint>(result) : std::nullopt;
+    }
+
+    SourceRate source_rate(fs::path const& ffmpeg, fs::path const& source,
+        std::function<bool()> const& cancelled = {})
+    {
+        auto info = motion::probe_video(ffmpeg, source, 10000, cancelled);
+        if (!info) return {};
+        SourceRate result;
+        result.numerator = info->frameRateNumerator;
+        result.denominator = info->frameRateDenominator;
+        result.width = info->width;
+        result.height = info->height;
+        result.encodedWidth = info->width;
+        result.encodedHeight = info->height;
+        if (info->rotationDegrees == 90 || info->rotationDegrees == 270) {
+            std::swap(result.width, result.height);
+        }
+        result.duration100ns = info->duration100ns;
+        using motion::agent::VideoSourceCodec;
+        if (info->codecName == "h264") {
+            result.codec = VideoSourceCodec::H264;
+            result.profile = info->profile == "High" ? 100u : info->profile == "Main" ? 77u :
+                info->profile == "Baseline" || info->profile == "Constrained Baseline" ? 66u : 0u;
+            result.profileKnown = result.profile != 0;
+        } else if (info->codecName == "hevc") {
+            result.codec = VideoSourceCodec::Hevc;
+            result.profile = info->profile == "Main 10" ? 2u : info->profile == "Main" ? 1u : 0u;
+            result.profileKnown = result.profile != 0;
+        } else if (info->codecName == "vp9") {
+            result.codec = VideoSourceCodec::Vp9;
+            result.profile = info->profile == "Profile 2" ? 2u : 0u;
+            result.profileKnown = info->profile == "Profile 0" || info->profile == "Profile 2";
+        } else if (info->codecName == "av1") {
+            result.codec = VideoSourceCodec::Av1;
+            result.profileKnown = info->profile == "Main";
+        }
+        result.matchesSdrOutput = info->rotationDegrees == 0 && motion::agent::video_matches_sdr_output(
+            info->codecName, info->pixelFormat, info->bitDepth,
+            info->colorTransfer, info->colorPrimaries, info->colorSpace, info->colorRange);
         return result;
     }
 
@@ -125,36 +150,12 @@ namespace
         uint32_t frameRateDenominator{};
     };
 
-    SourceDecodeRequirement source_decode_requirement(fs::path const& source)
+    SourceDecodeRequirement source_decode_requirement(fs::path const& ffmpeg, fs::path const& source)
     {
-        com_ptr<IMFSourceReader> reader;
-        if (FAILED(MFCreateSourceReaderFromURL(source.c_str(), nullptr, reader.put()))) return {};
-        com_ptr<IMFMediaType> type;
-        if (FAILED(reader->GetNativeMediaType(
-                static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, type.put()))) return {};
-
-        GUID subtype{};
-        UINT32 profile{};
-        uint32_t width{}, height{};
-        bool subtypeKnown = SUCCEEDED(type->GetGUID(MF_MT_SUBTYPE, &subtype));
-        bool profileKnown = SUCCEEDED(type->GetUINT32(MF_MT_MPEG2_PROFILE, &profile));
-        if (!subtypeKnown || FAILED(MFGetAttributeSize(
-                type.get(), MF_MT_FRAME_SIZE, &width, &height)) || !width || !height) return {};
-
-        auto codec = (subtype == MFVideoFormat_H264 || subtype == MFVideoFormat_H264_ES)
-            ? motion::agent::VideoSourceCodec::H264
-            : (subtype == MFVideoFormat_HEVC || subtype == MFVideoFormat_HEVC_ES)
-                ? motion::agent::VideoSourceCodec::Hevc
-                : subtype == MFVideoFormat_VP90
-                    ? motion::agent::VideoSourceCodec::Vp9
-                    : subtype == MFVideoFormat_AV1
-                        ? motion::agent::VideoSourceCodec::Av1
-                        : motion::agent::VideoSourceCodec::Unknown;
-        uint32_t frameRateNumerator{}, frameRateDenominator{};
-        MFGetAttributeRatio(type.get(), MF_MT_FRAME_RATE,
-            &frameRateNumerator, &frameRateDenominator);
-        return { motion::agent::video_hardware_decode_profile(codec, profileKnown, profile),
-            width, height, frameRateNumerator, frameRateDenominator };
+        auto info = source_rate(ffmpeg, source);
+        return { motion::agent::video_hardware_decode_profile(
+                info.codec, info.profileKnown, info.profile),
+            info.encodedWidth, info.encodedHeight, info.numerator, info.denominator };
     }
 
     bool decoder_configuration_available(ID3D11VideoDevice* videoDevice, GUID const& profile,
@@ -252,10 +253,10 @@ namespace
         return hasDesktopOutput ? 1 : 2;
     }
 
-    std::wstring source_hardware_decode_adapter(fs::path const& source,
-        std::wstring const& preferredAdapter, uint64_t aggregateOutputPixels)
+    std::vector<motion::agent::gpu_probe_detail::RankedDecodeAdapter> source_hardware_decode_adapters(fs::path const& ffmpeg, fs::path const& source,
+        std::wstring const& preferredAdapter, uint64_t aggregateOutputPixels, std::wstring const& onlyAdapter)
     {
-        auto requirement = source_decode_requirement(source);
+        auto requirement = source_decode_requirement(ffmpeg, source);
         if (requirement.profile == motion::agent::VideoHardwareDecodeProfile::Unsupported) return {};
 
         com_ptr<IDXGIFactory1> factory;
@@ -316,7 +317,10 @@ namespace
             D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
             D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0
         };
-        for (auto const& candidate : candidates) {
+        std::vector<motion::agent::gpu_probe_detail::RankedDecodeAdapter> supported;
+        for (size_t rank = 0; rank < candidates.size(); ++rank) {
+            auto const& candidate = candidates[rank];
+            if (!onlyAdapter.empty() && candidate.luid != onlyAdapter) continue;
             com_ptr<ID3D11Device> device;
             if (FAILED(D3D11CreateDevice(candidate.adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                     D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
@@ -324,10 +328,10 @@ namespace
                     device.put(), nullptr, nullptr)) || !device) continue;
             auto videoDevice = device.try_as<ID3D11VideoDevice>();
             if (videoDevice && device_supports_decode_requirement(videoDevice.get(), requirement)) {
-                return candidate.luid;
+                supported.push_back({ static_cast<uint32_t>(rank), candidate.luid });
             }
         }
-        return {};
+        return supported;
     }
 
     bool current_variant(fs::path const& source, fs::path const& variant)
@@ -462,15 +466,20 @@ namespace
         return result;
     }
 
-    bool has_transcode_space(fs::path const& directory, fs::path const& source)
+    bool has_transcode_space(fs::path const& directory, fs::path const& source,
+        VariantValidationSpec const& specification)
     {
         ULARGE_INTEGER available{};
         if (!GetDiskFreeSpaceExW(directory.c_str(), &available, nullptr, nullptr)) return false;
         std::error_code error;
         auto sourceSize = fs::file_size(source, error);
         if (error) return false;
-        auto worstCase = sourceSize > (UINT64_MAX - diskReserve) / 6
-            ? UINT64_MAX : sourceSize * 6 + diskReserve;
+        auto rate = motion::agent::video_transcode_rate_control(
+            specification.width, specification.height, specification.targetFps,
+            motion::agent::VideoTranscodeCodec::H264, sourceSize, specification.duration100ns);
+        auto outputBudget = rate.maximumOutputBytes;
+        auto worstCase = outputBudget > UINT64_MAX - diskReserve
+            ? UINT64_MAX : outputBudget + diskReserve;
         return available.QuadPart >= worstCase;
     }
 
@@ -580,8 +589,8 @@ namespace
                 std::error_code itemError;
                 if (!entries->is_regular_file(itemError) || itemError) continue;
                 auto name = entries->path().filename().wstring();
-                if (name.starts_with(L"balanced-") && name.ends_with(L"-v5.mp4")) balanced = entries->path();
-                else if (name.starts_with(L"power-saver-") && name.ends_with(L"-v5.mp4")) powerSaver = entries->path();
+                if (name.starts_with(L"balanced-") && name.ends_with(L"-v7.mp4")) balanced = entries->path();
+                else if (name.starts_with(L"power-saver-") && name.ends_with(L"-v7.mp4")) powerSaver = entries->path();
             }
             if (balanced.empty() || powerSaver.empty()) return;
             auto balancedName = balanced.filename().wstring();
@@ -661,7 +670,7 @@ namespace
                     auto name = entries->path().filename().wstring();
                     if (!name.starts_with(variant_prefix(mode)) || name.ends_with(L".part.mp4") ||
                         entries->path().extension() != L".mp4") continue;
-                    Candidate candidate{ entries->path(), name.ends_with(L"-v5.mp4"),
+                    Candidate candidate{ entries->path(), name.ends_with(L"-v7.mp4"),
                         entries->last_write_time(itemError) };
                     if (itemError) continue;
                     if (!keep || (candidate.currentPolicy && !keep->currentPolicy) ||
@@ -679,6 +688,92 @@ namespace
 
 namespace motion::agent
 {
+    int run_video_gpu_probe_cli(int argc, wchar_t** argv)
+    {
+        if (argc < 2 || (wcscmp(argv[1], L"--probe-gpu-inventory") != 0 &&
+            wcscmp(argv[1], L"--probe-gpu-decode") != 0 &&
+            wcscmp(argv[1], L"--probe-cuda-device") != 0)) return -1;
+        auto status = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(status)) return 2;
+        struct ComGuard { ~ComGuard() { CoUninitialize(); } } guard;
+        try {
+            std::ostringstream output;
+            if (wcscmp(argv[1], L"--probe-cuda-device") == 0) {
+                if (argc != 3) return 2;
+                // Load optional vendor code only in this bounded child. CUDA
+                // ordinals are NOT DXGI indices; match the Windows adapter LUID.
+                auto module = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                if (!module) return 3;
+                struct ModuleGuard { HMODULE value; ~ModuleGuard() { FreeLibrary(value); } } moduleGuard{ module };
+                auto initialize = reinterpret_cast<int (WINAPI*)(unsigned)>(GetProcAddress(module, "cuInit"));
+                auto getCount = reinterpret_cast<int (WINAPI*)(int*)>(GetProcAddress(module, "cuDeviceGetCount"));
+                auto getDevice = reinterpret_cast<int (WINAPI*)(int*, int)>(GetProcAddress(module, "cuDeviceGet"));
+                auto getLuid = reinterpret_cast<int (WINAPI*)(char*, unsigned*, int)>(GetProcAddress(module, "cuDeviceGetLuid"));
+                int count{};
+                if (!initialize || !getCount || !getDevice || !getLuid || initialize(0) || getCount(&count) || count > 64) return 3;
+                bool found{};
+                for (int index = 0; index < count; ++index) {
+                    int device{}; unsigned nodeMask{}; LUID luid{};
+                    if (getDevice(&device, index) || getLuid(reinterpret_cast<char*>(&luid), &nodeMask, device)) continue;
+                    auto identity = std::to_wstring(luid.HighPart) + L":" + std::to_wstring(luid.LowPart);
+                    if (identity != argv[2]) continue;
+                    output << "cuda-v1 " << index << ' ' << luid.HighPart << ' ' << luid.LowPart << '\n';
+                    found = true;
+                    break;
+                }
+                if (!found) return 3;
+            } else if (wcscmp(argv[1], L"--probe-gpu-decode") == 0) {
+                if (argc != 7) return 2;
+                size_t consumed{};
+                auto pixels = std::stoull(argv[5], &consumed);
+                if (consumed != wcslen(argv[5])) return 2;
+                auto candidates = source_hardware_decode_adapters(argv[2], argv[3],
+                    wcscmp(argv[4], L"none") == 0 ? std::wstring{} : std::wstring(argv[4]), pixels, argv[6]);
+                output << gpu_probe_detail::ranked_decode_output(std::move(candidates));
+            } else {
+                if (argc != 2) return 2;
+                com_ptr<IDXGIFactory1> factory;
+                if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put())))) return 3;
+                std::vector<std::string> adapters;
+                for (UINT index = 0; index < 64; ++index) {
+                    com_ptr<IDXGIAdapter1> adapter;
+                    auto result = factory->EnumAdapters1(index, adapter.put());
+                    if (result == DXGI_ERROR_NOT_FOUND) break;
+                    if (FAILED(result)) return 3;
+                    DXGI_ADAPTER_DESC1 description{};
+                    if (FAILED(adapter->GetDesc1(&description))) return 3;
+                    if (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+                    LARGE_INTEGER driver{};
+                    adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver);
+                    std::vector<std::string> displays;
+                    for (UINT displayIndex = 0; displayIndex < 64; ++displayIndex) {
+                        com_ptr<IDXGIOutput> display;
+                        auto displayResult = adapter->EnumOutputs(displayIndex, display.put());
+                        if (displayResult == DXGI_ERROR_NOT_FOUND) break;
+                        if (FAILED(displayResult)) return 3;
+                        DXGI_OUTPUT_DESC value{};
+                        if (SUCCEEDED(display->GetDesc(&value)) && value.AttachedToDesktop)
+                            displays.push_back(wide_to_utf8(value.DeviceName));
+                    }
+                    std::ostringstream line;
+                    line << description.VendorId << ' ' << description.DedicatedVideoMemory << ' ' << index << ' ' <<
+                        description.AdapterLuid.HighPart << ' ' << description.AdapterLuid.LowPart << ' ' <<
+                        static_cast<uint64_t>(driver.QuadPart) << ' ' << displays.size();
+                    for (auto const& display : displays) line << ' ' << display;
+                    adapters.push_back(line.str());
+                }
+                // Device creation is tested separately per adapter so one bad
+                // driver cannot prevent us enumerating the remaining devices.
+                output << "gpu-v1 " << (adapters.empty() ? 0 : 1) << ' ' << adapters.size() << '\n';
+                for (auto const& adapter : adapters) output << adapter << '\n';
+            }
+            auto text = output.str();
+            DWORD written{};
+            return WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), text.data(), static_cast<DWORD>(text.size()),
+                &written, nullptr) && written == text.size() ? 0 : 3;
+        } catch (...) { return 3; }
+    }
+
     struct VideoOptimizer::Impl
     {
         struct Request
@@ -689,13 +784,13 @@ namespace motion::agent
             uint32_t width{};
             uint32_t height{};
             uint64_t duration100ns{};
-            SourceVisualMetadata sourceVisual;
             std::string mode;
             motion::VariantGenerationRequest durableRequest;
             uint64_t generation{};
             bool explicitRequest{};
             bool softwareFallbackAllowed{ true };
             bool softwarePlaybackTarget{};
+            std::string failureContext;
 
             [[nodiscard]] std::wstring Key() const
             {
@@ -718,16 +813,20 @@ namespace motion::agent
             // repair. Keep the root identity handles alive for the whole pass
             // and resolve every path through the volume-GUID namespace.
             normalize_variant_profiles(wallpapersAccess->path);
+            stillPreviews_ = std::make_unique<VideoStillPreview>(ffmpeg_,
+                applicationRoot / L"Config" / L"DesktopPreviews");
             mediaFoundationStarted_ = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_FULL));
             if (mediaFoundationStarted_) {
                 worker_ = std::jthread([this](std::stop_token stop) { Run(stop); });
             } else {
-                append_log(logRoot_, L"无法初始化媒体优化器，继续使用原视频。");
+                append_log(logRoot_, L"无法初始化媒体优化器，所需性能副本不可用，保留原视频并显示静态预览。");
             }
         }
 
         ~Impl()
         {
+            stillPreviews_.reset();
+            gpu_probe_detail::service().Quiesce(15000);
             worker_.request_stop();
             generation_.fetch_add(1, std::memory_order_relaxed);
             condition_.notify_all();
@@ -747,41 +846,52 @@ namespace motion::agent
                 return { source, RetainLibraryPlaybackLease(trust, acquirePlaybackLease),
                     performanceCopyRequired, performanceCopyPending };
             };
-            auto mode = softwarePlaybackTarget ? std::string("cpu-smooth") : requestedMode;
-            bool selectedPerformanceMode = !softwarePlaybackTarget &&
-                (mode == "balanced" || mode == "power-saver");
-            bool playbackCopyMode = selectedPerformanceMode || softwarePlaybackTarget;
             if (source.empty()) return {};
             auto stableSource = StablePath(source);
             auto stableMediaDirectory = StablePath(source.parent_path());
             if (!stableSource || !stableMediaDirectory) return {};
-            if (mode == "original") return sourceResult();
+            // Original is an explicit direct-play request even if a caller
+            // still carries a software compatibility flag from an earlier
+            // selection. It must never adopt or generate a replacement.
+            if (requestedMode == "original") return sourceResult();
+            auto mode = softwarePlaybackTarget ? std::string("cpu-smooth") : requestedMode;
+            bool selectedPerformanceMode = !softwarePlaybackTarget &&
+                (mode == "balanced" || mode == "power-saver");
+            bool playbackCopyMode = selectedPerformanceMode || softwarePlaybackTarget;
             // If the optimizer itself is unavailable, fail closed for a
-            // selected performance tier. Original and internal cpu-smooth
-            // paths retain their existing source-playback behavior.
+            // selected performance tier or a CPU compatibility request.
             if (!mediaFoundationStarted_) return sourceResult(playbackCopyMode);
             SourceRate rate;
+            bool rateCached{};
+            auto rateKey = source.wstring() + L"\n" + motion::utf8_to_wide(
+                video_file_fingerprint(*stableSource) + "|" + video_file_fingerprint(ffmpeg_.parent_path() / L"ffprobe.exe"));
             {
                 std::lock_guard lock(mutex_);
-                auto found = rates_.find(source.wstring());
-                if (found != rates_.end()) rate = found->second;
+                auto found = rates_.find(rateKey);
+                if (found != rates_.end()) { rate = found->second; rateCached = true; }
             }
-            if (!rate.numerator) {
-                rate = source_rate(*stableSource);
+            if (!rateCached) {
+                rate = source_rate(ffmpeg_, *stableSource);
+                if (!rate.numerator) append_log(logRoot_, L"视频信息探测失败或超时: " + source.filename().wstring());
                 std::lock_guard lock(mutex_);
-                rates_[source.wstring()] = rate;
+                rates_[rateKey] = rate;
             }
 
-            auto dimensions = softwarePlaybackTarget
-                ? video_cpu_variant_dimensions(rate.width, rate.height, targetWidth, targetHeight)
-                : video_variant_dimensions(rate.width, rate.height, targetWidth, targetHeight);
+            auto dimensions = video_sdr_variant_dimensions(
+                mode, rate.width, rate.height, targetWidth, targetHeight);
             auto decision = video_variant_decision(
                 mode, dimensions.first, dimensions.second,
-                rate.numerator, rate.denominator, targetRefreshRate);
-            bool codecNeedsVariant = softwarePlaybackTarget && !rate.softwarePlaybackFriendly;
+                rate.numerator, rate.denominator,
+                targetRefreshRate);
+            bool codecNeedsVariant = !rate.matchesSdrOutput;
             if (!video_needs_variant(rate.numerator, rate.denominator, decision.targetFps,
                 rate.width, rate.height, dimensions.first, dimensions.second) && !codecNeedsVariant) return sourceResult();
-            if (softwarePlaybackTarget && !rate.softwarePlaybackConversionAllowed) {
+            if (!rate.width || !rate.height || !rate.numerator || !rate.denominator) {
+                if (selectedPerformanceMode) {
+                    auto request = EnsureAutomaticRequest(source.parent_path(), mode,
+                        motion::VariantProgressState::queued);
+                    if (request) FailGeneration(source.parent_path(), request);
+                }
                 return sourceResult(true);
             }
             auto destination = source.parent_path() / L"Variants" / decision.fileName;
@@ -789,16 +899,31 @@ namespace motion::agent
 
             std::shared_ptr<void> playbackLease;
             auto playbackLeaseOutput = acquirePlaybackLease ? &playbackLease : nullptr;
-            if (TryAdoptVariant(source, mode, destination, playbackLeaseOutput, trust)) {
-                append_log(logRoot_, L"使用壁纸优化缓存: " + destination.filename().wstring());
+            VariantValidationSpec expected{ dimensions.first, dimensions.second, decision.targetFps, rate.duration100ns };
+            if (TryAdoptVariant(source, mode, destination, expected, playbackLeaseOutput, trust)) {
                 return { destination, std::move(playbackLease), false, false };
             }
+            auto legacyName = unchanged_legacy_fill_variant(decision.fileName,
+                rate.width, rate.height, dimensions.first, dimensions.second);
+            if (!legacyName.empty()) {
+                auto legacy = destination.parent_path() / legacyName;
+                if (TryAdoptVariant(source, mode, legacy, expected, playbackLeaseOutput, trust)) {
+                    return { legacy, std::move(playbackLease), false, false };
+                }
+            }
             if (ReuseEquivalentVariant(source, destination, mode)) {
-                if (TryAdoptVariant(source, mode, destination, playbackLeaseOutput, trust)) {
+                if (TryAdoptVariant(source, mode, destination, expected, playbackLeaseOutput, trust)) {
                     append_log(logRoot_, L"复用相同规格的壁纸优化副本: " + destination.filename().wstring());
                     return { destination, std::move(playbackLease), false, false };
                 }
             }
+            auto inventory = video_gpu_inventory_async();
+            if (inventory.pending) {
+                auto result = sourceResult(playbackCopyMode);
+                result.gpuProbePending = true;
+                return result;
+            }
+            auto failureContext = FailureContext(*stableSource, destination, inventory);
             // Cancellation, pause and profile suppression control generation,
             // not adoption of an already validated copy or presentation
             // safety. Once we know a missing copy is genuinely required,
@@ -806,7 +931,7 @@ namespace motion::agent
             if (fs::is_regular_file(motion::variant_cancelled_path(*stableMediaDirectory)) ||
                 motion::variant_generation_paused(*stableMediaDirectory) ||
                 motion::variant_generation_suppressed(*stableMediaDirectory, mode) ||
-                GenerationFailed(source.parent_path(), mode)) {
+                GenerationFailed(source.parent_path(), mode, failureContext)) {
                 return sourceResult(playbackCopyMode);
             }
             bool battery = on_battery();
@@ -843,12 +968,11 @@ namespace motion::agent
                     // background/import work without interrupting an active
                     // transcode, which keeps prioritization cheap and stable.
                     pending_.push_front(Request{ source, destination, decision.targetFps,
-                        dimensions.first, dimensions.second, rate.duration100ns, rate.visual, mode,
+                        dimensions.first, dimensions.second, rate.duration100ns, mode,
                         durableRequest, currentGeneration,
                         static_cast<bool>(durableRequest),
-                        softwarePlaybackTarget ? rate.softwarePlaybackConversionAllowed :
-                            rate.softwareFallbackAllowed,
-                        softwarePlaybackTarget });
+                        true,
+                        softwarePlaybackTarget, failureContext });
                     if (softwarePlaybackTarget) {
                         append_log(logRoot_, L"源视频无法直接播放，已排队生成 H.264 兼容副本: " +
                             source.filename().wstring());
@@ -902,32 +1026,55 @@ namespace motion::agent
             // clearing a failure, pruning, or enqueueing any work.
             if (!durableRequestIsCurrent()) return;
             SourceRate rate;
+            bool rateCached{};
+            auto rateKey = source.wstring() + L"\n" + motion::utf8_to_wide(
+                video_file_fingerprint(*stableSource) + "|" + video_file_fingerprint(ffmpeg_.parent_path() / L"ffprobe.exe"));
             {
                 std::lock_guard lock(mutex_);
-                auto found = rates_.find(source.wstring());
-                if (found != rates_.end()) rate = found->second;
+                auto found = rates_.find(rateKey);
+                // An explicit retry must not inherit a transient probe failure.
+                if (found != rates_.end() && found->second.width && found->second.height &&
+                    found->second.numerator && found->second.denominator) {
+                    rate = found->second;
+                    rateCached = true;
+                }
             }
-            if (!rate.numerator) {
-                rate = source_rate(*stableSource);
+            if (!rateCached) {
+                rate = source_rate(ffmpeg_, *stableSource);
                 std::lock_guard lock(mutex_);
-                rates_[source.wstring()] = rate;
+                rates_[rateKey] = rate;
             }
-            auto dimensions = video_variant_dimensions(rate.width, rate.height, targetWidth, targetHeight);
+            if (!rate.width || !rate.height || !rate.numerator || !rate.denominator) {
+                FailGeneration(mediaDirectory, durableRequest);
+                return;
+            }
+            auto dimensions = video_sdr_variant_dimensions(mode, rate.width, rate.height, targetWidth, targetHeight);
             auto decision = video_variant_decision(mode, dimensions.first, dimensions.second,
                 rate.numerator, rate.denominator, targetRefreshRate);
             if (!durableRequestIsCurrent()) return;
-            if (!video_needs_variant(rate.numerator, rate.denominator, decision.targetFps,
+            if (rate.matchesSdrOutput && !video_needs_variant(rate.numerator, rate.denominator, decision.targetFps,
                 rate.width, rate.height, dimensions.first, dimensions.second)) {
                 CompleteGeneration(mediaDirectory, durableRequest);
                 return;
             }
             auto destination = mediaDirectory / L"Variants" / decision.fileName;
-            if (TryAdoptVariant(source, mode, destination)) {
+            auto inventory = video_gpu_inventory_async();
+            if (inventory.pending) return;
+            auto failureContext = FailureContext(*stableSource, destination, inventory);
+            VariantValidationSpec expected{ dimensions.first, dimensions.second, decision.targetFps, rate.duration100ns };
+            if (TryAdoptVariant(source, mode, destination, expected)) {
+                CompleteGeneration(mediaDirectory, durableRequest);
+                return;
+            }
+            auto legacyName = unchanged_legacy_fill_variant(decision.fileName,
+                rate.width, rate.height, dimensions.first, dimensions.second);
+            if (!legacyName.empty() && TryAdoptVariant(source, mode,
+                    destination.parent_path() / legacyName, expected)) {
                 CompleteGeneration(mediaDirectory, durableRequest);
                 return;
             }
             if (ReuseEquivalentVariant(source, destination, mode)) {
-                if (TryAdoptVariant(source, mode, destination)) {
+                if (TryAdoptVariant(source, mode, destination, expected)) {
                     CompleteGeneration(mediaDirectory, durableRequest);
                     return;
                 }
@@ -958,9 +1105,9 @@ namespace motion::agent
                     }
                     if (!alreadyPending) {
                         pending_.push_back(Request{ source, destination, decision.targetFps,
-                            dimensions.first, dimensions.second, rate.duration100ns, rate.visual, mode,
+                            dimensions.first, dimensions.second, rate.duration100ns, mode,
                             durableRequest, generation_.load(std::memory_order_relaxed), true,
-                            rate.softwareFallbackAllowed, false });
+                            true, false, failureContext });
                         condition_.notify_one();
                     }
                     publishState = motion::VariantProgressState::queued;
@@ -971,31 +1118,16 @@ namespace motion::agent
             WriteProgress(mediaDirectory, durableRequest, publishState);
         }
 
-        std::wstring SourceHardwareDecodeAdapter(fs::path const& source,
+        VideoGpuDecodeProbe SourceHardwareDecodeCandidates(fs::path const& source,
             std::wstring const& preferredAdapter, uint64_t aggregateOutputPixels)
         {
             auto trust = AcquireLibraryTrust();
             if (libraryTrust_ && !trust) return {};
             if (source.empty() || !mediaFoundationStarted_) return {};
-            auto cacheKey = source.wstring() + L"\n" + preferredAdapter + L"\n" +
-                std::to_wstring(aggregateOutputPixels);
-            {
-                std::lock_guard lock(mutex_);
-                auto cached = hardwareDecodeAdapters_.find(cacheKey);
-                if (cached != hardwareDecodeAdapters_.end()) return cached->second;
-            }
-
-            // D3D11 decoder profiles are queried outside the optimizer mutex:
-            // device/driver discovery can be slow and must never stall Resolve
-            // or the transcode worker. Imported media is immutable, and a
-            // topology invalidation drops this cache before it can be reused.
             auto stableSource = StablePath(source);
             if (!stableSource) return {};
-            auto adapter = source_hardware_decode_adapter(
-                *stableSource, preferredAdapter, aggregateOutputPixels);
-            std::lock_guard lock(mutex_);
-            hardwareDecodeAdapters_[cacheKey] = adapter;
-            return adapter;
+            return video_gpu_decode_async(ffmpeg_, *stableSource, preferredAdapter,
+                aggregateOutputPixels, std::static_pointer_cast<void>(trust));
         }
 
         VideoPlaybackLease AcquirePlaybackLease(fs::path const& path)
@@ -1026,14 +1158,32 @@ namespace motion::agent
                 : RetainLibraryPlaybackLease(trust, true);
         }
 
+        ResolvedVideoPath ResolveStillPreview(fs::path const& source)
+        {
+            if (source.empty() || !motion::filesystem_path_is_nested(wallpapersPath_, source)) return {};
+            auto access = AcquireStableAccess(source);
+            if (!access) return {};
+            struct SourceLease
+            {
+                std::shared_ptr<motion::MediaLibraryTrustLease> trust;
+                VideoPlaybackLease playback;
+            };
+            auto lease = std::make_shared<SourceLease>(access->trust, AcquirePlaybackLease(source));
+            auto preview = stillPreviews_->Read(access->path, std::move(lease));
+            return { std::move(preview.path), std::move(preview.lease) };
+        }
+
         void InvalidateChoices()
         {
+            invalidate_video_gpu_probes();
             generation_.fetch_add(1, std::memory_order_relaxed);
             std::lock_guard lock(mutex_);
             RetireChoicesLocked();
             failed_.clear();
             pending_.clear();
             hardwareDecodeAdapters_.clear();
+            rates_.clear();
+            validatedVariants_.clear();
         }
 
         void SetGenerationAllowed(bool allowed)
@@ -1051,16 +1201,28 @@ namespace motion::agent
 
         [[nodiscard]] bool Quiesce(uint32_t timeoutMilliseconds)
         {
-            std::unique_lock lock(mutex_);
-            if (generationAllowed_) {
-                generationAllowed_ = false;
-                generation_.fetch_add(1, std::memory_order_relaxed);
+            auto started = std::chrono::steady_clock::now();
+            {
+                std::lock_guard lock(mutex_);
+                if (generationAllowed_) {
+                    generationAllowed_ = false;
+                    generation_.fetch_add(1, std::memory_order_relaxed);
+                }
+                pending_.clear();
+                condition_.notify_all();
             }
-            pending_.clear();
-            condition_.notify_all();
+            bool probesIdle = gpu_probe_detail::service().Quiesce(timeoutMilliseconds);
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            auto remaining = elapsed >= timeoutMilliseconds ? 0u : timeoutMilliseconds - static_cast<uint32_t>(elapsed);
+            bool previewsIdle = stillPreviews_->Quiesce(remaining);
+            elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            remaining = elapsed >= timeoutMilliseconds ? 0u : timeoutMilliseconds - static_cast<uint32_t>(elapsed);
+            std::unique_lock lock(mutex_);
             return condition_.wait_for(lock,
-                std::chrono::milliseconds(timeoutMilliseconds),
-                [&] { return !active_; });
+                std::chrono::milliseconds(remaining),
+                [&] { return !active_; }) && probesIdle && previewsIdle;
         }
 
         void SetStorageQuotaBytes(uint64_t quotaBytes) noexcept
@@ -1142,14 +1304,33 @@ namespace motion::agent
                 : motion::VariantGenerationRequest{};
         }
 
+        [[nodiscard]] std::string FailureContext(fs::path const& source, fs::path const& destination,
+            VideoGpuInventory const& inventory) const
+        {
+            return "failure-v1|" + motion::wide_to_utf8(destination.filename().wstring()) + "|" +
+                video_file_fingerprint(source) + "|" +
+                (inventory.succeeded ? inventory.environment : std::string("gpu-probe-unavailable")) + "|" +
+                video_file_fingerprint(ffmpeg_) + "|" + video_file_fingerprint(ffmpeg_.parent_path() / L"ffprobe.exe");
+        }
+
         [[nodiscard]] bool GenerationFailed(
             fs::path const& configuredMediaDirectory,
-            std::string const& mode) const noexcept
+            std::string const& mode, std::string const& context) const noexcept
         {
-            auto stable = StablePath(configuredMediaDirectory);
-            if (!stable) return true;
-            return motion::read_small_file(
-                motion::variant_failed_path(*stable)) == mode;
+            auto access = AcquireStableAccess(configuredMediaDirectory);
+            if (!access) return true;
+            motion::unique_handle failure(CreateFileW(motion::variant_failed_path(access->path).c_str(),
+                GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (!failure) return false;
+            char value[4096]{};
+            DWORD read{};
+            if (!ReadFile(failure.get(), value, sizeof(value), &read, nullptr)) return true;
+            std::string_view record(value, read);
+            if (motion::variant_failure_mode(record) != mode) return false;
+            if (motion::variant_failure_context_matches(record, mode, context)) return true;
+            // Delete only this locked stale failure, never user pause/cancel/
+            // suppression markers or a new record from a concurrent UI retry.
+            return !motion::mark_locked_request_for_deletion(failure.get());
         }
 
         // Playback-created work is a real library task: publish one durable,
@@ -1170,8 +1351,8 @@ namespace motion::agent
                             motion::variant_cancelled_path(mediaDirectory), error) && !error) ||
                     motion::variant_generation_paused(mediaDirectory) ||
                     motion::variant_generation_suppressed(mediaDirectory, mode) ||
-                    motion::read_small_file(
-                        motion::variant_failed_path(mediaDirectory)) == mode;
+                    motion::variant_failure_mode(motion::read_small_file(
+                        motion::variant_failed_path(mediaDirectory))) == mode;
             };
             if (blocked()) return {};
 
@@ -1260,10 +1441,10 @@ namespace motion::agent
         }
 
         bool FailGeneration(fs::path const& configuredMediaDirectory,
-            motion::VariantGenerationRequest const& request) const noexcept
+            motion::VariantGenerationRequest const& request, std::string const& context = {}) const noexcept
         {
             auto access = AcquireStableAccess(configuredMediaDirectory);
-            return access && motion::fail_variant_generation(access->path, request);
+            return access && motion::fail_variant_generation(access->path, request, context);
         }
 
         [[nodiscard]] bool ReuseEquivalentVariant(fs::path const& configuredSource,
@@ -1415,6 +1596,7 @@ namespace motion::agent
                 retainedProfiles_.erase(path);
                 retentionRetryAfter_.erase(path);
                 variantUseTouchAfter_.erase(path);
+                validatedVariants_.erase(path);
                 return true;
             }
             if (error) return false;
@@ -1423,19 +1605,74 @@ namespace motion::agent
                 retainedProfiles_.erase(path);
                 retentionRetryAfter_.erase(path);
                 variantUseTouchAfter_.erase(path);
+                validatedVariants_.erase(path);
                 return true;
             }
             return false;
         }
 
+        bool ValidateVariantForAdoption(fs::path const& stableSource,
+            fs::path const& stableDestination, fs::path const& configuredDestination,
+            VariantValidationSpec const& expected, motion::unique_handle& pinnedVariant)
+        {
+            // Pin this exact file against writes and replacement while the
+            // external probes run. The caller keeps this handle until a
+            // Renderer lease has been published under the removal mutex.
+            pinnedVariant.reset(CreateFileW(stableDestination.c_str(), GENERIC_READ,
+                FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+            if (!pinnedVariant) return false;
+            if (!current_variant(stableSource, stableDestination)) return false;
+            auto variantFingerprint = variant_file_fingerprint(pinnedVariant.get());
+            motion::unique_handle sourceHandle(CreateFileW(stableSource.c_str(), FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+            auto sourceFingerprint = sourceHandle ? variant_file_fingerprint(sourceHandle.get()) : std::nullopt;
+            if (!variantFingerprint || !sourceFingerprint) return false;
+            {
+                std::lock_guard lock(mutex_);
+                auto known = validatedVariants_.find(configuredDestination);
+                if (known != validatedVariants_.end() &&
+                    known->second.source == *sourceFingerprint &&
+                    known->second.variant == *variantFingerprint &&
+                    known->second.specification == expected) return known->second.valid;
+            }
+            auto epoch = generation_.load(std::memory_order_relaxed);
+            auto cancelled = [&] {
+                return !LibraryTrusted() || generation_.load(std::memory_order_relaxed) != epoch;
+            };
+            // Never hold mutex_ across an external decoder or a bounded
+            // process wait. Invalid fingerprints are remembered too so a
+            // damaged cache is not probed again on every policy iteration.
+            auto actual = source_rate(ffmpeg_, stableDestination, cancelled);
+            bool valid = actual.matchesSdrOutput &&
+                video_variant_dimensions_match(actual.width, actual.height, expected.width, expected.height) &&
+                video_variant_rate_matches(actual.numerator, actual.denominator, expected.targetFps) &&
+                video_variant_duration_matches(actual.duration100ns, expected.duration100ns, expected.targetFps) &&
+                video_candidate_decodes_first_frame(stableDestination, cancelled);
+            if (cancelled()) return false;
+            {
+                std::lock_guard lock(mutex_);
+                if (validatedVariants_.size() >= 1024) validatedVariants_.clear();
+                validatedVariants_[configuredDestination] = {
+                    *sourceFingerprint, *variantFingerprint, expected, valid };
+            }
+            if (!valid) append_log(logRoot_, L"优化缓存已损坏或不符合 SDR 规格，将重新生成: " +
+                configuredDestination.filename().wstring());
+            return valid;
+        }
+
         bool TryAdoptVariant(fs::path const& source, std::string const& mode,
-            fs::path const& destination, std::shared_ptr<void>* playbackLease = nullptr,
+            fs::path const& destination, VariantValidationSpec const& expected,
+            std::shared_ptr<void>* playbackLease = nullptr,
             std::shared_ptr<motion::MediaLibraryTrustLease> const& libraryTrust = {})
         {
             auto destinationAccess = AcquireStableAccess(destination);
             auto stableSource = StablePath(source);
             auto stableMediaDirectory = StablePath(source.parent_path());
             if (!destinationAccess || !stableSource || !stableMediaDirectory) return false;
+            motion::unique_handle pinnedVariant;
+            if (!ValidateVariantForAdoption(*stableSource, destinationAccess->path,
+                    destination, expected, pinnedVariant)) return false;
             bool shouldRetain{};
             bool shouldTouchUseTime{};
             auto now = std::chrono::steady_clock::now();
@@ -1477,6 +1714,11 @@ namespace motion::agent
                     }
                 }
             }
+            // Internal removal is now blocked by the Renderer lease/grace.
+            // Releasing this OS pin also permits the LRU timestamp update.
+            // That timestamp changes the fingerprint, causing at most one
+            // fresh validation after a half-hour touch, never per frame.
+            pinnedVariant.reset();
             if (shouldTouchUseTime) {
                 std::error_code ignored;
                 fs::last_write_time(destinationAccess->path,
@@ -1543,7 +1785,8 @@ namespace motion::agent
                     : static_cast<bool>(durableRequestBeforeCompletion);
                 bool accepted = succeeded && !paused && !obsolete && !cancelled && !suppressed && !superseded;
                 if (accepted) {
-                    accepted = TryAdoptVariant(request.source, request.mode, request.destination);
+                    accepted = TryAdoptVariant(request.source, request.mode, request.destination,
+                        { request.width, request.height, request.targetFps, request.duration100ns });
                     if (accepted) {
                         if (request.explicitRequest) {
                             WriteProgress(request.source.parent_path(),
@@ -1565,7 +1808,7 @@ namespace motion::agent
                 if (!succeeded && !paused && request.explicitRequest && !stop.stop_requested() && !obsolete &&
                     !cancelled && !suppressed && !superseded) {
                     FailGeneration(
-                        request.source.parent_path(), request.durableRequest);
+                        request.source.parent_path(), request.durableRequest, request.failureContext);
                 }
                 {
                     std::lock_guard lock(mutex_);
@@ -1599,7 +1842,7 @@ namespace motion::agent
                 if (!paused && !obsolete && !cancelled && !suppressed && !superseded) {
                     append_log(logRoot_, accepted
                         ? L"已生成壁纸优化副本: " + request.destination.filename().wstring()
-                        : L"无法生成壁纸优化副本，继续使用原文件: " + request.source.filename().wstring());
+                        : L"所选壁纸副本规格不可用，保留原文件并显示静态预览: " + request.source.filename().wstring());
                 }
             }
         }
@@ -1671,7 +1914,8 @@ namespace motion::agent
                         });
                 };
                 pruneToStorageQuota();
-                if (!has_transcode_space(directory, *stableSource)) {
+                if (!has_transcode_space(directory, *stableSource,
+                        { request.width, request.height, request.targetFps, request.duration100ns })) {
                     append_log(logRoot_, L"磁盘空间不足，跳过壁纸优化副本生成。");
                     return VideoTranscodeResult::failed;
                 }
@@ -1733,11 +1977,14 @@ namespace motion::agent
                             estimatedRemainingKnown = true;
                         }
                     }
-                    bool persisted = request.explicitRequest &&
-                        motion::write_variant_progress_if_current(*stableMediaDirectory,
+                    bool persisted = request.explicitRequest
+                        ? motion::write_variant_progress_if_current(*stableMediaDirectory,
                             request.durableRequest, motion::VariantProgressState::generating,
                             progress.percent, progress.determinate,
-                            estimatedRemainingSeconds, estimatedRemainingKnown);
+                            estimatedRemainingSeconds, estimatedRemainingKnown)
+                        : motion::write_variant_progress(*stableMediaDirectory, request.mode,
+                            motion::VariantProgressState::generating, progress.percent,
+                            progress.determinate, {}, estimatedRemainingSeconds, estimatedRemainingKnown);
                     // Cancel/pause/suppress and a replacement request are
                     // cross-process file operations. They may land between
                     // the optimistic check above and this write; re-check the
@@ -1759,39 +2006,27 @@ namespace motion::agent
                         lastProgressWrite = now;
                     }
                 };
-                auto preservesSourceVisualMetadata = [&](SourceRate const& actual,
-                    VideoTranscodeCodec codec) {
-                    bool profileMatches = codec != VideoTranscodeCodec::HevcMain10 ||
-                        video_variant_is_hevc_main10(
-                            actual.visual.profileKnown, actual.visual.profile);
-                    return profileMatches && video_variant_color_metadata_matches(
-                        request.sourceVisual.transferFunctionKnown,
-                        request.sourceVisual.transferFunction,
-                        actual.visual.transferFunctionKnown,
-                        actual.visual.transferFunction,
-                        request.sourceVisual.primariesKnown,
-                        request.sourceVisual.primaries,
-                        actual.visual.primariesKnown,
-                        actual.visual.primaries);
-                };
-                auto validateCandidate = [&](fs::path const& candidate,
+                auto validationCancelled = [&] { return control() != VideoTranscodeControl::running; };
+                auto validatePreview = [&](fs::path const& candidate,
                     VideoTranscodeBackend, VideoTranscodeCodec codec) {
                     if (!LibraryTrusted()) {
                         trustLost = true;
                         return false;
                     }
-                    auto actual = source_rate(candidate);
-                    auto expectedCodec = codec == VideoTranscodeCodec::H264
-                        ? VideoSourceCodec::H264 : VideoSourceCodec::Hevc;
-                    return video_variant_dimensions_match(
+                    auto actual = source_rate(ffmpeg_, candidate, validationCancelled);
+                    return codec == VideoTranscodeCodec::H264 && video_variant_dimensions_match(
                             actual.width, actual.height, request.width, request.height) &&
                         video_variant_rate_matches(
                             actual.numerator, actual.denominator, targetFps) &&
-                        actual.codec == expectedCodec &&
-                        preservesSourceVisualMetadata(actual, codec) &&
-                        video_variant_duration_matches(
-                            actual.duration100ns, request.duration100ns, targetFps) &&
-                        video_candidate_decodes_first_frame(candidate);
+                        actual.matchesSdrOutput && actual.duration100ns > 0 &&
+                        video_candidate_decodes_first_frame(candidate, validationCancelled);
+                };
+                auto validateCandidate = [&](fs::path const& candidate,
+                    VideoTranscodeBackend backend, VideoTranscodeCodec codec) {
+                    if (!validatePreview(candidate, backend, codec)) return false;
+                    auto actual = source_rate(ffmpeg_, candidate, validationCancelled);
+                    return video_variant_duration_matches(
+                        actual.duration100ns, request.duration100ns, targetFps);
                 };
                 VideoTranscodePathAccess pathAccess;
                 if (libraryTrust_) {
@@ -1808,7 +2043,8 @@ namespace motion::agent
                     *stableSource, temporary, request.width, request.height, targetFps,
                     control, error, &selectedBackend, request.softwareFallbackAllowed,
                     request.softwarePlaybackTarget, request.duration100ns, publishProgress,
-                    validateCandidate, &selectedCodec, pathAccess);
+                    validateCandidate, &selectedCodec, pathAccess,
+                    [&](std::wstring const& message) { append_log(logRoot_, message); }, validatePreview);
                 if (trustLost || !LibraryTrusted()) return VideoTranscodeResult::cancelled;
                 if (result == VideoTranscodeResult::cancelled || result == VideoTranscodeResult::paused) {
                     removeTemporaryIfTrusted();
@@ -1816,6 +2052,7 @@ namespace motion::agent
                 }
                 if (result != VideoTranscodeResult::succeeded) {
                     append_log(logRoot_, copyLabel + L" " +
+                        std::to_wstring(request.width) + L"x" + std::to_wstring(request.height) + L" / " +
                         std::to_wstring(targetFps) + L" FPS 不可用: " + error);
                     removeTemporaryIfTrusted();
                     return result;
@@ -1830,7 +2067,7 @@ namespace motion::agent
                     removeTemporaryIfTrusted();
                     return VideoTranscodeResult::failed;
                 }
-                auto actual = source_rate(temporary);
+                auto actual = source_rate(ffmpeg_, temporary, validationCancelled);
                 // Container duration seldom ends exactly on a frame boundary,
                 // so Media Foundation may report 59.94 for a CFR 60 stream.
                 // One-frame-per-second tolerance accepts that representation
@@ -1839,12 +2076,12 @@ namespace motion::agent
                     actual.numerator, actual.denominator, targetFps);
                 bool matchingDimensions = video_variant_dimensions_match(
                     actual.width, actual.height, request.width, request.height);
-                bool matchingCodec = actual.codec == (selectedCodec == VideoTranscodeCodec::H264
-                    ? VideoSourceCodec::H264 : VideoSourceCodec::Hevc);
-                bool matchingVisualMetadata = preservesSourceVisualMetadata(actual, selectedCodec);
+                bool matchingCodec = selectedCodec == VideoTranscodeCodec::H264 &&
+                    actual.codec == VideoSourceCodec::H264;
+                bool matchingVisualMetadata = actual.matchesSdrOutput;
                 bool matchingDuration = video_variant_duration_matches(
                     actual.duration100ns, request.duration100ns, targetFps);
-                bool decodesFirstFrame = video_candidate_decodes_first_frame(temporary);
+                bool decodesFirstFrame = video_candidate_decodes_first_frame(temporary, validationCancelled);
                 finalControl = control();
                 if (finalControl != VideoTranscodeControl::running) {
                     removeTemporaryIfTrusted();
@@ -1901,11 +2138,13 @@ namespace motion::agent
         fs::path logRoot_;
         fs::path ffmpeg_;
         std::optional<motion::MediaLibraryTrustIdentity> libraryTrust_;
+        std::unique_ptr<VideoStillPreview> stillPreviews_;
         std::mutex mutex_;
         std::condition_variable_any condition_;
         std::deque<Request> pending_;
         std::optional<Request> active_;
         std::map<std::wstring, SourceRate> rates_;
+        std::map<fs::path, VariantValidationEntry> validatedVariants_;
         std::map<std::wstring, std::wstring> hardwareDecodeAdapters_;
         std::set<std::wstring> failed_;
         std::map<fs::path, std::chrono::steady_clock::time_point> retiredVariantLeases_;
@@ -1955,8 +2194,18 @@ namespace motion::agent
     std::wstring VideoOptimizer::SourceHardwareDecodeAdapter(fs::path const& source,
         std::wstring const& preferredAdapter, uint64_t aggregateOutputPixels)
     {
-        return impl_->SourceHardwareDecodeAdapter(
-            source, preferredAdapter, aggregateOutputPixels);
+        auto result = impl_->SourceHardwareDecodeCandidates(source, preferredAdapter, aggregateOutputPixels);
+        return result.adapters.empty() ? std::wstring{} : result.adapters.front();
+    }
+    ResolvedVideoPath VideoOptimizer::ResolveStillPreview(fs::path const& source)
+    {
+        return impl_->ResolveStillPreview(source);
+    }
+
+    VideoGpuDecodeProbe VideoOptimizer::SourceHardwareDecodeCandidates(fs::path const& source,
+        std::wstring const& preferredAdapter, uint64_t aggregateOutputPixels)
+    {
+        return impl_->SourceHardwareDecodeCandidates(source, preferredAdapter, aggregateOutputPixels);
     }
     void VideoOptimizer::SetStorageQuotaBytes(uint64_t quotaBytes) noexcept
     {

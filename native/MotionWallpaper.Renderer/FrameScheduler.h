@@ -29,8 +29,22 @@ namespace motion::renderer
 
         void Start(HWND target, UINT interval)
         {
+            StartAt(target, Now100ns() + static_cast<int64_t>((std::max)(1u, interval)) * 10'000);
+        }
+
+        static int64_t Now100ns() noexcept
+        {
+            LARGE_INTEGER counter{}, frequency{};
+            QueryPerformanceCounter(&counter);
+            QueryPerformanceFrequency(&frequency);
+            return (counter.QuadPart / frequency.QuadPart) * 10'000'000 +
+                (counter.QuadPart % frequency.QuadPart) * 10'000'000 / frequency.QuadPart;
+        }
+
+        void StartAt(HWND target, int64_t deadline100ns)
+        {
             target_.store(target, std::memory_order_release);
-            interval_.store((std::max)(1u, interval), std::memory_order_release);
+            deadline_.store(deadline100ns, std::memory_order_release);
             running_.store(true, std::memory_order_release);
             if (updateEvent_) SetEvent(updateEvent_.get());
         }
@@ -64,8 +78,8 @@ namespace motion::renderer
                     CancelWaitableTimer(timer_.get());
                     if (!running_.load(std::memory_order_acquire)) continue;
                     LARGE_INTEGER due{};
-                    due.QuadPart = motion::renderer::frame_due_time_100ns(
-                        interval_.load(std::memory_order_acquire));
+                    due.QuadPart = -(std::max)(int64_t{1},
+                        deadline_.load(std::memory_order_acquire) - Now100ns());
                     SetWaitableTimerEx(timer_.get(), &due, 0, nullptr, nullptr, nullptr, 0);
                     continue;
                 }
@@ -86,7 +100,7 @@ namespace motion::renderer
         motion::unique_handle timer_;
         std::thread worker_;
         std::atomic<HWND> target_{};
-        std::atomic_uint interval_{ 5 };
+        std::atomic_int64_t deadline_{};
         std::atomic_bool running_{};
         std::atomic_bool tickPending_{};
     };

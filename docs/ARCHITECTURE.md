@@ -18,10 +18,12 @@
 - `MotionWallpaper.Core`：供 App、Agent 和集成测试共用的媒体操作、缩略图和转码静态库。
 - `MotionWallpaper.Common`：配置模型、Windows JSON、路径、ID、策略决策、命名事件和 Win32 句柄所有权。
 - `MotionWallpaper.Agent`：单实例、事件驱动的常驻策略进程。
-- `MotionWallpaper.Renderer`：Media Foundation、D3D11、DXGI 与 DirectComposition 呈现。
+- `MotionWallpaper.Renderer`：Media Foundation、D3D11、DXGI 与 DirectComposition 呈现；系统缺少解码器时可选用随包 FFmpeg 实时解码。
 - `MotionWallpaper.Tests`：配置、状态策略、媒体库和协议回归测试。
 
 `MotionWallpaper.exe` 是唯一面向用户的可执行文件。设置窗口关闭后 Agent 继续驻留；只有需要播放媒体或保留冻结帧时 Renderer 才存在。
+
+内置解码的 DLL 只在系统播放路径报告缺少解码器时加载，使用程序目录内的绝对路径和受限 DLL 搜索范围，不改变系统解码器注册。解码工作线程独占 FFmpeg 上下文，以容量为 3 的帧队列向 Renderer 时钟供帧；各输出继续共享一帧、独立呈现。硬解使用 Presenter 的同一 D3D11 设备和多线程保护，GPU 帧不读回 CPU。暂停冻结时间线，低内存释放后按原位置重新打开；旧 Media Foundation 回调不得终止备用解码器。测试宿主中的像素读回仅用于验证，不进入发行播放器。
 
 关闭设置窗口会保存待处理修改并只退出 WinUI 进程。从 Agent 托盘菜单选择“退出”时，会广播命名退出事件，让设置进程先保存并正常关闭，再停止 Renderer 和 Agent，最终不保留任何 MotionWallpaper 进程。
 
@@ -83,7 +85,7 @@ Renderer 在冻结、暂停、循环以及桌面/屏保宿主切换时保留最�
 
 冻结边界还会按完整显示分辨率捕获到一张 DirectComposition 表面。Windows 报告低内存压力时，DWM 先原子接管该表面，再释放 Media Engine 和双缓冲交换链。恢复时在保留表面后创建新交换链、定位到记录时间并提交首帧，最后才切换视觉层。深度压缩不会降低分辨率或帧率。
 
-同一 GPU 上的多个显示器由一个 Renderer 共享一条解码链和一个 D3D11 设备，但每块显示器拥有独立、原生尺寸的 DirectComposition 视觉层和交换链。跨显卡显示器使用不同 Renderer，避免隐式跨适配器复制。
+同一 GPU 且同步播放同一媒体副本的多个显示器由一个 Renderer 共享一条解码链和一个 D3D11 设备，但每块显示器拥有独立、原生尺寸的 DirectComposition 视觉层和交换链。跨显卡显示器使用不同 Renderer，避免隐式跨适配器复制。
 
 ## 解码路径
 
@@ -91,7 +93,7 @@ Renderer 会按负载和显示器归属选择物理 D3D11 适配器，并把该�
 
 - `auto`：除物理 D3D11 设备外，还按当前源编码、profile、NV12/P010 位深输出格式与分辨率检查实际解码配置；探测返回具体适配器 LUID，Agent 将同一 LUID 传给 Renderer，避免混合显卡机器在独显上探测成功却实际落到不支持该素材的核显；找不到匹配配置时生成隔离的 CPU 兼容副本，合成仍优先保留在物理 GPU，最后才使用 WARP；
 - `hardware`：要求成功创建物理 D3D11 视频设备；没有可用设备时直接报告不可用，不进入持续重启；
-- `software`：始终使用软件/WARP 路径。
+- `software`：CPU 解码，经 WIC 位图上传后优先使用物理 GPU 显示，WARP 作为最后回退。
 
 Renderer 将可验证的路径决策报告给 Agent，由 Agent 写入数据目录中的 `Config/runtime.json` 供界面显示。`IMFMediaEngine` 不公开最终选中的解码器变换，因此界面中的“已启用/已请求 DXGI/DXVA 路径”不冒充厂商级 GPU 遥测。这里不能用 `MFT_ENUM_FLAG_HARDWARE` 作为 DXVA 可用性判断：Windows 上常见的系统解码器属于软件 MFT，但会把实际解码委托给 DXVA；只枚举硬件 MFT 会在 AMD、NVIDIA 和 Intel 设备上产生假阴性。
 
@@ -99,7 +101,7 @@ Renderer 将可验证的路径决策报告给 Agent，由 Agent 写入数据目�
 
 驱动 Trim 只在闲置深度压缩后执行。正常路径不会强制清空进程工作集，以免快速恢复时产生缺页卡顿。
 
-播放期间使用基于 Media Foundation 时间戳的高精度单次调度：在下一帧预计到达前唤醒，帧未准备好时仅执行短重试；非播放状态完全停止调度。
+播放期间根据源帧周期和 QPC 单调时间维护下一帧期限，处理完成后等待剩余时间；帧未准备好时短重试，漏过期限时跳过积压。非播放状态停止帧调度，独立的低频健康报告继续描述目标状态。
 
 ## 命令与确认
 
@@ -118,3 +120,5 @@ Agent 只在目标状态获得确认后更新 `runtime.json`，因此界面不�
 - `Alt + Tab`、桌面/屏保切换和锁定/解锁；
 - 多显示器和跨显卡布局；
 - CPU、GPU Video Decode、工作集、句柄数、磁盘读取和丢帧统计。
+
+2026-09-23：多屏退役、播放健康检测、帧期限调度和副本裁切规则已更新，详见 [前四项架构修复](ARCHITECTURE_FIRST_FOUR_FIXES_2026-09-23.md)。

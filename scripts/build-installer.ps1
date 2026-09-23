@@ -67,6 +67,11 @@ $required = @(
     'LICENSE.txt',
     'THIRD_PARTY_NOTICES.md',
     'Tools\ffmpeg\ffmpeg.exe',
+    'Tools\ffmpeg\ffprobe.exe',
+    'Tools\ffmpeg\avformat-62.dll',
+    'Tools\ffmpeg\avcodec-62.dll',
+    'Tools\ffmpeg\avutil-60.dll',
+    'Tools\ffmpeg\swscale-9.dll',
     'Tools\ffmpeg\FFmpeg-NOTICE.txt',
     'Tools\ffmpeg\LICENSE-FFmpeg.txt',
     'Tools\ffmpeg\LICENSE-OpenH264.txt'

@@ -16,7 +16,7 @@
     <NuGetTargetMoniker>native,Version=v0.0</NuGetTargetMoniker>
     <RuntimeIdentifiers>win10-x64</RuntimeIdentifiers>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <WindowsTargetPlatformMinVersion>10.0.19041.0</WindowsTargetPlatformMinVersion>
+    <WindowsTargetPlatformMinVersion>10.0.19045.0</WindowsTargetPlatformMinVersion>
     <UseWinUI>true</UseWinUI>
     <CppWinRTOptimized>true</CppWinRTOptimized>
     <CppWinRTRootNamespaceAutoMerge>true</CppWinRTRootNamespaceAutoMerge>

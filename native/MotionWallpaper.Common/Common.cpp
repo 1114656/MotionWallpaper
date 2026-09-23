@@ -67,6 +67,12 @@ namespace
             value == "optimizing" || value == "degraded" || value == "failed";
     }
 
+    bool valid_runtime_performance_mode(std::string const& value) noexcept
+    {
+        return value.empty() || value == "original" || value == "balanced" ||
+            value == "power-saver";
+    }
+
     bool valid_runtime_control_action(std::string const& value) noexcept
     {
         return value == "retry" || value == "restart-renderer";
@@ -537,6 +543,26 @@ namespace motion
     void append_utf8_log(fs::path const& path, std::wstring_view message) noexcept
     {
         try {
+            // Agent/UI workers can log concurrently, and several Renderer
+            // processes share one log. Serialize the entire rotate + append
+            // transaction across processes without holding the policy loop
+            // indefinitely when another writer is unavailable.
+            auto normalizedPath = fs::absolute(path).lexically_normal().wstring();
+            uint64_t pathHash = 14695981039346656037ULL;
+            for (wchar_t character : normalizedPath) {
+                pathHash ^= static_cast<uint16_t>(std::towlower(character));
+                pathHash *= 1099511628211ULL;
+            }
+            auto mutexName = L"Local\\MotionWallpaper.Log." + std::to_wstring(pathHash);
+            unique_handle writerMutex(CreateMutexW(nullptr, FALSE, mutexName.c_str()));
+            if (!writerMutex) return;
+            auto lockResult = WaitForSingleObject(writerMutex.get(), 100);
+            if (lockResult != WAIT_OBJECT_0 && lockResult != WAIT_ABANDONED) return;
+            struct WriterUnlock
+            {
+                HANDLE handle;
+                ~WriterUnlock() { ReleaseMutex(handle); }
+            } writerUnlock{ writerMutex.get() };
             if (!path.parent_path().empty()) fs::create_directories(path.parent_path());
             constexpr uintmax_t maximumLogBytes = 2 * 1024 * 1024;
             constexpr uintmax_t retainedLogBytes = maximumLogBytes / 2;
@@ -547,6 +573,10 @@ namespace motion
                 if (input) {
                     input.seekg(-static_cast<std::streamoff>(retainedLogBytes), std::ios::end);
                     std::string retained((std::istreambuf_iterator<char>(input)), {});
+                    // A CRT ifstream does not share delete access on Windows.
+                    // Close it before replacing the same file, or every later
+                    // append repeats the megabyte-sized failed rotation.
+                    input.close();
                     auto firstLine = retained.find('\n');
                     if (firstLine != std::string::npos) retained.erase(0, firstLine + 1);
                     auto temporary = path;
@@ -554,8 +584,13 @@ namespace motion
                     std::ofstream rotated(temporary, std::ios::binary | std::ios::trunc);
                     if (rotated) {
                         rotated.write(retained.data(), static_cast<std::streamsize>(retained.size()));
+                        bool wrote = static_cast<bool>(rotated);
                         rotated.close();
-                        MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+                        if (!wrote || !rotated || !MoveFileExW(temporary.c_str(), path.c_str(),
+                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                            std::error_code ignored;
+                            fs::remove(temporary, ignored);
+                        }
                     }
                 }
             }
@@ -1271,6 +1306,19 @@ namespace motion
         runtime.decodePath = json_string(object, L"decodePath");
         runtime.decodeReason = json_string(object, L"decodeReason");
         runtime.updatedAt = json_wstring(object, L"updatedAt");
+        auto readOptionalContext = [&](wchar_t const* name, std::string& destination) {
+            auto value = object.GetNamedValue(name, JsonValue::CreateNullValue());
+            if (value.ValueType() == JsonValueType::Null) return true;
+            if (value.ValueType() != JsonValueType::String) return false;
+            destination = wide_to_utf8(value.GetString().c_str());
+            return true;
+        };
+        if (!readOptionalContext(L"performanceMode", runtime.performanceMode) ||
+            !readOptionalContext(L"activeSceneId", runtime.activeSceneId) ||
+            !valid_runtime_performance_mode(runtime.performanceMode) ||
+            (!runtime.activeSceneId.empty() && !valid_scene_profile_id(runtime.activeSceneId))) {
+            return std::nullopt;
+        }
         if ((!runtime.activeGroupId.empty() && !valid_id(runtime.activeGroupId)) ||
             (!runtime.activeMediaId.empty() && !valid_id(runtime.activeMediaId))) return std::nullopt;
         if (runtime.activeGroupId.empty() != runtime.activeMediaId.empty()) return std::nullopt;
@@ -1282,6 +1330,10 @@ namespace motion
             for (auto const& value : values) {
                 if (value.ValueType() != JsonValueType::Object) return std::nullopt;
                 auto displayObject = value.GetObject();
+                if (displayObject.HasKey(L"errorDetail") &&
+                    displayObject.GetNamedValue(L"errorDetail").ValueType() != JsonValueType::String) {
+                    return std::nullopt;
+                }
                 DisplayRuntimeState display{
                     json_string(displayObject, L"displayId"),
                     json_wstring(displayObject, L"deviceName"),
@@ -1295,7 +1347,8 @@ namespace motion
                     static_cast<uint32_t>((std::min)(json_uint64(displayObject,
                         L"rendererProcessId"), static_cast<uint64_t>(UINT32_MAX))),
                     displayObject.GetNamedBoolean(L"canRetry", false),
-                    displayObject.GetNamedBoolean(L"canRestartRenderer", false)
+                    displayObject.GetNamedBoolean(L"canRestartRenderer", false),
+                    json_string(displayObject, L"errorDetail")
                 };
                 bool validSelection = display.groupId.empty() == display.mediaId.empty() &&
                     (display.groupId.empty() ||
@@ -1306,7 +1359,8 @@ namespace motion
                     !valid_runtime_display_state(display.state) ||
                     !safe_runtime_text(display.reason) ||
                     !valid_decode_path(display.decodePath) ||
-                    !safe_runtime_text(display.decodeReason)) {
+                    !safe_runtime_text(display.decodeReason) ||
+                    !safe_runtime_text(display.errorDetail)) {
                     return std::nullopt;
                 }
                 auto duplicate = std::find_if(runtime.displayStates.begin(),
@@ -1357,6 +1411,8 @@ namespace motion
             runtime.activeGroupId.empty() != runtime.activeMediaId.empty() ||
             !valid_decode_path(runtime.decodePath) ||
             !safe_runtime_text(runtime.decodeReason) ||
+            !valid_runtime_performance_mode(runtime.performanceMode) ||
+            (!runtime.activeSceneId.empty() && !valid_scene_profile_id(runtime.activeSceneId)) ||
             (!runtime.agentInstanceId.empty() && !valid_id(runtime.agentInstanceId)) ||
             (!runtime.lastCommandId.empty() && !valid_id(runtime.lastCommandId)) ||
             runtime.lastCommandId.empty() != runtime.lastCommandAction.empty() ||
@@ -1377,6 +1433,7 @@ namespace motion
                 !safe_runtime_text(display.reason) ||
                 !valid_decode_path(display.decodePath) ||
                 !safe_runtime_text(display.decodeReason) ||
+                !safe_runtime_text(display.errorDetail) ||
                 std::any_of(runtime.displayStates.begin(),
                     runtime.displayStates.begin() + index, [&](auto const& existing) {
                         return existing.displayId == display.displayId;
@@ -1390,6 +1447,8 @@ namespace motion
         object.Insert(L"activeMediaId", JsonValue::CreateStringValue(utf8_to_wide(runtime.activeMediaId)));
         object.Insert(L"decodePath", JsonValue::CreateStringValue(utf8_to_wide(runtime.decodePath)));
         object.Insert(L"decodeReason", JsonValue::CreateStringValue(utf8_to_wide(runtime.decodeReason)));
+        object.Insert(L"performanceMode", JsonValue::CreateStringValue(utf8_to_wide(runtime.performanceMode)));
+        object.Insert(L"activeSceneId", JsonValue::CreateStringValue(utf8_to_wide(runtime.activeSceneId)));
         JsonArray displayStates;
         for (auto const& display : runtime.displayStates) {
             JsonObject displayObject;
@@ -1409,6 +1468,8 @@ namespace motion
                 utf8_to_wide(display.decodePath)));
             displayObject.Insert(L"decodeReason", JsonValue::CreateStringValue(
                 utf8_to_wide(display.decodeReason)));
+            displayObject.Insert(L"errorDetail", JsonValue::CreateStringValue(
+                utf8_to_wide(display.errorDetail)));
             displayObject.Insert(L"rendererProcessId", JsonValue::CreateNumberValue(
                 display.rendererProcessId));
             displayObject.Insert(L"canRetry", JsonValue::CreateBooleanValue(display.canRetry));

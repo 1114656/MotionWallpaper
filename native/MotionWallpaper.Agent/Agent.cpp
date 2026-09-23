@@ -12,6 +12,7 @@
 #include "../MotionWallpaper.Common/DisplayAwareness.h"
 #include "../MotionWallpaper.Common/DisplayTopology.h"
 #include "../MotionWallpaper.Common/SceneProfiles.h"
+#include "../MotionWallpaper.Common/StartupEnvironment.h"
 #include "../MotionWallpaper.Common/VariantCache.h"
 #include "CoveragePolicy.h"
 #include "IdlePolicy.h"
@@ -23,9 +24,13 @@
 #include "RuntimeEventPolicy.h"
 #include "RuntimeStatusPolicy.h"
 #include "SharedRendererPolicy.h"
+#include "RendererLifecyclePolicy.h"
 #include "TrayControlPolicy.h"
 #include "VideoOptimizer.h"
+#include "VideoVariantPolicy.h"
+#include "VideoTranscoder.h"
 #include "../MotionWallpaper.Protocol/RendererProtocol.h"
+#include "../MotionWallpaper.Protocol/BoundedPipeReader.h"
 
 #include <winrt/base.h>
 
@@ -61,53 +66,16 @@ namespace
 
     std::wstring display_adapter_key(std::wstring const& displayDevice)
     {
-        if (displayDevice.empty()) return {};
-        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || !factory) return {};
-        for (UINT adapterIndex = 0;; ++adapterIndex) {
-            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-            auto adapterResult = factory->EnumAdapters1(adapterIndex, &adapter);
-            if (adapterResult == DXGI_ERROR_NOT_FOUND) break;
-            if (FAILED(adapterResult) || !adapter) break;
-            DXGI_ADAPTER_DESC1 adapterDescription{};
-            if (FAILED(adapter->GetDesc1(&adapterDescription))) continue;
-            for (UINT outputIndex = 0;; ++outputIndex) {
-                Microsoft::WRL::ComPtr<IDXGIOutput> output;
-                auto outputResult = adapter->EnumOutputs(outputIndex, &output);
-                if (outputResult == DXGI_ERROR_NOT_FOUND) break;
-                if (FAILED(outputResult) || !output) break;
-                DXGI_OUTPUT_DESC outputDescription{};
-                if (FAILED(output->GetDesc(&outputDescription)) ||
-                    _wcsicmp(outputDescription.DeviceName, displayDevice.c_str()) != 0) continue;
-                return std::to_wstring(adapterDescription.AdapterLuid.HighPart) + L":" +
-                    std::to_wstring(adapterDescription.AdapterLuid.LowPart);
-            }
-        }
-        return {};
+        auto inventory = motion::agent::video_gpu_inventory_async();
+        auto found = inventory.displayAdapters.find(displayDevice);
+        return found == inventory.displayAdapters.end() ? std::wstring{} : found->second;
     }
 
     bool physical_video_device_available()
     {
-        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || !factory) return false;
-        D3D_FEATURE_LEVEL levels[]{
-            D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
-            D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0
-        };
-        for (UINT index = 0;; ++index) {
-            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-            auto adapterResult = factory->EnumAdapters1(index, &adapter);
-            if (adapterResult == DXGI_ERROR_NOT_FOUND) break;
-            if (FAILED(adapterResult) || !adapter) break;
-            DXGI_ADAPTER_DESC1 description{};
-            if (FAILED(adapter->GetDesc1(&description)) ||
-                (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
-            Microsoft::WRL::ComPtr<ID3D11Device> device;
-            if (SUCCEEDED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &device, nullptr, nullptr))) return true;
-        }
-        return false;
+        auto inventory = motion::agent::video_gpu_inventory_async();
+        // Pending is not proof that the machine needs CPU compatibility.
+        return inventory.pending || inventory.physicalVideoDeviceAvailable;
     }
 
     bool cloned_or_projected_display_active() noexcept
@@ -167,6 +135,11 @@ namespace
             return MediaSelection{ path, metadata.kind, mediaId, true };
         }
         if (metadata.kind != "video") return {};
+        if (performanceMode == "original") {
+            // Missing originals are visible playback failures. Never replace
+            // an explicit original choice with a retained performance copy.
+            return MediaSelection{ path, "video", mediaId, true };
+        }
         auto retained = performanceMode == motion::agent::cpu_smooth_mode
             ? motion::select_cpu_smooth_variant_file(directory)
             : motion::select_variant_file(motion::inspect_variant_cache(directory), performanceMode);
@@ -179,20 +152,30 @@ namespace
     }
 
     MediaSelection media_poster_by_id(fs::path const& wallpapers,
-        std::string const& groupId, std::string const& mediaId)
+        std::string const& groupId, std::string const& mediaId,
+        motion::agent::VideoOptimizer& optimizer)
     {
         if (!motion::valid_id(groupId) || !motion::valid_id(mediaId)) return {};
         auto directory = wallpapers / L"Groups" / motion::utf8_to_wide(groupId) /
             L"Videos" / motion::utf8_to_wide(mediaId);
         motion::MediaMetadata metadata;
         if (!motion::try_load_media(directory / L"metadata.json", metadata) ||
-            metadata.id != mediaId || metadata.groupId != groupId ||
-            metadata.coverFileName.empty() ||
-            !motion::safe_file_name(metadata.coverFileName)) return {};
+            metadata.id != mediaId || metadata.groupId != groupId) return {};
+        if (metadata.kind == "video") {
+            // Existing imports upgrade lazily too. When the user has removed
+            // the original, the best retained copy can still supply a frame.
+            auto video = media_by_id(wallpapers, groupId, mediaId, "balanced");
+            auto preview = optimizer.ResolveStillPreview(video.path);
+            if (!preview.path.empty()) {
+                return { std::move(preview.path), "image", mediaId, false, std::move(preview.lease) };
+            }
+        }
+        if (metadata.coverFileName.empty() || !motion::safe_file_name(metadata.coverFileName)) return {};
         auto poster = directory / metadata.coverFileName;
         std::error_code error;
         if (!fs::is_regular_file(poster, error) || error) return {};
-        return { std::move(poster), "image", mediaId, false };
+        auto lease = optimizer.AcquirePlaybackLease(poster);
+        return { std::move(poster), "image", mediaId, false, std::move(lease) };
     }
 
     struct ImportedOptimizationRequest
@@ -242,26 +225,6 @@ namespace
         PresentPreview,
         Ready
     };
-
-    OptimizationTarget optimization_target_size(motion::Settings const& settings)
-    {
-        auto displays = motion::enumerate_displays();
-        if (settings.displayMode == "primary") {
-            auto primary = std::find_if(displays.begin(), displays.end(), [](auto const& value) { return value.primary; });
-            if (primary == displays.end()) return {};
-            return { static_cast<uint32_t>(primary->bounds.right - primary->bounds.left),
-                static_cast<uint32_t>(primary->bounds.bottom - primary->bounds.top), primary->refreshRateHz };
-        }
-        OptimizationTarget result;
-        for (auto const& display : displays) {
-            result.width = (std::max)(result.width,
-                static_cast<uint32_t>(display.bounds.right - display.bounds.left));
-            result.height = (std::max)(result.height,
-                static_cast<uint32_t>(display.bounds.bottom - display.bounds.top));
-            result.refreshRateHz = (std::max)(result.refreshRateHz, display.refreshRateHz);
-        }
-        return result;
-    }
 
     std::vector<std::string> group_media_ids(fs::path const& wallpapers, std::string const& groupId,
         std::string const& performanceMode)
@@ -340,6 +303,8 @@ namespace
             bool failed{};
             uint32_t processId{};
             motion::protocol::DecodeStatus decode;
+            std::string errorDetail;
+            bool firstFrameSeen{};
         };
 
         explicit Renderer(fs::path executable) : executable_(std::move(executable)) {}
@@ -351,7 +316,7 @@ namespace
         bool Apply(Target target, MediaSelection const& media, std::string const& decodeMode,
             std::string const& displayMode, uint32_t frameRateCap,
             std::vector<std::wstring> const& monitorDevices = {},
-            std::wstring const& decodeAdapter = {})
+            std::wstring const& decodeAdapter = {}, bool originalPlayback = false)
         {
             auto now = std::chrono::steady_clock::now();
             std::wstring requestKey = media.path.wstring() + L"\n" + motion::utf8_to_wide(media.kind) + L"\n" +
@@ -361,6 +326,7 @@ namespace
             bool configurationChanged = requestKey != requestedKey_;
             if (configurationChanged && process_ && !Stop()) return false;
             if (configurationChanged) {
+                recoveryBudget_.Clear();
                 requestedKey_ = std::move(requestKey);
                 permanentlyUnavailable_.store(false, std::memory_order_release);
                 automaticStartupTimeouts_ = 0;
@@ -378,6 +344,14 @@ namespace
                 }
             }
             bool awaitingAck = targetRevision_ && targetAcknowledgedRevision_.load() < targetRevision_;
+            if (motion::agent::original_first_frame_expired(originalPlayback,
+                    media.kind == "video", awaitingAck,
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - targetFirstSentAt_).count()))) {
+                SetDecodeUnavailable("original-first-frame-timeout");
+                Shutdown(false);
+                return false;
+            }
             if (awaitingAck && now - targetFirstSentAt_ >= 6s) {
                 if (decodeMode_ == "auto" && !decodeAdapter_.empty() &&
                     ++automaticStartupTimeouts_ >= 2) {
@@ -395,6 +369,25 @@ namespace
                 targetSentAt_ = now;
             }
             if (TargetReady()) {
+                bool playing = kind_ == "video" &&
+                    (target_ == Target::DesktopPlay || target_ == Target::ScreensaverPlay);
+                motion::agent::PlaybackHealthFailure healthFailure{};
+                {
+                    std::scoped_lock lock(healthMutex_);
+                    if (playing) healthFailure = health_.Check(GetTickCount64());
+                }
+                if (healthFailure != motion::agent::PlaybackHealthFailure::None) {
+                    auto reason = healthFailure == motion::agent::PlaybackHealthFailure::Heartbeat
+                        ? "playback-heartbeat-timeout" : "playback-frame-stalled";
+                    {
+                        std::scoped_lock lock(decodeStatusMutex_);
+                        errorDetail_ = motion::protocol::format_renderer_error(reason, WAIT_TIMEOUT);
+                    }
+                    bool exhausted = recoveryBudget_.Exhausted(GetTickCount64());
+                    FailAndBackOff();
+                    if (exhausted) SetDecodeUnavailable(reason);
+                    return false;
+                }
                 automaticStartupTimeouts_ = 0;
                 if (now - launchedAt_ >= 15s) ResetBackOff();
             }
@@ -424,6 +417,8 @@ namespace
                 targetAcknowledgedRevision_.load(std::memory_order_acquire) < targetRevision_;
         }
 
+        [[nodiscard]] bool IsStaticImage() const noexcept { return kind_ == "image"; }
+
         [[nodiscard]] motion::protocol::DecodeStatus DecodeState() const
         {
             std::scoped_lock lock(decodeStatusMutex_);
@@ -438,9 +433,13 @@ namespace
             result.transitionPending = TransitionPending();
             result.failed = permanentlyUnavailable_.load(std::memory_order_acquire) ||
                 (!process_ && failureCount_ != 0);
+            // Shutdown(false) preserves the acknowledgement so a later device
+            // loss is not mistaken for a decoder that never produced a frame.
+            result.firstFrameSeen = targetAcknowledgedRevision_.load() != 0;
             result.processId = process_ ? GetProcessId(process_.get()) : 0;
             std::scoped_lock lock(decodeStatusMutex_);
             result.decode = decodeStatus_;
+            result.errorDetail = errorDetail_;
             return result;
         }
 
@@ -519,11 +518,13 @@ namespace
             targetRevision_ = 0;
             failed_.store(false);
             if (resetBackOff) {
+                recoveryBudget_.Clear();
                 permanentlyUnavailable_.store(false, std::memory_order_release);
                 ResetBackOff();
                 requestedKey_.clear();
                 std::scoped_lock lock(decodeStatusMutex_);
                 decodeStatus_ = {};
+                errorDetail_.clear();
             }
             return true;
         }
@@ -602,6 +603,10 @@ namespace
                 arguments.push_back(decodeAdapter);
             }
             auto command = motion::build_command_line(arguments);
+            {
+                std::scoped_lock lock(decodeStatusMutex_);
+                errorDetail_.clear();
+            }
             STARTUPINFOW startup{ sizeof(startup) };
             startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
             startup.wShowWindow = SW_HIDE;
@@ -612,6 +617,11 @@ namespace
             if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
                 CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                 nullptr, executable_.parent_path().c_str(), &startup, &created)) {
+                {
+                    auto code = GetLastError();
+                    std::scoped_lock lock(decodeStatusMutex_);
+                    errorDetail_ = motion::protocol::format_renderer_error("create-renderer", code);
+                }
                 ResetTransport();
                 return false;
             }
@@ -655,6 +665,11 @@ namespace
         {
             if (!inputWrite_) return 0;
             uint64_t revision = ++revision_;
+            if (command == "desktop-play" || command == "screensaver-play" ||
+                command == "desktop-freeze" || command == "pause") {
+                std::scoped_lock lock(healthMutex_);
+                health_.Reset(revision, GetTickCount64());
+            }
             std::string value = command + " " + std::to_string(revision) + "\n";
             DWORD written{};
             if (!WriteFile(inputWrite_.get(), value.data(), static_cast<DWORD>(value.size()), &written, nullptr) ||
@@ -670,18 +685,16 @@ namespace
 
         void ReadAcks()
         {
-            std::string pending;
-            char buffer[256];
-            DWORD bytes{};
-            while (!outputStopping_.load(std::memory_order_acquire) && outputRead_ &&
-                ReadFile(outputRead_.get(), buffer, sizeof(buffer), &bytes, nullptr) && bytes) {
-                pending.append(buffer, bytes);
-                for (size_t end; (end = pending.find('\n')) != std::string::npos; pending.erase(0, end + 1)) {
-                    auto value = pending.substr(0, end);
+            if (!outputRead_) return;
+            motion::protocol::read_bounded_pipe_lines(outputRead_.get(), outputStopping_,
+                [&](std::string_view value) {
                     auto ack = motion::protocol::parse_ack(value);
                     if (ack.channel == motion::protocol::AckChannel::Target) {
                         uint64_t previous = targetAcknowledgedRevision_.load();
                         while (previous < ack.revision && !targetAcknowledgedRevision_.compare_exchange_weak(previous, ack.revision)) {}
+                    } else if (auto heartbeat = motion::protocol::parse_playback_heartbeat(value)) {
+                        std::scoped_lock lock(healthMutex_);
+                        health_.Observe(heartbeat->revision, heartbeat->serial, heartbeat->period100ns, GetTickCount64());
                     } else if (auto status = motion::protocol::parse_decode_status(value); !status.path.empty()) {
                         if (status.path == "unavailable") {
                             permanentlyUnavailable_.store(true, std::memory_order_release);
@@ -689,24 +702,41 @@ namespace
                         std::scoped_lock lock(decodeStatusMutex_);
                         decodeStatus_ = std::move(status);
                     } else if (value.starts_with("error ")) {
+                        std::scoped_lock lock(decodeStatusMutex_);
+                        auto error = motion::protocol::parse_renderer_error(value);
+                        errorDetail_ = error
+                            ? motion::protocol::format_renderer_error(error->operation, error->code)
+                            : "renderer-protocol-error";
                         failed_.store(true);
                     }
-                }
-            }
+                });
         }
 
         void Refresh()
         {
             if (!process_ || WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT) return;
+            DWORD exitCode{};
+            bool hasExitCode = GetExitCodeProcess(process_.get(), &exitCode) != FALSE;
             // The process is already signaled, so sending "stop" would write
             // to a broken pipe and recursively enter this cleanup path.
             if (!Shutdown(false, true)) return;
+            {
+                std::scoped_lock lock(decodeStatusMutex_);
+                // Drain error messages before recording the process status;
+                // the precise HRESULT from Renderer takes precedence.
+                if (errorDetail_.empty() && hasExitCode) {
+                    errorDetail_ = motion::protocol::format_renderer_error("renderer-exit", exitCode);
+                }
+            }
             RecordFailure();
         }
 
         void ResetTransport()
         {
             inputWrite_.reset();
+            // The reader still consumes its bounded snapshot of already
+            // buffered messages, even if it has not been scheduled before this
+            // flag is set. An inherited writer cannot make join wait for EOF.
             outputStopping_.store(true, std::memory_order_release);
             if (outputThread_.joinable()) outputThread_.join();
             outputRead_.reset();
@@ -757,12 +787,16 @@ namespace
         std::atomic_bool permanentlyUnavailable_{};
         mutable std::mutex decodeStatusMutex_;
         motion::protocol::DecodeStatus decodeStatus_;
+        std::string errorDetail_;
         std::chrono::steady_clock::time_point targetSentAt_{};
         std::chrono::steady_clock::time_point targetFirstSentAt_{};
         std::chrono::steady_clock::time_point launchedAt_{};
         std::chrono::steady_clock::time_point nextLaunchAllowed_{};
         unsigned failureCount_{};
         unsigned automaticStartupTimeouts_{};
+        std::mutex healthMutex_;
+        motion::agent::PlaybackHealthMonitor health_;
+        motion::agent::PlaybackRecoveryBudget recoveryBudget_;
     };
 
     struct DisplayMediaTarget
@@ -780,6 +814,10 @@ namespace
         uint32_t playbackFrameRateCap{};
         bool performanceCopyRequired{};
         bool performanceCopyPending{};
+        bool originalPlayback{};
+        bool gpuProbePending{};
+        bool hasAlternativeDecodeAdapter{};
+        motion::DisplayRefreshRate displayRefreshRate{ 60, 1 };
     };
 
     std::vector<DisplayMediaTarget> display_media_targets(fs::path const& wallpapers, motion::Settings const& settings,
@@ -794,9 +832,11 @@ namespace
             uint32_t width = primary == displays.end() ? 0u : static_cast<uint32_t>(primary->bounds.right - primary->bounds.left);
             uint32_t height = primary == displays.end() ? 0u : static_cast<uint32_t>(primary->bounds.bottom - primary->bounds.top);
             uint32_t refreshRate = primary == displays.end() ? 60u : primary->refreshRateHz;
-            return { { primary == displays.end() ? std::string{} : primary->id,
+            DisplayMediaTarget target{ primary == displays.end() ? std::string{} : primary->id,
                 primary == displays.end() ? std::wstring{} : primary->deviceName,
-                defaultGroupId, defaultMediaId, std::move(defaultMedia), width, height, refreshRate } };
+                defaultGroupId, defaultMediaId, std::move(defaultMedia), width, height, refreshRate };
+            if (primary != displays.end()) target.displayRefreshRate = motion::effective_display_refresh_rate(*primary);
+            return { std::move(target) };
         }
 
         std::vector<DisplayMediaTarget> targets;
@@ -815,15 +855,42 @@ namespace
                     mediaId = assignment->mediaId;
                     targets.push_back({ display.id, display.deviceName,
                         std::move(groupId), std::move(mediaId), std::move(assigned), width, height, display.refreshRateHz });
+                    targets.back().displayRefreshRate = motion::effective_display_refresh_rate(display);
                     continue;
                 }
             }
             if (!defaultMedia.path.empty()) {
                 targets.push_back({ display.id, display.deviceName,
                     std::move(groupId), std::move(mediaId), defaultMedia, width, height, display.refreshRateHz });
+                targets.back().displayRefreshRate = motion::effective_display_refresh_rate(display);
             }
         }
         return targets;
+    }
+
+    OptimizationTarget optimization_target_size(
+        std::vector<DisplayMediaTarget> const& targets, std::string const& mediaId,
+        std::vector<motion::DisplayTarget> const& displays)
+    {
+        OptimizationTarget result;
+        for (auto const& output : targets) {
+            if (output.mediaId != mediaId) continue;
+            // A pre-generated copy belongs to a real viewport, never to a
+            // synthetic square made from unrelated landscape/portrait maxima.
+            if (result.width && motion::agent::video_display_aspect(result.width, result.height) !=
+                motion::agent::video_display_aspect(output.targetWidth, output.targetHeight)) continue;
+            result.width = (std::max)(result.width, output.targetWidth);
+            result.height = (std::max)(result.height, output.targetHeight);
+            result.refreshRateHz = (std::max)(result.refreshRateHz, output.targetRefreshRate);
+        }
+        if (result.width && result.height) return result;
+        // A library item with no assigned output is prepared for the primary
+        // display, rather than unrelated dimensions/Hz from every monitor.
+        auto primary = std::find_if(displays.begin(), displays.end(),
+            [](auto const& display) { return display.primary; });
+        if (primary == displays.end()) return {};
+        return { static_cast<uint32_t>(primary->bounds.right - primary->bounds.left),
+            static_cast<uint32_t>(primary->bounds.bottom - primary->bounds.top), primary->refreshRateHz };
     }
 
     class RendererPool
@@ -869,13 +936,14 @@ namespace
                 }
                 routes.push_back({ motion::agent::renderer_media_key(output.media.path, output.media.kind),
                     output.deviceName, std::move(adapterKey),
-                    static_cast<uint64_t>(output.targetWidth) * output.targetHeight });
+                    static_cast<uint64_t>(output.targetWidth) * output.targetHeight, output.displayRefreshRate });
             }
             auto grouped = motion::agent::group_renderer_routes(routes, !primaryOnly);
             std::vector<std::wstring> desiredKeys;
             std::map<std::string, std::wstring> desiredDisplayKeys;
             desiredKeys.reserve(grouped.size());
             bool allReady = !grouped.empty();
+            std::set<std::wstring> readyKeys;
             for (auto const& route : grouped) {
                 auto output = std::find_if(outputs.begin(), outputs.end(), [&](auto const& value) {
                     if (motion::agent::renderer_media_key(value.media.path, value.media.kind) !=
@@ -926,24 +994,43 @@ namespace
                 }
                 auto& renderer = renderers_[routeKey];
                 if (!renderer) renderer = std::make_unique<Renderer>(executable_);
-                auto routeTarget = freezeRoute
+                auto routeTarget = freezeRoute && target != Renderer::Target::ScreensaverPlay
                     ? Renderer::Target::DesktopFreeze : target;
                 bool applied = renderer->Apply(routeTarget, output->media, decodeMode,
                     primaryOnly ? "primary" : "monitor", routeFrameRateCap,
-                    route.monitorDevices, output->decodeAdapter);
+                    route.monitorDevices, output->decodeAdapter, output->originalPlayback);
                 auto decode = renderer->DecodeState();
-                if (motion::agent::automatic_decode_failure_requires_cpu_smooth(
-                        decodeMode, decode.path, decode.reason,
-                        !output->decodeAdapter.empty())) {
+                auto snapshot = renderer->RuntimeSnapshot();
+                auto failureAction = motion::agent::automatic_decode_failure_action(
+                    decodeMode, decode.path, decode.reason, !output->decodeAdapter.empty(),
+                    snapshot.failed, snapshot.firstFrameSeen, output->hasAlternativeDecodeAdapter);
+                if (failureAction.rejectAdapter) {
                     RememberAutoDecodeFailure(output->media.path, output->decodeAdapter);
                 }
+                if (!failureAction.tryAlternative &&
+                    motion::agent::original_playback_failed(output->originalPlayback,
+                        output->media.kind == "video", snapshot.failed, decode.path)) {
+                    auto reason = decode.reason.empty() ? std::string("renderer-process-failed") : decode.reason;
+                    for (auto const& candidate : outputs) {
+                        if (!candidate.originalPlayback || candidate.media.kind != "video" ||
+                            motion::agent::renderer_media_key(candidate.media.path, candidate.media.kind) != route.mediaKey) continue;
+                        if (!primaryOnly && std::find(route.monitorDevices.begin(), route.monitorDevices.end(),
+                                candidate.deviceName) == route.monitorDevices.end()) continue;
+                        originalPlaybackFailures_[candidate.displayId] = {
+                            candidate.groupId, candidate.mediaId, candidate.media.path.native(), reason,
+                            snapshot.errorDetail };
+                    }
+                }
+                if (applied && renderer->TargetReady()) readyKeys.insert(routeKey);
                 allReady = applied && renderer->TargetReady() && allReady;
             }
             desiredKeys_ = desiredKeys;
             desiredDisplayKeys_ = std::move(desiredDisplayKeys);
-            if (allReady) {
+            auto keep = retirement_.Keep(desiredDisplayKeys_, readyKeys, GetTickCount64());
+            keep.insert(desiredKeys.begin(), desiredKeys.end());
+            {
                 for (auto iterator = renderers_.begin(); iterator != renderers_.end();) {
-                    if (std::find(desiredKeys.begin(), desiredKeys.end(), iterator->first) == desiredKeys.end()) {
+                    if (!keep.contains(iterator->first)) {
                         // Do not destroy a Renderer until its child process and
                         // acknowledgement thread are confirmed stopped. A
                         // failed retirement keeps the playback lease pinned and
@@ -951,13 +1038,8 @@ namespace
                         if (iterator->second->Stop()) iterator = renderers_.erase(iterator);
                         else ++iterator;
                     } else {
+                        iterator->second->ReapExited();
                         ++iterator;
-                    }
-                }
-            } else {
-                for (auto& [key, renderer] : renderers_) {
-                    if (std::find(desiredKeys.begin(), desiredKeys.end(), key) == desiredKeys.end()) {
-                        renderer->ReapExited();
                     }
                 }
             }
@@ -1007,28 +1089,33 @@ namespace
                 auto renderer = renderers_.find(key);
                 if (renderer == renderers_.end()) continue;
                 renderer->second->Freeze();
-                ready = renderer->second->TargetReady() && ready;
+                // Freeze refreshes process health and can discover an exit or
+                // first-frame failure. Such a route can never acknowledge the
+                // freeze; retire it instead of blocking the replacement copy.
+                // The exclusive-display filter above still protects shared
+                // routes that have a sibling outside this preview transition.
+                auto snapshot = renderer->second->RuntimeSnapshot();
+                auto action = motion::agent::preview_freeze_action(snapshot.running,
+                    snapshot.transitionPending, snapshot.failed, snapshot.targetReady);
+                bool stopped = action == motion::agent::PreviewFreezeAction::stop &&
+                    renderer->second->Stop();
+                ready = motion::agent::preview_freeze_settled(action, stopped) && ready;
             }
             return ready;
         }
 
-        // A compatibility target without a poster cannot ask its failed
-        // source route to produce a first frame. Stop the complete renderer
-        // route (including any displays sharing it), release its playback
-        // lease, and remove it from the desired set. Other independent routes
-        // remain alive while the bounded H.264 copy is generated.
-        [[nodiscard]] bool StopDisplays(
+        // A failed source route cannot acknowledge a freeze. Retire that
+        // complete video route, including shared displays, but keep static
+        // image routes alive while the compatibility copy is generated.
+        [[nodiscard]] bool StopVideoDisplays(
             std::vector<std::string> const& displayIds)
         {
-            acknowledgedPresentationKey_.clear();
-            std::vector<std::wstring> keys;
-            for (auto const& displayId : displayIds) {
-                auto route = desiredDisplayKeys_.find(displayId);
-                if (route != desiredDisplayKeys_.end() &&
-                    std::find(keys.begin(), keys.end(), route->second) == keys.end()) {
-                    keys.push_back(route->second);
-                }
-            }
+            auto keys = motion::agent::compatibility_renderer_routes_to_stop(
+                displayIds, desiredDisplayKeys_, [&](auto const& key) {
+                    auto renderer = renderers_.find(key);
+                    return renderer != renderers_.end() && renderer->second->IsStaticImage();
+                });
+            if (!keys.empty()) acknowledgedPresentationKey_.clear();
             bool stopped = true;
             for (auto const& key : keys) {
                 auto renderer = renderers_.find(key);
@@ -1066,6 +1153,13 @@ namespace
 
         [[nodiscard]] bool HasActiveRoute() const noexcept { return !desiredKeys_.empty(); }
 
+        [[nodiscard]] bool HasRunningVideoRoute() const
+        {
+            return std::any_of(renderers_.begin(), renderers_.end(), [](auto const& entry) {
+                return !entry.second->IsStaticImage() && entry.second->RuntimeSnapshot().running;
+            });
+        }
+
         [[nodiscard]] bool RetiringRoutesStopped() const
         {
             return std::none_of(renderers_.begin(), renderers_.end(),
@@ -1088,7 +1182,31 @@ namespace
                 });
         }
 
-        void ResetAutoDecodeFailures() noexcept { autoDecodeFailures_.clear(); }
+        void ResetAutoDecodeFailures() noexcept
+        {
+            autoDecodeFailures_.clear();
+            originalPlaybackFailures_.clear();
+        }
+
+        [[nodiscard]] std::string OriginalPlaybackFailure(DisplayMediaTarget const& output) const
+        {
+            if (!output.originalPlayback) return {};
+            auto found = originalPlaybackFailures_.find(output.displayId);
+            if (found == originalPlaybackFailures_.end()) return {};
+            auto const& failure = found->second;
+            return failure.Matches(output.groupId, output.mediaId, output.media.path.native())
+                ? failure.reason : std::string{};
+        }
+
+        [[nodiscard]] std::string OriginalPlaybackErrorDetail(DisplayMediaTarget const& output) const
+        {
+            if (!output.originalPlayback) return {};
+            auto found = originalPlaybackFailures_.find(output.displayId);
+            if (found == originalPlaybackFailures_.end()) return {};
+            auto const& failure = found->second;
+            return failure.Matches(output.groupId, output.mediaId, output.media.path.native())
+                ? failure.errorDetail : std::string{};
+        }
 
         [[nodiscard]] motion::protocol::DecodeStatus DecodeState() const
         {
@@ -1174,22 +1292,36 @@ namespace
                 bool degraded = output->softwarePlaybackTarget ||
                     snapshot.decode.path == "software-fallback" ||
                     performanceCopyUnavailable;
+                bool rendererAbsent = !snapshot.running && !snapshot.transitionPending;
+                auto originalFailure = OriginalPlaybackFailure(*output);
                 motion::agent::DisplayRuntimeSignals signals{
                     snapshot.failed,
                     output->performanceCopyPending,
                     paused,
                     snapshot.targetReady,
-                    degraded
+                    degraded,
+                    rendererAbsent,
+                    !originalFailure.empty()
                 };
                 state.state = motion::agent::display_runtime_state(signals);
                 state.decodePath = snapshot.decode.path;
                 state.decodeReason = snapshot.decode.reason;
+                state.errorDetail = snapshot.errorDetail;
                 state.rendererProcessId = snapshot.processId;
                 state.canRetry = snapshot.failed;
                 state.canRestartRenderer = hasRenderer;
-                if (snapshot.failed) {
+                if (!originalFailure.empty()) {
+                    state.reason = paused ? pausedReason() : "original-playback-failed";
+                    state.decodePath = "unavailable";
+                    state.decodeReason = std::move(originalFailure);
+                    state.errorDetail = OriginalPlaybackErrorDetail(*output);
+                    state.canRetry = !paused;
+                    state.canRestartRenderer = !paused;
+                } else if (snapshot.failed) {
                     state.reason = snapshot.decode.reason.empty()
                         ? "renderer-process-failed" : snapshot.decode.reason;
+                } else if (paused && rendererAbsent) {
+                    state.reason = pausedReason();
                 } else if (!snapshot.targetReady) {
                     state.reason = paused ? "pause-pending" :
                         snapshot.transitionPending
@@ -1204,6 +1336,14 @@ namespace
                     state.reason = snapshot.decode.reason.empty()
                         ? "compatibility-fallback" : snapshot.decode.reason;
                 }
+                if (output->gpuProbePending && !paused && !signals.originalPlaybackFailed) {
+                    state.state = "applying";
+                    state.reason = "checking-decoder";
+                    state.decodePath = "probing";
+                    state.decodeReason = "checking-decoder";
+                    state.errorDetail.clear();
+                    state.canRetry = false;
+                }
                 result.push_back(std::move(state));
             }
             return result;
@@ -1212,21 +1352,21 @@ namespace
         bool Retry(std::string const& displayId)
         {
             auto keys = ControlKeys(displayId);
-            bool retried{};
+            bool retried = ClearOriginalPlaybackFailures(displayId);
             for (auto const& key : keys) {
                 auto renderer = renderers_.find(key);
                 if (renderer != renderers_.end()) {
                     retried = renderer->second->RetryFailed() || retried;
                 }
             }
-            if (retried) ResetAutoDecodeFailures();
+            if (retried) autoDecodeFailures_.clear();
             return retried;
         }
 
         bool Restart(std::string const& displayId)
         {
             auto keys = ControlKeys(displayId);
-            bool found{};
+            bool found = ClearOriginalPlaybackFailures(displayId);
             bool stopped = true;
             for (auto const& key : keys) {
                 auto renderer = renderers_.find(key);
@@ -1234,7 +1374,7 @@ namespace
                 found = true;
                 stopped = renderer->second->Restart() && stopped;
             }
-            if (found && stopped) ResetAutoDecodeFailures();
+            if (found && stopped) autoDecodeFailures_.clear();
             return found && stopped;
         }
 
@@ -1249,6 +1389,7 @@ namespace
             acknowledgedPresentationKey_.clear();
             desiredKeys_.clear();
             desiredDisplayKeys_.clear();
+            retirement_.Clear();
             bool stopped = true;
             for (auto& [_, renderer] : renderers_) {
                 stopped = renderer->Stop() && stopped;
@@ -1275,6 +1416,7 @@ namespace
                     motion::utf8_to_wide(output.media.kind) + L"\n" +
                     output.decodeAdapter + L"\n" +
                     std::to_wstring(output.playbackFrameRateCap) + L"\n" +
+                    motion::display_refresh_rate_key(output.displayRefreshRate) + L"\n" +
                     (output.media.sourceBacked ? L"source" : L"derived") + L"\n" +
                     (output.performanceCopyRequired ? L"copy-required" : L"copy-ready");
             }
@@ -1294,12 +1436,8 @@ namespace
             std::string const& decodeMode, bool primaryOnly,
             uint32_t frameRateCap) const
         {
-            std::wstring key = route.mediaKey + L"\n" + motion::utf8_to_wide(decodeMode) +
-                (primaryOnly ? L"\nprimary\n" : L"\nmonitor\n") + route.adapterKey + L"\n" +
-                std::to_wstring(frameRateCap) + L"\n" +
-                std::to_wstring(topologyGeneration_);
-            for (auto const& monitor : route.monitorDevices) key += L"\n" + monitor;
-            return key;
+            return motion::agent::renderer_route_key(route, motion::utf8_to_wide(decodeMode),
+                primaryOnly, frameRateCap, topologyGeneration_);
         }
 
         void RememberAutoDecodeFailure(fs::path const& media, std::wstring const& adapter)
@@ -1308,11 +1446,21 @@ namespace
             autoDecodeFailures_.emplace_back(media.lexically_normal().wstring(), adapter);
         }
 
+        bool ClearOriginalPlaybackFailures(std::string const& displayId)
+        {
+            if (!displayId.empty()) return originalPlaybackFailures_.erase(displayId) != 0;
+            bool hadFailures = !originalPlaybackFailures_.empty();
+            originalPlaybackFailures_.clear();
+            return hadFailures;
+        }
+
         fs::path executable_;
         std::map<std::wstring, std::unique_ptr<Renderer>> renderers_;
+        motion::agent::RendererRetirementPolicy retirement_;
         std::vector<std::wstring> desiredKeys_;
         std::map<std::string, std::wstring> desiredDisplayKeys_;
         std::vector<std::pair<std::wstring, std::wstring>> autoDecodeFailures_;
+        std::map<std::string, motion::agent::OriginalPlaybackFailure> originalPlaybackFailures_;
         std::wstring acknowledgedPresentationKey_;
         uint64_t topologyGeneration_{};
     };
@@ -1359,16 +1507,40 @@ namespace
         std::chrono::steady_clock::time_point nextSample_{};
     };
 
-    std::optional<bool> query_session_locked()
+    void query_session_state(motion::agent::RuntimeSessionState& session)
     {
         LPWSTR buffer{};
         DWORD bytes{};
-        if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSConnectState, &buffer, &bytes)) return std::nullopt;
         auto release = [](wchar_t* value) noexcept { if (value) WTSFreeMemory(value); };
-        std::unique_ptr<wchar_t, decltype(release)> memory(buffer, release);
-        if (!buffer || bytes < sizeof(WTS_CONNECTSTATE_CLASS)) return std::nullopt;
-        auto state = *reinterpret_cast<WTS_CONNECTSTATE_CLASS*>(buffer);
-        return state != WTSActive;
+        if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+                WTSSessionInfoEx, &buffer, &bytes)) {
+            std::unique_ptr<wchar_t, decltype(release)> memory(buffer, release);
+            if (buffer && bytes >= sizeof(WTSINFOEXW)) {
+                auto const& info = *reinterpret_cast<WTSINFOEXW const*>(buffer);
+                if (info.Level == 1) {
+                    auto const& details = info.Data.WTSInfoExLevel1;
+                    std::optional<bool> locked;
+                    if (details.SessionFlags == WTS_SESSIONSTATE_LOCK) locked = true;
+                    else if (details.SessionFlags == WTS_SESSIONSTATE_UNLOCK) locked = false;
+                    session.Observe(details.SessionState == WTSActive, locked);
+                    return;
+                }
+            }
+        } else if (buffer) {
+            WTSFreeMemory(buffer);
+        }
+        buffer = nullptr;
+        bytes = 0;
+        if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+                WTSConnectState, &buffer, &bytes)) {
+            std::unique_ptr<wchar_t, decltype(release)> memory(buffer, release);
+            if (buffer && bytes >= sizeof(WTS_CONNECTSTATE_CLASS)) {
+                session.Observe(*reinterpret_cast<WTS_CONNECTSTATE_CLASS const*>(buffer) == WTSActive,
+                    std::nullopt);
+            }
+        } else if (buffer) {
+            WTSFreeMemory(buffer);
+        }
     }
 
     class RuntimeEvents
@@ -1380,7 +1552,7 @@ namespace
             togglePlaybackEvent_.reset(CreateEventW(nullptr, FALSE, FALSE, motion::toggle_playback_event_name));
             nextWallpaperEvent_.reset(CreateEventW(nullptr, FALSE, FALSE, motion::next_wallpaper_event_name));
             screensaverPreviewEvent_.reset(CreateEventW(nullptr, FALSE, FALSE, motion::screensaver_preview_event_name));
-            if (auto locked = query_session_locked()) locked_ = *locked;
+            query_session_state(session_);
             SYSTEM_POWER_STATUS power{};
             if (GetSystemPowerStatus(&power) && power.ACLineStatus != 255) {
                 onBattery_ = power.ACLineStatus == 0;
@@ -1396,7 +1568,7 @@ namespace
             if (!window_) return;
             sessionNotificationRegistered_ =
                 WTSRegisterSessionNotification(window_, NOTIFY_FOR_THIS_SESSION) != FALSE;
-            displayNotification_ = RegisterPowerSettingNotification(window_, &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE);
+            displayNotification_ = RegisterPowerSettingNotification(window_, &GUID_SESSION_DISPLAY_STATUS, DEVICE_NOTIFY_WINDOW_HANDLE);
             powerSourceNotification_ = RegisterPowerSettingNotification(window_, &GUID_ACDC_POWER_SOURCE, DEVICE_NOTIFY_WINDOW_HANDLE);
             eventWindow_.store(window_, std::memory_order_release);
             foregroundHook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
@@ -1433,7 +1605,7 @@ namespace
             return window_ != nullptr && appExitEvent_ && togglePlaybackEvent_ &&
                 nextWallpaperEvent_ && screensaverPreviewEvent_;
         }
-        bool Locked() const { return locked_; }
+        bool Locked() const { return session_.Inactive(); }
         bool DisplayOn() const { return displayOn_; }
         bool OnBattery() const { return onBattery_; }
         uint64_t TopologyRevision() const { return topologyRevision_; }
@@ -1491,7 +1663,7 @@ namespace
         {
             if (now < nextSessionPoll_) return;
             nextSessionPoll_ = now + 1s;
-            if (auto locked = query_session_locked()) locked_ = *locked;
+            query_session_state(session_);
         }
 
         bool Wait(HANDLE settingsEvent, DWORD milliseconds)
@@ -1641,26 +1813,17 @@ namespace
             case WM_INPUT:
                 return DefWindowProcW(window, message, wParam, lParam);
             case WM_WTSSESSION_CHANGE:
-                switch (wParam) {
-                case WTS_SESSION_LOCK:
-                case WTS_CONSOLE_DISCONNECT:
-                case WTS_REMOTE_DISCONNECT:
-                case WTS_SESSION_LOGOFF:
-                    self->locked_ = true;
-                    break;
-                case WTS_SESSION_UNLOCK:
-                case WTS_CONSOLE_CONNECT:
-                case WTS_REMOTE_CONNECT:
-                case WTS_SESSION_LOGON:
-                case WTS_SESSION_DESKTOP_READY:
-                    self->locked_ = false;
-                    break;
+                self->session_.Notify(static_cast<uint32_t>(wParam));
+                self->nextSessionPoll_ = std::chrono::steady_clock::time_point::min();
+                if (wParam == WTS_CONSOLE_CONNECT || wParam == WTS_CONSOLE_DISCONNECT ||
+                    wParam == WTS_REMOTE_CONNECT || wParam == WTS_REMOTE_DISCONNECT) {
+                    ++self->topologyRevision_;
                 }
                 return 0;
             case WM_POWERBROADCAST:
                 if (wParam == PBT_POWERSETTINGCHANGE) {
                     auto setting = reinterpret_cast<POWERBROADCAST_SETTING*>(lParam);
-                    if (setting && IsEqualGUID(setting->PowerSetting, GUID_CONSOLE_DISPLAY_STATE) && setting->DataLength >= sizeof(DWORD)) {
+                    if (setting && IsEqualGUID(setting->PowerSetting, GUID_SESSION_DISPLAY_STATUS) && setting->DataLength >= sizeof(DWORD)) {
                         self->displayOn_ = *reinterpret_cast<DWORD*>(setting->Data) != 0;
                     } else if (setting && IsEqualGUID(setting->PowerSetting, GUID_ACDC_POWER_SOURCE) &&
                         setting->DataLength >= sizeof(DWORD)) {
@@ -1686,7 +1849,7 @@ namespace
         motion::unique_handle nextWallpaperEvent_;
         motion::unique_handle screensaverPreviewEvent_;
         motion::agent::TrayStatus status_{ motion::agent::TrayStatus::Starting };
-        bool locked_{};
+        motion::agent::RuntimeSessionState session_;
         bool sessionNotificationRegistered_{};
         bool displayOn_{ true };
         bool onBattery_{};
@@ -1796,6 +1959,28 @@ namespace
 
 int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
 {
+    int argumentCount{};
+    auto arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    if (!arguments) return 1;
+    if (argumentCount >= 2 &&
+        wcscmp(arguments[1], L"--probe-video-first-frame") == 0) {
+        if (argumentCount != 3) {
+            LocalFree(arguments);
+            return 1;
+        }
+        fs::path candidate(arguments[2]);
+        LocalFree(arguments);
+        return motion::agent::run_video_first_frame_probe(candidate);
+    }
+    auto gpuProbeExitCode = motion::agent::run_video_gpu_probe_cli(argumentCount, arguments);
+    LocalFree(arguments);
+    if (gpuProbeExitCode >= 0) return gpuProbeExitCode;
+    auto installation = motion::startup::inspect_installation(motion::executable_directory());
+    if (!installation.conflict.empty()) {
+        MessageBoxW(nullptr, installation.conflict.c_str(), L"MotionWallpaper · 安装位置冲突",
+            MB_OK | MB_ICONWARNING);
+        return ERROR_ALREADY_EXISTS;
+    }
     motion::enable_per_monitor_dpi_awareness();
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     motion::unique_handle mutex(CreateMutexW(nullptr, TRUE, L"Local\\MotionWallpaper.Agent"));
@@ -1881,7 +2066,10 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
         uint32_t logicalProcessors = (std::max)(1u,
             static_cast<uint32_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
         bool physicalVideoDeviceAvailable = physical_video_device_available();
+        std::string gpuEnvironment;
         std::string publishedGroupId, publishedMediaId, publishedDecodePath, publishedDecodeReason;
+        std::string publishedPerformanceMode, publishedActiveSceneId;
+        bool effectiveSettingsActive{};
         std::vector<motion::DisplayRuntimeState> publishedDisplayStates;
         auto agentInstanceId = motion::new_id();
         uint32_t agentProcessId = GetCurrentProcessId();
@@ -1899,6 +2087,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 publishedMediaId = std::move(previousRuntime.activeMediaId);
                 publishedDecodePath = std::move(previousRuntime.decodePath);
                 publishedDecodeReason = std::move(previousRuntime.decodeReason);
+                publishedPerformanceMode = std::move(previousRuntime.performanceMode);
+                publishedActiveSceneId = std::move(previousRuntime.activeSceneId);
                 publishedDisplayStates = std::move(previousRuntime.displayStates);
                 publishedAgentInstanceId = std::move(previousRuntime.agentInstanceId);
                 publishedAgentProcessId = previousRuntime.agentProcessId;
@@ -1921,8 +2111,22 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
             if (legacyDataConflict) return;
             auto nextDisplayStates = displayStates
                 ? std::move(*displayStates) : publishedDisplayStates;
+            // Command acknowledgements can be published before this pass has
+            // applied an automatic scene. Preserve the previous effective
+            // context then; publishing base settings would briefly mislabel
+            // the still-current display failures as a different quality mode.
+            auto nextPerformanceMode = effectiveSettingsActive
+                ? settings.performanceMode : publishedPerformanceMode;
+            auto nextActiveSceneId = effectiveSettingsActive
+                ? settings.activeSceneId : publishedActiveSceneId;
+            if (!configurationAvailable) {
+                nextPerformanceMode.clear();
+                nextActiveSceneId.clear();
+            }
             if (groupId == publishedGroupId && mediaId == publishedMediaId &&
                 decodePath == publishedDecodePath && decodeReason == publishedDecodeReason &&
+                nextPerformanceMode == publishedPerformanceMode &&
+                nextActiveSceneId == publishedActiveSceneId &&
                 nextDisplayStates == publishedDisplayStates &&
                 agentInstanceId == publishedAgentInstanceId &&
                 agentProcessId == publishedAgentProcessId &&
@@ -1936,6 +2140,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 runtime.activeMediaId = mediaId;
                 runtime.decodePath = decodePath;
                 runtime.decodeReason = decodeReason;
+                runtime.performanceMode = nextPerformanceMode;
+                runtime.activeSceneId = nextActiveSceneId;
                 runtime.agentInstanceId = agentInstanceId;
                 runtime.agentProcessId = agentProcessId;
                 runtime.displayStates = nextDisplayStates;
@@ -1945,10 +2151,21 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 runtime.lastCommandMessage = lastCommandMessage;
                 runtime.updatedAt = motion::timestamp_utc();
                 motion::save_runtime(runtimePath, runtime);
+                for (auto const& display : nextDisplayStates) {
+                    if (display.errorDetail.empty()) continue;
+                    auto previous = std::find_if(publishedDisplayStates.begin(), publishedDisplayStates.end(),
+                        [&](auto const& value) { return value.displayId == display.displayId; });
+                    if (previous == publishedDisplayStates.end() || previous->errorDetail != display.errorDetail) {
+                        append_agent_log(root, L"Renderer [" + display.displayName + L"] " +
+                            motion::utf8_to_wide(display.errorDetail));
+                    }
+                }
                 publishedGroupId = std::move(groupId);
                 publishedMediaId = std::move(mediaId);
                 publishedDecodePath = std::move(decodePath);
                 publishedDecodeReason = std::move(decodeReason);
+                publishedPerformanceMode = std::move(nextPerformanceMode);
+                publishedActiveSceneId = std::move(nextActiveSceneId);
                 publishedDisplayStates = std::move(nextDisplayStates);
                 publishedAgentInstanceId = agentInstanceId;
                 publishedAgentProcessId = agentProcessId;
@@ -1977,6 +2194,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
         };
 
         for (;;) {
+            effectiveSettingsActive = false;
             if (runtimeEvents.ExitRequested()) { renderers.Stop(); return 0; }
 
             bool conflictNow = motion::legacy_data_conflict_present(applicationRoot);
@@ -1996,6 +2214,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     publishedMediaId.clear();
                     publishedDecodePath.clear();
                     publishedDecodeReason.clear();
+                    publishedPerformanceMode.clear();
+                    publishedActiveSceneId.clear();
                     publishedDisplayStates.clear();
                     publishedAgentInstanceId.clear();
                     publishedAgentProcessId = 0;
@@ -2039,6 +2259,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 publishedMediaId.clear();
                 publishedDecodePath.clear();
                 publishedDecodeReason.clear();
+                publishedPerformanceMode.clear();
+                publishedActiveSceneId.clear();
                 publishedDisplayStates.clear();
                 publishedAgentInstanceId.clear();
                 publishedAgentProcessId = 0;
@@ -2052,6 +2274,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     publishedMediaId = std::move(previousRuntime.activeMediaId);
                     publishedDecodePath = std::move(previousRuntime.decodePath);
                     publishedDecodeReason = std::move(previousRuntime.decodeReason);
+                    publishedPerformanceMode = std::move(previousRuntime.performanceMode);
+                    publishedActiveSceneId = std::move(previousRuntime.activeSceneId);
                     publishedDisplayStates = std::move(previousRuntime.displayStates);
                     publishedAgentInstanceId = std::move(previousRuntime.agentInstanceId);
                     publishedAgentProcessId = previousRuntime.agentProcessId;
@@ -2299,10 +2523,29 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 importedRequests = imported_optimization_requests(wallpapers);
                 nextOptimizationRequestScan = now + (importedRequests.empty() ? 10s : 1s);
             }
+            auto displays = motion::enumerate_displays();
             auto prepareImported = [&] {
                 if (importedRequests.empty()) return;
-                auto target = optimization_target_size(settings);
                 for (auto const& request : importedRequests) {
+                    auto targets = display_media_targets(wallpapers, settings,
+                        settings.selectedGroupId, settings.selectedMediaId, request.mode, displays);
+                    auto target = optimization_target_size(targets, request.media.id, displays);
+                    std::map<std::pair<uint32_t, uint32_t>, OptimizationTarget> aspects;
+                    for (auto const& output : targets) {
+                        if (output.mediaId != request.media.id) continue;
+                        auto& required = aspects[motion::agent::video_display_aspect(output.targetWidth, output.targetHeight)];
+                        required.width = (std::max)(required.width, output.targetWidth);
+                        required.height = (std::max)(required.height, output.targetHeight);
+                        required.refreshRateHz = (std::max)(required.refreshRateHz, output.targetRefreshRate);
+                    }
+                    // A mode has one durable request token. Select its next
+                    // missing viewport before completing that token, otherwise
+                    // a ready landscape copy repeatedly cancels portrait work.
+                    for (auto const& [_, required] : aspects) {
+                        auto resolved = videoOptimizer->ResolveWithLease(request.media.path, request.mode,
+                            required.width, required.height, required.refreshRateHz, false, false);
+                        if (resolved.performanceCopyRequired || resolved.gpuProbePending) { target = required; break; }
+                    }
                     videoOptimizer->Prepare(request.media.path, request.mode,
                         target.width, target.height, target.refreshRateHz);
                 }
@@ -2320,11 +2563,11 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
             auto screensaverIdle = screensaverIdleTimer.Update(uptime, input.tick, input.idle,
                 motion::agent::screensaver_idle_is_inhibited(inhibition.display, screensaverWasActive));
             DWORD waitMilliseconds = motion::agent::stable_wait_ms;
-            auto displays = motion::enumerate_displays();
             std::vector<motion::DisplayRuntimeState> currentDisplayStates;
             if (runtimeEvents.TopologyRevision() != topologyRevision) {
                 topologyRevision = runtimeEvents.TopologyRevision();
                 renderers.TopologyChanged();
+                motion::agent::invalidate_video_gpu_probes();
                 bool available = physical_video_device_available();
                 physicalVideoDeviceAvailable = available;
                 // Adapter membership and per-codec decode profiles can change
@@ -2333,6 +2576,16 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 // topology revision.
                 videoOptimizer->InvalidateChoices();
                 automaticCompatibilityPriority = false;
+            }
+            auto gpuInventory = motion::agent::video_gpu_inventory_async();
+            if (!gpuInventory.pending) {
+                auto environment = gpuInventory.succeeded ? gpuInventory.environment : std::string("gpu-probe-unavailable");
+                if (environment != gpuEnvironment) {
+                    gpuEnvironment = std::move(environment);
+                    physicalVideoDeviceAvailable = gpuInventory.physicalVideoDeviceAvailable;
+                    renderers.ResetAutoDecodeFailures();
+                    videoOptimizer->InvalidateChoices();
+                }
             }
             IterationSettingsRestore restoreConfiguredSettings{ settings, settings };
             SYSTEMTIME localTime{};
@@ -2346,6 +2599,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     settings, sceneContext)) {
                 (void)motion::apply_scene_profile(settings, *automaticScene);
             }
+            effectiveSettingsActive = true;
             videoOptimizer->SetStorageQuotaBytes(
                 settings.optimizationStorageQuotaBytes);
             auto sessionAction = motion::agent::reduce_runtime_action(settings,
@@ -2356,10 +2610,11 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 runtimeEvents.SetScreensaverInputWakeEnabled(false);
                 runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::DisplayOff,
                     trayControls.ManuallyPaused());
-                // The display-off contract wins over background preparation:
-                // stop hardware work now and resume the durable request later.
-                videoOptimizer->SetGenerationAllowed(false);
-                renderers.Stop();
+                bool stopped = renderers.Stop();
+                bool mayPrepare = motion::agent::hidden_session_generation_allowed(
+                    sessionAction, runtimeEvents.OnBattery(), stopped);
+                videoOptimizer->SetGenerationAllowed(mayPrepare);
+                if (mayPrepare) prepareImported();
                 currentDisplayStates = renderers.RuntimeStates(displays, {},
                     sessionAction, settings.displayMode == "primary");
                 waitMilliseconds = 1000;
@@ -2369,8 +2624,11 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 runtimeEvents.SetScreensaverInputWakeEnabled(false);
                 runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::Locked,
                     trayControls.ManuallyPaused());
-                videoOptimizer->SetGenerationAllowed(false);
-                renderers.Stop();
+                bool stopped = renderers.Stop();
+                bool mayPrepare = motion::agent::hidden_session_generation_allowed(
+                    sessionAction, runtimeEvents.OnBattery(), stopped);
+                videoOptimizer->SetGenerationAllowed(mayPrepare);
+                if (mayPrepare) prepareImported();
                 currentDisplayStates = renderers.RuntimeStates(displays, {},
                     sessionAction, settings.displayMode == "primary");
                 if (!wasLocked) {
@@ -2394,8 +2652,12 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 }
                 waitMilliseconds = 1000;
             } else {
-                bool softwarePlayback = motion::agent::uses_software_playback(
-                    settings.decodeMode, physicalVideoDeviceAvailable);
+                // Original is a direct-play choice, including when the user
+                // explicitly requests a software decoder. It never implies a
+                // silent cpu-smooth conversion or a different selected file.
+                bool softwarePlayback = settings.performanceMode != "original" &&
+                    motion::agent::uses_software_playback(
+                        settings.decodeMode, physicalVideoDeviceAvailable);
                 if (settings.decodeMode != "auto") automaticCompatibilityPriority = false;
                 std::string playbackPerformanceMode = softwarePlayback
                     ? std::string(motion::agent::cpu_smooth_mode) : settings.performanceMode;
@@ -2537,6 +2799,10 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 auto outputs = display_media_targets(
                     wallpapers, outputSettings, groupId, mediaId, playbackPerformanceMode,
                     displays);
+                for (auto& output : outputs) {
+                    output.originalPlayback = settings.performanceMode == "original" &&
+                        output.media.kind == "video";
+                }
                 if (softwarePlayback) {
                     for (auto& output : outputs) {
                         output.softwarePlaybackTarget = output.media.kind == "video";
@@ -2545,6 +2811,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                                 motion::agent::software_playback_profile(true,
                                     logicalProcessors, output.targetWidth,
                                     output.targetHeight, output.targetRefreshRate).frameRate;
+                            output.playbackFrameRateCap = motion::agent::video_cpu_frame_rate_cap(
+                                output.playbackFrameRateCap);
                         }
                     }
                 }
@@ -2556,18 +2824,23 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         for (size_t index = 0; index < targets.size(); ++index) {
                             auto& output = targets[index];
                             if (output.media.kind != "video") continue;
+                            if (motion::agent::defer_source_decode_probe(
+                                    output.media.sourceBacked, output.performanceCopyRequired)) continue;
                             preferredAdapters[index] = display_adapter_key(output.deviceName);
                             auto routeAdapter = motion::agent::renderer_adapter_key(
                                 preferredAdapters[index], output.deviceName);
                             probeRoutes.push_back({
                                 motion::agent::renderer_media_key(output.media.path, output.media.kind),
                                 output.deviceName, std::move(routeAdapter),
-                                static_cast<uint64_t>(output.targetWidth) * output.targetHeight });
+                                static_cast<uint64_t>(output.targetWidth) * output.targetHeight,
+                                output.displayRefreshRate });
                         }
                         auto groupedProbeRoutes = motion::agent::group_renderer_routes(probeRoutes, false);
                         for (size_t index = 0; index < targets.size(); ++index) {
                             auto& output = targets[index];
                             if (output.media.kind != "video") continue;
+                            if (motion::agent::defer_source_decode_probe(
+                                    output.media.sourceBacked, output.performanceCopyRequired)) continue;
                             auto mediaKey = motion::agent::renderer_media_key(
                                 output.media.path, output.media.kind);
                             auto routeAdapter = motion::agent::renderer_adapter_key(
@@ -2580,11 +2853,19 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                             auto aggregateOutputPixels = route == groupedProbeRoutes.end()
                                 ? static_cast<uint64_t>(output.targetWidth) * output.targetHeight
                                 : route->aggregateOutputPixels;
-                            output.decodeAdapter = videoOptimizer->SourceHardwareDecodeAdapter(
+                            auto probe = videoOptimizer->SourceHardwareDecodeCandidates(
                                 output.media.path, preferredAdapters[index], aggregateOutputPixels);
-                            if (renderers.AutoDecodeRouteRejected(
-                                    output.media.path, output.decodeAdapter)) {
-                                output.decodeAdapter.clear();
+                            output.gpuProbePending = probe.pending;
+                            output.decodeAdapter.clear();
+                            output.hasAlternativeDecodeAdapter = false;
+                            if (probe.pending) continue;
+                            for (auto const& adapter : probe.adapters) {
+                                if (renderers.AutoDecodeRouteRejected(output.media.path, adapter)) continue;
+                                if (output.decodeAdapter.empty()) output.decodeAdapter = adapter;
+                                else if (adapter != output.decodeAdapter) {
+                                    output.hasAlternativeDecodeAdapter = true;
+                                    break;
+                                }
                             }
                             if (output.decodeAdapter.empty()) {
                                 routesWithoutHardwareDecode.push_back(index);
@@ -2627,13 +2908,14 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     onBattery, powerSaverNeedsPriority || !importedRequests.empty(), playbackIdle);
                 auto resolveVideoOutputs = [&](bool onlySoftwareTargets = false,
                     bool allowGenerationRequest = false) {
-                    using ResolveKey = std::pair<std::wstring, bool>;
+                    using ResolveKey = std::tuple<std::wstring, bool, std::pair<uint32_t, uint32_t>>;
                     std::map<ResolveKey, OptimizationTarget> requiredVideoTargets;
                     for (auto const& output : outputs) {
                         if (output.media.kind != "video" || !output.media.sourceBacked) continue;
                         if (onlySoftwareTargets && !output.softwarePlaybackTarget) continue;
                         auto key = ResolveKey{ output.media.path.wstring(),
-                            output.softwarePlaybackTarget };
+                            output.softwarePlaybackTarget,
+                            motion::agent::video_display_aspect(output.targetWidth, output.targetHeight) };
                         auto& required = requiredVideoTargets[key];
                         auto profile = motion::agent::software_playback_profile(
                             output.softwarePlaybackTarget,
@@ -2651,7 +2933,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         if (onlySoftwareTargets && !output.softwarePlaybackTarget) continue;
                         auto source = output.media.path;
                         auto const required = requiredVideoTargets[{ source.wstring(),
-                            output.softwarePlaybackTarget }];
+                            output.softwarePlaybackTarget,
+                            motion::agent::video_display_aspect(output.targetWidth, output.targetHeight) }];
                         auto resolved = videoOptimizer->ResolveWithLease(source, settings.performanceMode,
                             required.width, required.height, required.refreshRateHz,
                             output.softwarePlaybackTarget,
@@ -2660,6 +2943,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                             resolved.performanceCopyRequired;
                         output.performanceCopyPending =
                             resolved.performanceCopyPending;
+                        output.gpuProbePending = resolved.gpuProbePending;
                         output.media.path = std::move(resolved.path);
                         output.media.playbackLease = std::move(resolved.lease);
                         output.media.sourceBacked = output.media.path == source;
@@ -2684,7 +2968,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     // capabilities. Runtime driver failures are keyed to this
                     // same concrete path and adapter.
                     auto unsupportedRoutes = assignDecodeAdapters(outputs);
-                    if (!softwarePlayback && !unsupportedRoutes.empty()) {
+                    if (settings.performanceMode != "original" &&
+                        !softwarePlayback && !unsupportedRoutes.empty()) {
                         automaticCompatibilityPriority = true;
                         auto cpuOutputs = display_media_targets(wallpapers, settings,
                             groupId, mediaId, std::string(motion::agent::cpu_smooth_mode),
@@ -2712,6 +2997,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                                 motion::agent::software_playback_profile(true,
                                     logicalProcessors, output.targetWidth,
                                     output.targetHeight, output.targetRefreshRate).frameRate;
+                            output.playbackFrameRateCap = motion::agent::video_cpu_frame_rate_cap(
+                                output.playbackFrameRateCap);
                         }
                         powerSaverNeedsPriority = true;
                         backgroundGenerationAllowed = motion::agent::variant_generation_allowed(
@@ -2733,16 +3020,15 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                             output.media.sourceBacked;
                     });
                 bool waitingForPerformanceCopy =
-                    state == motion::agent::RuntimeAction::DesktopPlay &&
-                    std::any_of(outputs.begin(), outputs.end(), [](auto const& output) {
-                        return motion::agent::active_playback_waits_for_performance_copy(
-                            output.performanceCopyRequired,
-                            output.media.sourceBacked);
+                    std::any_of(outputs.begin(), outputs.end(), [&](auto const& output) {
+                        bool required = motion::agent::active_playback_waits_for_performance_copy(
+                            output.performanceCopyRequired, output.media.sourceBacked);
+                        return motion::agent::performance_copy_preview_required(state, required || output.gpuProbePending);
                     });
                 std::vector<std::string> performanceCopyDisplayIds;
                 if (waitingForPerformanceCopy) {
                     for (auto const& output : outputs) {
-                        if (output.performanceCopyRequired &&
+                        if ((output.performanceCopyRequired || output.gpuProbePending) &&
                             !output.displayId.empty()) {
                             performanceCopyDisplayIds.push_back(output.displayId);
                         }
@@ -2750,10 +3036,9 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 }
 
                 if (waitingForPerformanceCopy && !performanceCopyWasRequired) {
-                    // Stop an already running optimizer before touching the
-                    // previous playback route. Generation remains disabled
-                    // until both barriers below have acknowledged.
-                    videoOptimizer->SetGenerationAllowed(false);
+                    // Establish the preview barrier without discarding an
+                    // AC-powered task that survived lock or display-off.
+                    // Source presentation still enforces quiescence below.
                     performancePreviewStage = renderers.HasActiveRoute()
                         ? PerformancePreviewStage::FreezePrevious
                         : PerformancePreviewStage::PresentPreview;
@@ -2762,31 +3047,58 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 }
                 performanceCopyWasRequired = waitingForPerformanceCopy;
 
+                // Keep logical outputs unchanged for runtime identity and
+                // error reporting. Only the concrete presentation route uses
+                // the original video's poster after a real playback failure.
+                auto playbackOutputs = outputs;
+                std::vector<std::string> originalFailedDisplayIds;
+                std::vector<std::string> originalMissingPosterDisplayIds;
+                for (auto& output : playbackOutputs) {
+                    if (renderers.OriginalPlaybackFailure(output).empty()) continue;
+                    originalFailedDisplayIds.push_back(output.displayId);
+                    auto poster = media_poster_by_id(wallpapers, output.groupId, output.mediaId, *videoOptimizer);
+                    if (poster.path.empty()) {
+                        originalMissingPosterDisplayIds.push_back(output.displayId);
+                        continue;
+                    }
+                    output.media = std::move(poster);
+                    output.decodeAdapter.clear();
+                    output.softwarePlaybackTarget = false;
+                    output.playbackFrameRateCap = 0;
+                }
+                playbackOutputs.erase(std::remove_if(playbackOutputs.begin(), playbackOutputs.end(),
+                    [&](auto const& output) {
+                        return std::find(originalMissingPosterDisplayIds.begin(), originalMissingPosterDisplayIds.end(),
+                            output.displayId) != originalMissingPosterDisplayIds.end();
+                    }), playbackOutputs.end());
+                bool originalFailedRoutesStopped = originalFailedDisplayIds.empty() ||
+                    renderers.StopVideoDisplays(originalFailedDisplayIds);
+
                 auto performanceCopyPreviewOutputs = outputs;
                 std::vector<std::string> compatibilityCopyStoppedDisplayIds;
                 std::vector<std::string> compatibilityCopyNoPreviewDisplayIds;
                 if (waitingForPerformanceCopy) {
                     for (auto& output : performanceCopyPreviewOutputs) {
-                        if (!output.performanceCopyRequired) continue;
+                        if (!output.performanceCopyRequired && !output.gpuProbePending) continue;
                         auto poster = media_poster_by_id(
-                            wallpapers, output.groupId, output.mediaId);
+                            wallpapers, output.groupId, output.mediaId, *videoOptimizer);
                         bool posterAvailable = !poster.path.empty();
-                        if (motion::agent::compatibility_copy_requires_renderer_stop(
-                                output.performanceCopyRequired,
-                                output.softwarePlaybackTarget) &&
+                        if ((motion::agent::compatibility_copy_requires_renderer_stop(
+                                output.performanceCopyRequired || output.gpuProbePending,
+                                output.softwarePlaybackTarget) || !posterAvailable) &&
                             !output.displayId.empty()) {
                             compatibilityCopyStoppedDisplayIds.push_back(output.displayId);
                         }
                         if (!poster.path.empty()) {
-                            poster.playbackLease = videoOptimizer->AcquirePlaybackLease(poster.path);
                             output.media = std::move(poster);
                             output.decodeAdapter.clear();
                             output.softwarePlaybackTarget = false;
                             output.playbackFrameRateCap = 0;
-                        } else if (motion::agent::compatibility_copy_requires_renderer_stop(
-                                output.performanceCopyRequired,
-                                output.softwarePlaybackTarget) && !posterAvailable &&
-                            !output.displayId.empty()) {
+                        } else if (!output.displayId.empty()) {
+                            // A missing poster is not a reason to initialize
+                            // the expensive source decoder and cancel an
+                            // in-flight encode. Windows keeps its own desktop
+                            // background until the completed copy is available.
                             compatibilityCopyNoPreviewDisplayIds.push_back(output.displayId);
                         }
                     }
@@ -2826,6 +3138,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 auto sourcePresentationMayApply = [&](Renderer::Target target,
                     std::vector<DisplayMediaTarget> const& presentationOutputs,
                     bool freezePerformanceCopies = false) {
+                    if (!originalFailedRoutesStopped) return false;
                     bool needsIdle = renderers.SourcePresentationNeedsOptimizerIdle(
                         target, presentationOutputs, settings.decodeMode,
                         settings.displayMode == "primary", freezePerformanceCopies);
@@ -2838,6 +3151,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 };
                 auto trayStatus = motion::agent::TrayStatus::Applying;
                 if (autoLockTriggered) {
+                    targetReady = renderers.Stop();
                     runtimeEvents.SetScreensaverInputWakeEnabled(false);
                     trayControls.CancelScreensaverPreview();
                     trayStatus = motion::agent::TrayStatus::Locked;
@@ -2855,7 +3169,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         // freeze before a selected optimization can start. Do
                         // not rely on the later seamless-retirement path: a
                         // slow poster could otherwise overlap the whole encode.
-                        bool compatibilityRoutesStopped = renderers.StopDisplays(
+                        bool compatibilityRoutesStopped = renderers.StopVideoDisplays(
                             compatibilityCopyStoppedDisplayIds);
                         std::vector<std::string> previewDisplayIds;
                         std::copy_if(performanceCopyDisplayIds.begin(),
@@ -2877,19 +3191,20 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         trayStatus = motion::agent::TrayStatus::Applying;
                         waitMilliseconds = motion::agent::responsive_wait_ms;
                     } else {
-                        // Barrier 2: present posters (or decode only one legacy
-                        // source frame) per pending display. Routes without a
-                        // missing performance copy remain in DesktopPlay.
-                        bool compatibilityRoutesStopped = renderers.StopDisplays(
+                        // Barrier 2: present available posters per pending
+                        // display. Other routes keep their requested target.
+                        bool compatibilityRoutesStopped = renderers.StopVideoDisplays(
                             compatibilityCopyStoppedDisplayIds);
+                        auto previewTarget = state == motion::agent::RuntimeAction::ScreensaverPlay
+                            ? Renderer::Target::ScreensaverPlay : Renderer::Target::DesktopPlay;
                         if (performanceCopyPreviewOutputs.empty()) {
                             targetReady = compatibilityRoutesStopped &&
                                 renderers.RetiringRoutesStopped();
                         } else if (compatibilityRoutesStopped &&
                             sourcePresentationMayApply(
-                                Renderer::Target::DesktopPlay,
+                                previewTarget,
                                 performanceCopyPreviewOutputs, true)) {
-                            renderers.Apply(Renderer::Target::DesktopPlay,
+                            renderers.Apply(previewTarget,
                                 performanceCopyPreviewOutputs, settings.decodeMode,
                                 settings.displayMode == "primary", true);
                             targetReady = renderers.TargetReady() &&
@@ -2901,7 +3216,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         }
                         bool anyCopyPending = std::any_of(outputs.begin(),
                             outputs.end(), [](auto const& output) {
-                                return output.performanceCopyPending;
+                                return output.performanceCopyPending || output.gpuProbePending;
                             });
                         trayStatus = !targetReady
                             ? motion::agent::TrayStatus::Applying
@@ -2918,9 +3233,9 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     switch (state) {
                     case motion::agent::RuntimeAction::ScreensaverPlay:
                         if (sourcePresentationMayApply(
-                                Renderer::Target::ScreensaverPlay, outputs)) {
+                                Renderer::Target::ScreensaverPlay, playbackOutputs)) {
                             renderers.Apply(Renderer::Target::ScreensaverPlay,
-                                outputs, settings.decodeMode,
+                                playbackOutputs, settings.decodeMode,
                                 settings.displayMode == "primary");
                             targetReady = renderers.TargetReady();
                         }
@@ -2931,9 +3246,9 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         break;
                     case motion::agent::RuntimeAction::DesktopPlay:
                         if (sourcePresentationMayApply(
-                                Renderer::Target::DesktopPlay, outputs)) {
+                                Renderer::Target::DesktopPlay, playbackOutputs)) {
                             renderers.Apply(Renderer::Target::DesktopPlay,
-                                outputs, settings.decodeMode,
+                                playbackOutputs, settings.decodeMode,
                                 settings.displayMode == "primary");
                             targetReady = renderers.TargetReady();
                         }
@@ -2944,9 +3259,9 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         break;
                     case motion::agent::RuntimeAction::DesktopFrozen:
                         if (sourcePresentationMayApply(
-                                Renderer::Target::DesktopFreeze, outputs)) {
+                                Renderer::Target::DesktopFreeze, playbackOutputs)) {
                             renderers.Apply(Renderer::Target::DesktopFreeze,
-                                outputs, settings.decodeMode,
+                                playbackOutputs, settings.decodeMode,
                                 settings.displayMode == "primary");
                             targetReady = renderers.TargetReady();
                         }
@@ -2957,7 +3272,8 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         break;
                     case motion::agent::RuntimeAction::DesktopPaused:
                         renderers.Pause();
-                        targetReady = renderers.TargetReady();
+                        targetReady = renderers.TargetReady() ||
+                            (!renderers.HasActiveRoute() && renderers.RetiringRoutesStopped());
                         trayStatus = targetReady
                             ? motion::agent::TrayStatus::Paused
                             : motion::agent::TrayStatus::Applying;
@@ -2979,15 +3295,18 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     motion::agent::optimization_renderer_is_static(
                         state, waitingForPerformanceCopy, previewBarrierReady,
                         targetReady, renderers.HasActiveRoute(),
-                        retiredRoutesStopped, holdExistingRenderer);
+                        retiredRoutesStopped, holdExistingRenderer,
+                        !renderers.HasRunningVideoRoute());
                 bool currentWallpaperMayGenerate = anyPlaybackCopyRequired &&
                     rendererStaticForOptimization && !onBattery;
-                bool optimizerMayRun = !autoLockTriggered &&
-                    rendererStaticForOptimization &&
-                    (backgroundGenerationAllowed || currentWallpaperMayGenerate);
+                bool optimizerMayRun = autoLockTriggered
+                    ? motion::agent::hidden_session_generation_allowed(
+                        motion::agent::RuntimeAction::Locked, onBattery, targetReady)
+                    : rendererStaticForOptimization &&
+                        (backgroundGenerationAllowed || currentWallpaperMayGenerate);
                 videoOptimizer->SetGenerationAllowed(optimizerMayRun);
                 if (optimizerMayRun) {
-                    if (anyPlaybackCopyRequired) {
+                    if (anyPlaybackCopyRequired && !autoLockTriggered) {
                         // The first Resolve published durable selected-tier
                         // requests without starting them. Re-resolve every
                         // source-backed output only after the static barrier;
@@ -2998,7 +3317,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     }
                     prepareImported();
                 }
-                if (waitingForPerformanceCopy && targetReady) {
+                if (waitingForPerformanceCopy && targetReady && !autoLockTriggered) {
                     // Resolve/Prepare above may queue the current copy during
                     // this same pass. Publish it immediately instead of
                     // leaving tray/runtime one stable poll behind.
@@ -3035,7 +3354,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         display.state = "applying";
                         display.reason = "media-transaction";
                     }
-                } else if (waitingForPerformanceCopy &&
+                } else if (!autoLockTriggered && waitingForPerformanceCopy &&
                     performancePreviewStage ==
                         PerformancePreviewStage::FreezePrevious) {
                     for (auto& display : currentDisplayStates) {
@@ -3050,7 +3369,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         display.reason = "freezing-previous-route";
                     }
                 }
-                if (waitingForPerformanceCopy &&
+                if (!autoLockTriggered && waitingForPerformanceCopy &&
                     performancePreviewStage == PerformancePreviewStage::Ready &&
                     !compatibilityCopyNoPreviewDisplayIds.empty()) {
                     for (auto& display : currentDisplayStates) {
@@ -3081,8 +3400,10 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                             return display.state == "failed";
                         }));
                 runtimeEvents.SetTrayStatus(trayStatus, trayControls.ManuallyPaused());
-                if (motion::agent::runtime_selection_can_publish(
-                        targetReady, waitingForPerformanceCopy)) {
+                bool originalFailureVisible = std::any_of(currentDisplayStates.begin(), currentDisplayStates.end(),
+                    [](auto const& display) { return display.reason == "original-playback-failed"; });
+                if (!autoLockTriggered && (originalFailureVisible ||
+                    motion::agent::runtime_selection_can_publish(targetReady, waitingForPerformanceCopy))) {
                     auto decode = renderers.DecodeState();
                     if (!groupId.empty() && !mediaId.empty()) publishRuntime(groupId, mediaId, decode.path, decode.reason);
                     else if (!outputs.empty()) publishRuntime(outputs.front().groupId, outputs.front().mediaId, decode.path, decode.reason);

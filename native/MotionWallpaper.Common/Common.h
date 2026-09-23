@@ -127,6 +127,9 @@ namespace motion
         uint32_t rendererProcessId{};
         bool canRetry{};
         bool canRestartRenderer{};
+        // Optional diagnostic detail; appended to retain existing aggregate
+        // initialization and runtime-v2 compatibility.
+        std::string errorDetail;
 
         bool operator==(DisplayRuntimeState const&) const = default;
     };
@@ -146,6 +149,10 @@ namespace motion
         bool lastCommandSucceeded{};
         std::string lastCommandMessage;
         std::wstring updatedAt;
+        // Effective policy after automatic scene selection. Empty values keep
+        // runtime documents from older Agents compatible with current readers.
+        std::string performanceMode;
+        std::string activeSceneId;
     };
 
     struct RuntimeControlRequest

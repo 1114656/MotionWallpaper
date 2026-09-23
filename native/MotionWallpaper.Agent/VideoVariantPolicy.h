@@ -2,33 +2,30 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace motion::agent
 {
-    [[nodiscard]] constexpr bool video_cpu_conversion_allowed(
-        bool hdrTransfer, bool bt2020Primaries) noexcept
+    [[nodiscard]] constexpr std::pair<uint32_t, uint32_t> video_display_aspect(uint32_t width, uint32_t height)
     {
-        return !hdrTransfer && !bt2020Primaries;
+        if (!width || !height) return { 0, 0 };
+        auto divisor = std::gcd(width, height);
+        return { width / divisor, height / divisor };
     }
-
-    [[nodiscard]] constexpr bool video_variant_color_metadata_matches(
-        bool sourceTransferKnown, uint32_t sourceTransfer,
-        bool actualTransferKnown, uint32_t actualTransfer,
-        bool sourcePrimariesKnown, uint32_t sourcePrimaries,
-        bool actualPrimariesKnown, uint32_t actualPrimaries) noexcept
+    // A performance copy has an explicit portable output contract, independent
+    // of which GPU/CPU encoder happens to create it. HDR inputs are transformed
+    // by the transcoder, never merely relabelled as SDR.
+    [[nodiscard]] constexpr bool video_matches_sdr_output(
+        std::string_view codec, std::string_view pixelFormat, uint32_t bitDepth,
+        std::string_view transfer, std::string_view primaries,
+        std::string_view matrix, std::string_view range) noexcept
     {
-        return (!sourceTransferKnown ||
-                (actualTransferKnown && actualTransfer == sourceTransfer)) &&
-            (!sourcePrimariesKnown ||
-                (actualPrimariesKnown && actualPrimaries == sourcePrimaries));
-    }
-
-    [[nodiscard]] constexpr bool video_variant_is_hevc_main10(
-        bool profileKnown, uint32_t profile) noexcept
-    {
-        return profileKnown && profile == 2;
+        return codec == "h264" && pixelFormat == "yuv420p" && bitDepth == 8 &&
+            transfer == "bt709" && primaries == "bt709" && matrix == "bt709" &&
+            (range == "tv" || range == "mpeg");
     }
 
     enum class VideoSourceCodec { Unknown, H264, Hevc, Vp9, Av1 };
@@ -75,42 +72,53 @@ namespace motion::agent
         }
     }
 
-    [[nodiscard]] constexpr bool video_software_fallback_allowed(
-        VideoSourceCodec codec, bool profileKnown, uint32_t profile,
-        bool hdrTransfer = false, bool bt2020Primaries = false) noexcept
-    {
-        if (hdrTransfer || bt2020Primaries) return false;
-        // OpenH264 produces 8-bit H.264. Accept a compatibility conversion
-        // only when the compressed profile positively identifies an 8-bit
-        // H.264/HEVC source. Unknown, VP9 and AV1 media may be 10/12-bit even
-        // without HDR metadata, so silently flattening them is a quality and
-        // colour correctness failure.
-        if (codec == VideoSourceCodec::Hevc) return profileKnown && profile == 1;
-        if (codec == VideoSourceCodec::H264) {
-            return profileKnown && (profile == 66 || profile == 77 || profile == 88 || profile == 100);
-        }
-        return false;
-    }
-
     struct VideoVariantDecision
     {
         uint32_t targetFps{};
         std::wstring fileName;
     };
 
+    [[nodiscard]] inline std::wstring unchanged_legacy_fill_variant(std::wstring name,
+        uint32_t sourceWidth, uint32_t sourceHeight, uint32_t width, uint32_t height)
+    {
+        if (!sourceWidth || !sourceHeight || !width || !height || !name.ends_with(L"-v7.mp4") ||
+            video_display_aspect(sourceWidth, sourceHeight) != video_display_aspect(width, height)) return {};
+        name.replace(name.size() - 7, 7, L"-v6.mp4");
+        return name;
+    }
+
+    // Both quality profiles follow the display refresh budget. Extra encoded
+    // frames consume decode bandwidth without adding visible display updates.
+    // Keep the separate CPU compatibility budget bounded below.
+    [[nodiscard]] constexpr uint32_t video_frame_rate_cap(
+        std::string_view performanceMode, uint32_t displayRefreshRate = 0) noexcept
+    {
+        if (performanceMode == "original") return 0;
+        return displayRefreshRate ? displayRefreshRate : 60u;
+    }
+
+    [[nodiscard]] constexpr uint32_t video_cpu_frame_rate_cap(
+        uint32_t requestedCpuCap = 0) noexcept
+    {
+        return (std::min)(60u, requestedCpuCap ? requestedCpuCap : 60u);
+    }
+
     [[nodiscard]] inline VideoVariantDecision video_variant_decision(
         std::string const& performanceMode,
         uint32_t width = 0, uint32_t height = 0,
         uint32_t sourceRateNumerator = 0, uint32_t sourceRateDenominator = 0,
-        uint32_t displayRefreshRate = 0)
+        uint32_t displayRefreshRateOrCpuCap = 0)
     {
         if (performanceMode == "original") return {};
         bool cpuSmooth = performanceMode == "cpu-smooth";
-        uint32_t cap = performanceMode == "power-saver" || cpuSmooth
-            ? (std::min)(60u, displayRefreshRate ? displayRefreshRate : 60u)
-            : (std::min)(120u, displayRefreshRate ? displayRefreshRate : 120u);
+        uint32_t cap = cpuSmooth
+            ? video_cpu_frame_rate_cap(displayRefreshRateOrCpuCap)
+            : video_frame_rate_cap(performanceMode, displayRefreshRateOrCpuCap);
+        // The integer is an upper bound/cache identity. Round it upward so
+        // the transcoder can retain the exact source rational below the cap
+        // (for example 24.4 FPS), rather than unnecessarily lowering it.
         uint32_t sourceFps = sourceRateNumerator && sourceRateDenominator
-            ? static_cast<uint32_t>((static_cast<uint64_t>(sourceRateNumerator) + sourceRateDenominator / 2) /
+            ? static_cast<uint32_t>((static_cast<uint64_t>(sourceRateNumerator) + sourceRateDenominator - 1) /
                 sourceRateDenominator)
             : cap;
         uint32_t targetFps = (std::max)(1u, (std::min)(sourceFps, cap));
@@ -118,12 +126,12 @@ namespace motion::agent
             ? L"-" + std::to_wstring(width) + L"x" + std::to_wstring(height)
             : std::wstring{};
         if (cpuSmooth) {
-            return { targetFps, L"cpu-smooth-" + std::to_wstring(targetFps) + dimensions + L"-v5.mp4" };
+            return { targetFps, L"cpu-smooth-" + std::to_wstring(targetFps) + dimensions + L"-v7.mp4" };
         }
         if (performanceMode == "power-saver") {
-            return { targetFps, L"power-saver-" + std::to_wstring(targetFps) + dimensions + L"-v5.mp4" };
+            return { targetFps, L"power-saver-" + std::to_wstring(targetFps) + dimensions + L"-v7.mp4" };
         }
-        return { targetFps, L"balanced-" + std::to_wstring(targetFps) + dimensions + L"-v5.mp4" };
+        return { targetFps, L"balanced-" + std::to_wstring(targetFps) + dimensions + L"-v7.mp4" };
     }
 
     [[nodiscard]] constexpr std::pair<uint32_t, uint32_t> video_variant_dimensions(
@@ -191,6 +199,42 @@ namespace motion::agent
         bool dimensionsDiffer = sourceWidth && sourceHeight && targetWidth && targetHeight &&
             (sourceWidth != targetWidth || sourceHeight != targetHeight);
         return frameRateDiffers || dimensionsDiffer;
+    }
+
+    [[nodiscard]] constexpr std::pair<uint32_t, uint32_t> video_sdr_variant_dimensions(
+        std::string_view performanceMode,
+        uint32_t sourceWidth, uint32_t sourceHeight,
+        uint32_t displayWidth, uint32_t displayHeight) noexcept
+    {
+        if (performanceMode == "original") return { sourceWidth, sourceHeight };
+        // Copies use the same centered fill geometry as Renderer. The output
+        // rectangle is limited by source pixels; crop before scaling, never
+        // shrink the full image and enlarge its remaining center afterwards.
+        auto fill = [&](uint32_t width, uint32_t height) {
+            if (!sourceWidth || !sourceHeight || !width || !height) return std::pair{sourceWidth, sourceHeight};
+            if (width > sourceWidth || height > sourceHeight) {
+                if (static_cast<uint64_t>(sourceWidth) * height <= static_cast<uint64_t>(sourceHeight) * width) {
+                    height = static_cast<uint32_t>(static_cast<uint64_t>(height) * sourceWidth / width);
+                    width = sourceWidth;
+                } else {
+                    width = static_cast<uint32_t>(static_cast<uint64_t>(width) * sourceHeight / height);
+                    height = sourceHeight;
+                }
+            }
+            return std::pair{width & ~1u, height & ~1u};
+        };
+        if (performanceMode == "balanced") {
+            return fill(
+                displayWidth ? displayWidth : sourceWidth,
+                displayHeight ? displayHeight : sourceHeight);
+        }
+        bool portrait = displayWidth && displayHeight
+            ? displayHeight > displayWidth : sourceHeight > sourceWidth;
+        uint32_t maximumWidth = portrait ? 1080u : 1920u;
+        uint32_t maximumHeight = portrait ? 1920u : 1080u;
+        if (displayWidth) maximumWidth = (std::min)(maximumWidth, displayWidth);
+        if (displayHeight) maximumHeight = (std::min)(maximumHeight, displayHeight);
+        return fill(maximumWidth, maximumHeight);
     }
 
     [[nodiscard]] inline bool video_variant_rate_matches(

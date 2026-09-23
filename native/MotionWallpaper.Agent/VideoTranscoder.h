@@ -5,10 +5,21 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace motion::agent
 {
+    // Generation prioritizes completion while leaving scheduling headroom.
+    // Bound filter parallelism instead of inheriting FFmpeg's all-core default.
+    [[nodiscard]] constexpr uint32_t video_transcode_worker_threads(
+        uint32_t logicalProcessors, uint32_t maximum = 12) noexcept
+    {
+        auto available = logicalProcessors > 4 ? logicalProcessors - 2
+            : logicalProcessors > 1 ? logicalProcessors - 1 : 1;
+        return available < maximum ? available : maximum;
+    }
+
     enum class VideoTranscodeControl { running, paused, cancelled };
     enum class VideoTranscodeResult { succeeded, unsupported, paused, cancelled, failed };
 
@@ -23,10 +34,11 @@ namespace motion::agent
     enum class VideoTranscodeCodec { H264, HevcMain10 };
 
     [[nodiscard]] constexpr VideoTranscodeCodec video_transcode_backend_codec(
-        VideoTranscodeBackend backend, bool sdrH264Allowed) noexcept
+        VideoTranscodeBackend, bool) noexcept
     {
-        return backend == VideoTranscodeBackend::softwareOpenH264 || sdrH264Allowed
-            ? VideoTranscodeCodec::H264 : VideoTranscodeCodec::HevcMain10;
+        // Performance copies have one presentation contract irrespective of
+        // encoder or source bit depth. Originals are retained separately.
+        return VideoTranscodeCodec::H264;
     }
 
     struct VideoTranscodeAdapter
@@ -37,6 +49,7 @@ namespace motion::agent
         int32_t luidHigh{};
         uint32_t luidLow{};
         bool identityKnown{};
+        uint64_t driverVersion{};
     };
 
     struct VideoTranscodeCandidate
@@ -84,6 +97,12 @@ namespace motion::agent
 
     [[nodiscard]] std::wstring video_transcode_backend_name(VideoTranscodeBackend backend);
 
+    [[nodiscard]] inline bool video_transcode_driver_incompatible(std::string_view message) noexcept
+    {
+        return message.find("Driver does not support the required nvenc API version") != std::string_view::npos ||
+            message.find("The minimum required Nvidia driver for nvenc") != std::string_view::npos;
+    }
+
     // Selects a quality-oriented rate first, then constrains it to the same
     // source-relative file-growth budget used when accepting the completed
     // output. A zero size or duration keeps the normal quality target.
@@ -111,11 +130,17 @@ namespace motion::agent
         VideoTranscodeProgressCallback const& progress = {},
         VideoTranscodeCandidateValidator const& validateCandidate = {},
         VideoTranscodeCodec* selectedCodec = nullptr,
-        VideoTranscodePathAccess const& pathAccess = {});
+        VideoTranscodePathAccess const& pathAccess = {},
+        std::function<void(std::wstring const&)> const& diagnostic = {},
+        VideoTranscodeCandidateValidator const& validatePreview = {});
 
-    // Media Foundation must already be started on the calling process. The
-    // probe succeeds only after a real uncompressed first video sample has
-    // been produced by an installed decoder.
+    // Run by Agent/Tests --probe-video-first-frame before ordinary startup.
+    // It is isolated because an installed decoder can hang inside ReadSample.
+    [[nodiscard]] int run_video_first_frame_probe(std::filesystem::path const& candidate) noexcept;
+
+    // Bounded subprocess; succeeds only after the actual Windows decoder has
+    // produced an uncompressed sample. FFmpeg decoding is not a substitute.
     [[nodiscard]] bool video_candidate_decodes_first_frame(
-        std::filesystem::path const& candidate) noexcept;
+        std::filesystem::path const& candidate,
+        std::function<bool()> const& cancelled = {}) noexcept;
 }

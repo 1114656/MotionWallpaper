@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../MotionWallpaper.Common/Common.h"
+#include "VideoGpuProbe.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -30,6 +31,7 @@ namespace motion::agent
         // True only while the required copy is eligible and actually queued
         // or running in this optimizer instance.
         bool performanceCopyPending{};
+        bool gpuProbePending{};
     };
 
     class VideoOptimizer
@@ -57,10 +59,18 @@ namespace motion::agent
             bool allowGenerationRequest = true);
         [[nodiscard]] VideoPlaybackLease AcquirePlaybackLease(
             std::filesystem::path const& path);
+        // Nonblocking: returns a cached sRGB PNG (up to 4K), or queues one
+        // source frame and returns empty while the small gallery poster shows.
+        [[nodiscard]] ResolvedVideoPath ResolveStillPreview(
+            std::filesystem::path const& source);
         void Prepare(std::filesystem::path const& source, std::string const& performanceMode,
             uint32_t targetWidth = 0, uint32_t targetHeight = 0,
             uint32_t targetRefreshRate = 0);
         [[nodiscard]] std::wstring SourceHardwareDecodeAdapter(
+            std::filesystem::path const& source,
+            std::wstring const& preferredAdapter = {},
+            uint64_t aggregateOutputPixels = 0);
+        [[nodiscard]] VideoGpuDecodeProbe SourceHardwareDecodeCandidates(
             std::filesystem::path const& source,
             std::wstring const& preferredAdapter = {},
             uint64_t aggregateOutputPixels = 0);

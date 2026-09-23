@@ -3,6 +3,8 @@
 #include "LibraryMigration.h"
 #include "resource.h"
 #include "VariantTaskView.h"
+#include "OriginalPlaybackRecovery.h"
+#include "../MotionWallpaper.Common/StartupEnvironment.h"
 
 #if __has_include("MainWindow.g.cpp")
 #include "MainWindow.g.cpp"
@@ -98,11 +100,13 @@ namespace
         if (reason == "active-playback-disabled") return L"活动时播放已关闭，保留静态画面";
         if (reason == "not-targeted") return L"当前模式不播放到这块屏幕";
         if (reason == "no-wallpaper") return L"尚未给这块屏幕分配壁纸";
-        if (reason == "performance-copy-pending") return L"正在准备节能优化版本，暂时显示所选壁纸的静态画面";
-        if (reason == "performance-copy-unavailable") return L"节能优化版本暂不可用，已保留安全播放路径";
+        if (reason == "performance-copy-pending") return L"正在准备性能副本，暂时显示所选壁纸的静态画面";
+        if (reason == "performance-copy-unavailable") return L"性能副本暂不可用，请在“存储与节能优化”中查看任务";
         if (reason == "freezing-previous-route") return L"正在保留上一张已确认画面，等待新壁纸准备完成";
         if (reason == "media-transaction") return L"媒体文件正在安全整理，暂时保留当前画面";
         if (reason == "renderer-process-failed") return L"渲染进程意外退出";
+        if (reason == "original-playback-failed") return L"原画播放失败，可生成性能副本后重试";
+        if (reason == "original-first-frame-timeout") return L"原画首帧解码超时";
         if (reason == "agent-not-running") return L"后台服务未运行，显示状态可能已过期";
         if (reason == "compatibility-fallback") return L"当前设备使用兼容播放路径";
         if (reason == "waiting-for-first-frame") return L"等待渲染器确认首帧";
@@ -111,6 +115,13 @@ namespace
         if (reason == "no-d3d11-video-support") return L"当前图形设备不支持所需视频路径";
         if (reason == "fallback-no-hardware-decoder") return L"硬件解码不可用，已切换到兼容路径";
         if (reason == "automatic-first-frame-timeout") return L"自动解码未能按时呈现首帧";
+        if (reason == "automatic-media-startup") return L"系统播放器未能启动视频解码";
+        if (reason == "builtin-ffmpeg-hardware") return L"内置解码器 · GPU 硬件解码";
+        if (reason == "builtin-ffmpeg-software") return L"内置解码器 · CPU 兼容解码";
+        if (reason == "builtin-throughput-insufficient") return L"当前设备无法实时解码此原片，建议使用平衡或节能副本";
+        if (reason == "builtin-software-budget") return L"原片超过 CPU 兼容解码上限（1080p、60 FPS），建议生成性能副本";
+        if (reason == "builtin-decode-failed") return L"内置解码器无法解码此视频，请生成性能副本或检查显卡驱动";
+        if (reason == "builtin-presentation-failed") return L"内置播放器无法转换此视频的画面格式或色彩，请生成性能副本";
         return motion::utf8_to_wide(reason);
     }
 
@@ -444,12 +455,14 @@ namespace winrt::MotionWallpaper::implementation
         settingsReloadTimer.Tick([this](auto const&, auto const&) {
             ReloadExternalSelection();
             UpdateRuntimeStatus();
+            if (currentPage == AppPage::Settings) UpdateOptimizationProgress();
             if (optimizationWorkVisible && currentPage == AppPage::Variants) RefreshVariants();
         });
         Closed([this](auto const&, auto const&) {
             bool migrationActive = activeLibraryMigrationPause ||
                 (libraryAccessGate && libraryAccessGate->MigrationInProgress());
             closing.store(true, std::memory_order_release);
+            controllerCancellation->store(true, std::memory_order_release);
             if (importCancellation) importCancellation->store(true, std::memory_order_release);
             if (libraryMigrationCancellation) libraryMigrationCancellation->store(true, std::memory_order_release);
             // Do not release the Agent pause from the UI thread while a
@@ -583,7 +596,7 @@ namespace winrt::MotionWallpaper::implementation
             ShowStatus(L"自定义媒体库当前不可访问或所有权校验失败；已停用所有媒体读写。连接原磁盘后可重试迁移位置。", true);
         }
         settingsReloadTimer.Start();
-        if (!motion::notify_settings_changed()) StartController();
+        StartController();
     }
 
     void MainWindow::SaveSettings()
@@ -697,6 +710,8 @@ namespace winrt::MotionWallpaper::implementation
             runtime.decodePath == actualDecodePath && runtime.decodeReason == actualDecodeReason &&
             runtime.agentInstanceId == runtimeState.agentInstanceId &&
             runtime.agentProcessId == runtimeState.agentProcessId &&
+            runtime.performanceMode == runtimeState.performanceMode &&
+            runtime.activeSceneId == runtimeState.activeSceneId &&
             runtime.displayStates == runtimeState.displayStates &&
             runtime.lastCommandId == runtimeState.lastCommandId &&
             runtime.lastCommandAction == runtimeState.lastCommandAction &&
@@ -1225,15 +1240,180 @@ namespace winrt::MotionWallpaper::implementation
         RestartRendererButton().IsEnabled(canRestart);
         if (states.empty()) RuntimeStatusSummary().Text(L"后台服务尚未发布显示器状态");
         else if (failed) RuntimeStatusSummary().Text(std::to_wstring(failed) + L" 块屏幕应用失败，可重试或重启渲染");
-        else if (optimizing) RuntimeStatusSummary().Text(std::to_wstring(optimizing) + L" 块屏幕正在准备节能优化版本");
+        else if (optimizing) RuntimeStatusSummary().Text(std::to_wstring(optimizing) + L" 块屏幕正在准备性能副本");
         else if (applying) RuntimeStatusSummary().Text(std::to_wstring(applying) + L" 块屏幕正在等待首帧确认");
         else if (degraded) RuntimeStatusSummary().Text(std::to_wstring(degraded) + L" 块屏幕正在使用兼容播放路径");
         else if (paused && !applied) RuntimeStatusSummary().Text(L"所有屏幕均已暂停");
         else RuntimeStatusSummary().Text(L"所有目标屏幕均已确认应用");
+        UpdateOriginalPlaybackWarnings(states);
+    }
+
+    void MainWindow::UpdateOriginalPlaybackWarnings(std::vector<motion::DisplayRuntimeState> const& states)
+    {
+        auto mode = runtimeState.performanceMode.empty() ? settings.performanceMode : runtimeState.performanceMode;
+        auto failures = motion::app::original_playback_failures(mode, states);
+        // Suppress stale controls while the Agent consumes the saved mode;
+        // a missed acknowledgement cannot hide a continuing failure forever.
+        if (std::chrono::steady_clock::now() - originalRecoveryRequestedAt < std::chrono::seconds(10)) {
+            failures.clear();
+        }
+        std::wstring fingerprint;
+        append_fingerprint(fingerprint, settings.mediaLibraryPath);
+        append_fingerprint(fingerprint, runtimeState.agentInstanceId);
+        append_fingerprint(fingerprint, runtimeState.activeSceneId);
+        append_fingerprint(fingerprint, static_cast<uint64_t>(settingsWritable && mediaLibraryAvailable));
+        for (auto const& failure : failures) {
+            append_fingerprint(fingerprint, failure.groupId);
+            append_fingerprint(fingerprint, failure.mediaId);
+            append_fingerprint(fingerprint, failure.decodeReason);
+            append_fingerprint(fingerprint, failure.errorDetail);
+        }
+        if (fingerprint == originalFailureFingerprint) return;
+        OriginalPlaybackWarnings().Children().Clear();
+        OriginalPlaybackWarnings().Visibility(Visibility::Collapsed);
+        if (failures.empty()) { originalFailureFingerprint = std::move(fingerprint); return; }
+        auto access = TryAcquireLibraryWrite(false);
+        if (!access) return;
+        try {
+            for (auto const& failure : failures) {
+                auto items = mediaLibrary->LoadMedia(failure.groupId);
+                auto found = std::find_if(items.begin(), items.end(), [&](auto const& media) {
+                    return media.id == failure.mediaId && media.kind == "video";
+                });
+                if (found == items.end()) continue;
+                auto media = *found;
+                bool available = mediaLibrary->SourceAvailable(media);
+                auto title = media.name.empty() ? media.originalName : media.name;
+                if (title.empty()) title = L"所选视频";
+                Border card;
+                card.Padding(ThicknessHelper::FromUniformLength(14));
+                card.CornerRadius(CornerRadiusHelper::FromUniformRadius(9));
+                card.Background(Microsoft::UI::Xaml::Media::SolidColorBrush{
+                    Windows::UI::ColorHelper::FromArgb(255, 255, 247, 230) });
+                StackPanel content;
+                content.Spacing(9);
+                TextBlock heading;
+                heading.Text(L"“" + title + L"”原画播放失败");
+                heading.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+                heading.TextWrapping(TextWrapping::Wrap);
+                content.Children().Append(heading);
+                TextBlock explanation;
+                explanation.Text(available
+                    ? L"建议生成平衡或节能性能副本后播放，原视频会保留。选择后将切换所有屏幕的性能模式，副本通过检查后自动应用。"
+                    : L"当前找不到原视频，暂时无法生成性能副本。请先检查文件或媒体库位置。");
+                auto scene = motion::find_scene_profile(settings, runtimeState.activeSceneId);
+                if (available && scene && scene->activation.enabled && scene->activation.trigger != "manual") {
+                    explanation.Text(std::wstring(explanation.Text()) + L" 当前自动场景“" + scene->name +
+                        L"”的性能模式也会同步更新。");
+                }
+                explanation.TextWrapping(TextWrapping::Wrap);
+                explanation.FontSize(13);
+                content.Children().Append(explanation);
+                StackPanel actions;
+                actions.Orientation(Orientation::Horizontal);
+                actions.Spacing(8);
+                for (auto const& recoveryMode : { std::string("balanced"), std::string("power-saver") }) {
+                    Button generate;
+                    generate.Content(box_value(recoveryMode == "balanced" ? L"生成平衡副本" : L"生成节能副本"));
+                    generate.IsEnabled(available);
+                    generate.Click([weak = get_weak(), media, recoveryMode](auto const&, auto const&) {
+                        if (auto self = weak.get()) self->RecoverOriginalPlayback(media, recoveryMode);
+                    });
+                    actions.Children().Append(generate);
+                }
+                Button details;
+                details.Content(box_value(L"查看错误详情"));
+                details.Click([weak = get_weak(), media, failure](auto const&, auto const&) {
+                    if (auto self = weak.get()) self->ShowOriginalPlaybackDetails(media, failure);
+                });
+                actions.Children().Append(details);
+                content.Children().Append(actions);
+                card.Child(content);
+                OriginalPlaybackWarnings().Children().Append(card);
+            }
+            OriginalPlaybackWarnings().Visibility(OriginalPlaybackWarnings().Children().Size()
+                ? Visibility::Visible : Visibility::Collapsed);
+            originalFailureFingerprint = std::move(fingerprint);
+        } catch (...) {
+            // An unavailable/remounted library is retried on the next refresh;
+            // it must never create a new modal error every second.
+        }
+    }
+
+    void MainWindow::RecoverOriginalPlayback(motion::MediaMetadata const& media, std::string const& mode)
+    {
+        if (mode != "balanced" && mode != "power-saver") return;
+        if (std::chrono::steady_clock::now() - originalRecoveryRequestedAt < std::chrono::seconds(10)) return;
+        auto currentMode = runtimeState.performanceMode.empty() ? settings.performanceMode : runtimeState.performanceMode;
+        auto failures = motion::app::original_playback_failures(currentMode, runtimeState.displayStates);
+        if (std::none_of(failures.begin(), failures.end(), [&](auto const& failure) {
+                return failure.groupId == media.groupId && failure.mediaId == media.id;
+            })) { UpdateRuntimeStatus(); return; }
+        auto access = TryAcquireLibraryWrite();
+        if (!access) return;
+        try {
+            if (!mediaLibrary->SourceAvailable(media) || !mediaLibrary->RequestOptimization(media, mode)) {
+                ShowStatus(L"无法创建性能副本任务，请确认原视频存在且媒体库可写。", true);
+                return;
+            }
+            auto previous = settings;
+            motion::app::set_original_recovery_mode(settings, mode, runtimeState.activeSceneId);
+            settingsSaveTimer.Stop();
+            if (!TrySaveSettings()) {
+                settings = std::move(previous);
+                motion::notify_settings_changed();
+                ShowStatus(L"已创建副本任务，但无法切换播放模式。完成后请手动选择对应性能模式。", true);
+                return;
+            }
+            auto wasInitializing = initializing;
+            initializing = true;
+            try { select_tag(PerformanceMode(), motion::utf8_to_wide(mode)); }
+            catch (...) { initializing = wasInitializing; throw; }
+            initializing = wasInitializing;
+            originalRecoveryRequestedAt = std::chrono::steady_clock::now();
+            motion::notify_settings_changed();
+            originalFailureFingerprint.clear();
+            optimizationWorkVisible = true;
+            UpdateStatusSummary();
+            ShowStatus(L"已开始准备性能副本，通过播放检查后会自动应用；原视频保留。");
+        } catch (...) {
+            ShowStatus(L"无法准备性能副本，请检查原视频和媒体库是否可用。", true);
+        }
+    }
+
+    winrt::fire_and_forget MainWindow::ShowOriginalPlaybackDetails(
+        motion::MediaMetadata media, motion::DisplayRuntimeState state)
+    {
+        if (originalErrorDialogOpen) co_return;
+        auto lifetime = get_strong();
+        originalErrorDialogOpen = true;
+        try {
+            auto reason = state.decodeReason.empty() ? state.reason : state.decodeReason;
+            auto fileName = media.originalName.empty() ? media.name : media.originalName;
+            auto message = L"视频：" + fileName + L"\n显示器：" + state.displayName +
+                L"\n原因：" + runtime_reason_label(reason) + L"\n诊断代码：" + motion::utf8_to_wide(reason) +
+                L"\n\n暂时无法从该错误确定是视频格式、系统解码组件还是驱动问题。可以生成平衡或节能副本后重试。\n日志位置：" +
+                (root / L"Config" / L"agent.log").wstring();
+            if (!state.errorDetail.empty()) {
+                message += L"\n\n底层错误详情：\n" + motion::utf8_to_wide(state.errorDetail);
+            }
+            TextBlock detail;
+            detail.Text(message);
+            detail.TextWrapping(TextWrapping::Wrap);
+            detail.IsTextSelectionEnabled(true);
+            ContentDialog dialog;
+            dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
+            dialog.Title(box_value(L"原画播放错误"));
+            dialog.Content(detail);
+            dialog.CloseButtonText(L"关闭");
+            co_await dialog.ShowAsync();
+        } catch (...) { ShowStatus(L"暂时无法显示错误详情。", true); }
+        originalErrorDialogOpen = false;
     }
 
     void MainWindow::UpdateStatusSummary()
     {
+        optimizationSummaryMedia.reset();
         UpdateRuntimeStatus();
         auto writeLease = TryAcquireLibraryWrite(false);
         if (!writeLease) return;
@@ -1246,6 +1426,7 @@ namespace winrt::MotionWallpaper::implementation
         CurrentWallpaperThumb4().Source(nullptr);
         CurrentWallpaperOverflowOverlay().Visibility(Visibility::Collapsed);
         bool currentIsVideo = false;
+        std::optional<motion::MediaMetadata> currentVideo;
         auto summaryGroupId = appliedGroupId;
         auto summaryMediaId = appliedMediaId;
         if (!selectedDisplayId.empty()) {
@@ -1311,6 +1492,7 @@ namespace winrt::MotionWallpaper::implementation
             auto selected = std::find_if(media.begin(), media.end(), [&](auto const& item) { return item.id == summaryMediaId; });
             if (selected != media.end()) {
                 currentIsVideo = selected->kind == "video";
+                if (currentIsVideo) currentVideo = *selected;
                 CurrentWallpaperName().Text(selected->name);
                 bool sourceAvailable = mediaLibrary->SourceAvailable(*selected);
                 CurrentWallpaperDetails().Text(selected->kind == "image"
@@ -1359,9 +1541,19 @@ namespace winrt::MotionWallpaper::implementation
         if (selectionPending && visibleState.empty()) visibleState = "applying";
         if (!settings.desktopPlayback) visibleState = "paused";
         else if (visibleState.empty()) visibleState = settings.activePlaybackEnabled ? "applied" : "paused";
-        PlaybackStatusText().Text(runtime_state_label(visibleState));
+        auto playbackLabel = runtime_state_label(visibleState);
+        if (visibleState == "optimizing" && currentVideo) {
+            optimizationSummaryMedia = currentVideo;
+            auto progress = mediaLibrary->VariantStatus(*currentVideo);
+            if (progress.generating && progress.progressKnown) {
+                playbackLabel += L" · " + std::to_wstring(progress.progressPercent) + L"%";
+            }
+        }
+        PlaybackStatusText().Text(playbackLabel);
         std::wstring decodeStatus;
-        if (actualDecodePath == "automatic") decodeStatus = L"自动解码 · 已启用 DXGI/DXVA 路径";
+        if (actualDecodeReason == "builtin-ffmpeg-hardware") decodeStatus = L"内置解码器 · GPU 硬件解码";
+        else if (actualDecodeReason == "builtin-ffmpeg-software") decodeStatus = L"内置解码器 · CPU 兼容解码";
+        else if (actualDecodePath == "automatic") decodeStatus = L"自动解码 · 已启用 DXGI/DXVA 路径";
         else if (actualDecodePath == "hardware") decodeStatus = L"硬件解码 · 已请求 DXGI/DXVA 路径";
         else if (actualDecodePath == "software-fallback") decodeStatus =
             actualDecodeReason == "no-physical-d3d11-adapter"
@@ -1382,6 +1574,19 @@ namespace winrt::MotionWallpaper::implementation
         DecodeStatusText().Visibility(currentIsVideo || actualDecodePath == "unavailable"
             ? Visibility::Visible : Visibility::Collapsed);
         UpdatePerformanceModeAvailability();
+    }
+
+    void MainWindow::UpdateOptimizationProgress()
+    {
+        if (!optimizationSummaryMedia) return;
+        auto writeLease = TryAcquireLibraryWrite(false);
+        if (!writeLease) return;
+        auto progress = mediaLibrary->VariantStatus(*optimizationSummaryMedia);
+        auto label = runtime_state_label("optimizing");
+        if (progress.generating && progress.progressKnown) {
+            label += L" · " + std::to_wstring(progress.progressPercent) + L"%";
+        }
+        PlaybackStatusText().Text(label);
     }
 
     void MainWindow::UpdatePerformanceModeAvailability()
@@ -2759,6 +2964,9 @@ namespace winrt::MotionWallpaper::implementation
                         reason == "video frame rate exceeds 240 FPS import limit") {
                         errorMessage = L"视频超过 240 FPS 上限，未导入。";
                     } else if (kind == "video" &&
+                        reason == "video metadata probe failed") {
+                        errorMessage = L"视频信息读取失败或超时。请确认文件完整，以及程序中的视频工具可用。";
+                    } else if (kind == "video" &&
                         reason == "video frame rate is invalid") {
                         errorMessage = L"无法读取有效的视频帧率，未导入。";
                     } else {
@@ -3122,10 +3330,10 @@ namespace winrt::MotionWallpaper::implementation
             motion::notify_settings_changed();
             RefreshVariants();
             ShowStatus(paused
-                ? L"优化任务已暂停；继续时会从头安全生成。"
-                : L"优化任务已继续。");
+                ? L"已停止本次生成；下次会从头开始，原文件保留。"
+                : L"已重新开始生成完整副本。");
         } catch (...) {
-            ShowStatus(paused ? L"暂停优化任务失败。" : L"继续优化任务失败。", true);
+            ShowStatus(paused ? L"停止生成失败。" : L"重新生成失败。", true);
         }
     }
 
@@ -4317,18 +4525,69 @@ namespace winrt::MotionWallpaper::implementation
         });
     }
 
-    void MainWindow::StartController()
+    winrt::fire_and_forget MainWindow::StartController()
     {
-        auto executable = applicationRoot / L"motionwallpaper-agent.exe";
-        if (!fs::exists(executable)) return;
-        std::wstring command = L"\"" + executable.wstring() + L"\"";
-        STARTUPINFOW startup{ sizeof(startup) };
-        PROCESS_INFORMATION process{};
-        if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
-            nullptr, applicationRoot.c_str(), &startup, &process)) {
-            motion::unique_handle thread(process.hThread);
-            motion::unique_handle handle(process.hProcess);
+        if (controllerStarting || closing.load(std::memory_order_acquire)) co_return;
+        controllerStarting = true;
+        auto lifetime = get_strong();
+        auto dispatcher = Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+        auto directory = applicationRoot;
+        auto dataRoot = root;
+        auto cancellation = controllerCancellation;
+        co_await winrt::resume_background();
+        motion::startup::AgentStartResult outcome;
+        try {
+            auto environment = motion::startup::check_environment();
+            if (!environment) {
+                outcome.message = std::move(environment.error);
+            } else {
+                auto writeError = motion::startup::check_data_directory(dataRoot);
+                if (!writeError.empty()) {
+                    outcome.message = std::move(writeError);
+                } else {
+                    HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                    struct ApartmentRelease {
+                        bool initialized{};
+                        ~ApartmentRelease() { if (initialized) CoUninitialize(); }
+                    } apartment{ SUCCEEDED(initialized) };
+                    auto runtimePath = dataRoot / L"Config" / L"runtime.json";
+                    outcome = motion::startup::start_or_connect_agent(directory, runtimePath,
+                        [&](DWORD processId) {
+                            motion::RuntimeState current;
+                            return motion::try_load_runtime(runtimePath, current) &&
+                                current.agentProcessId == processId && !current.agentInstanceId.empty();
+                        }, [&] { return cancellation->load(std::memory_order_acquire); });
+                }
+            }
+        } catch (std::exception const& error) {
+            outcome.message = L"后台服务启动检查失败：" + motion::utf8_to_wide(error.what());
+        } catch (...) {
+            outcome.message = L"后台服务启动检查发生异常，服务尚未确认就绪。";
         }
+        if (!outcome.ready && !outcome.cancelled && !outcome.message.empty()) {
+            try {
+                std::ofstream log(dataRoot / L"Config" / L"app-startup.log", std::ios::binary | std::ios::app);
+                SYSTEMTIME now{};
+                GetLocalTime(&now);
+                log << now.wYear << '-' << now.wMonth << '-' << now.wDay << ' '
+                    << now.wHour << ':' << now.wMinute << ':' << now.wSecond << "\n"
+                    << motion::wide_to_utf8(outcome.message) << "\n\n";
+            } catch (...) {}
+        }
+        dispatcher.TryEnqueue([lifetime, outcome = std::move(outcome)] {
+            lifetime->controllerStarting = false;
+            if (outcome.cancelled || lifetime->closing.load(std::memory_order_acquire)) return;
+            if (!outcome.ready) {
+                lifetime->ShowStatus(outcome.message, true, true);
+                return;
+            }
+            // Only notify after the matching installation's live Agent has
+            // published its own identity. A pre-existing named event is not a
+            // readiness or installation-identity handshake.
+            motion::notify_settings_changed();
+            lifetime->runtimeWriteTime = {};
+            lifetime->UpdateRuntimeStatus();
+        });
     }
 
     void MainWindow::ShowStatus(

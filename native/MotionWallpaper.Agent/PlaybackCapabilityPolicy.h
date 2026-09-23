@@ -45,6 +45,23 @@ namespace motion::agent
             reason == "no-d3d11-video-device";
     }
 
+    struct AutomaticDecodeFailureAction
+    {
+        bool rejectAdapter{};
+        bool tryAlternative{};
+    };
+
+    [[nodiscard]] constexpr AutomaticDecodeFailureAction automatic_decode_failure_action(
+        std::string_view decodeMode, std::string_view path, std::string_view reason,
+        bool hasProbedAdapter, bool rendererFailed, bool firstFrameSeen,
+        bool hasAlternativeAdapter) noexcept
+    {
+        bool reject = automatic_decode_failure_requires_cpu_smooth(
+            decodeMode, path, reason, hasProbedAdapter) ||
+            (decodeMode == "auto" && hasProbedAdapter && rendererFailed && !firstFrameSeen);
+        return { reject, reject && hasAlternativeAdapter };
+    }
+
     [[nodiscard]] constexpr SoftwarePlaybackProfile software_playback_profile(
         bool enabled,
         uint32_t logicalProcessors,

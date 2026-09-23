@@ -82,6 +82,7 @@ namespace winrt::MotionWallpaper::implementation
             std::make_shared<std::atomic_bool>() };
         motion::Settings settings;
         motion::RuntimeState runtimeState;
+        std::optional<motion::MediaMetadata> optimizationSummaryMedia;
         std::string appliedGroupId;
         std::string appliedMediaId;
         std::string actualDecodePath;
@@ -105,6 +106,8 @@ namespace winrt::MotionWallpaper::implementation
         std::shared_ptr<std::atomic_bool> importCancellation{ std::make_shared<std::atomic_bool>() };
         std::atomic_bool coversRefreshing{};
         std::atomic_bool closing{};
+        std::shared_ptr<std::atomic_bool> controllerCancellation{ std::make_shared<std::atomic_bool>() };
+        bool controllerStarting{};
         bool initializing{ true };
         bool reorderingGroups{};
         bool optimizationWorkVisible{};
@@ -118,6 +121,9 @@ namespace winrt::MotionWallpaper::implementation
         std::unordered_map<std::string, std::wstring> mediaGroupNames;
         std::unordered_map<std::string, motion::app::VariantTaskCard> variantTaskCards;
         std::wstring variantViewFingerprint;
+        std::wstring originalFailureFingerprint;
+        bool originalErrorDialogOpen{};
+        std::chrono::steady_clock::time_point originalRecoveryRequestedAt{};
         std::string draggedGroupId;
 
         void SaveSettings();
@@ -134,7 +140,12 @@ namespace winrt::MotionWallpaper::implementation
         void UpdateMediaActionState();
         void UpdatePerformanceModeAvailability();
         void UpdateStatusSummary();
+        void UpdateOptimizationProgress();
         void UpdateRuntimeStatus();
+        void UpdateOriginalPlaybackWarnings(std::vector<motion::DisplayRuntimeState> const& states);
+        void RecoverOriginalPlayback(motion::MediaMetadata const& media, std::string const& mode);
+        winrt::fire_and_forget ShowOriginalPlaybackDetails(
+            motion::MediaMetadata media, motion::DisplayRuntimeState state);
         void SendRuntimeControl(std::string const& action, std::string const& displayId);
         void LoadDisplayTargets();
         void LoadScenes();
@@ -176,7 +187,7 @@ namespace winrt::MotionWallpaper::implementation
             std::shared_ptr<std::atomic_bool> cancellation);
         std::shared_ptr<motion::app::LibraryWriteLease> TryAcquireLibraryWrite(bool showError = true);
         void SetLibraryMigrationUi(bool migrating);
-        void StartController();
+        winrt::fire_and_forget StartController();
         void ShowStatus(std::wstring const& message, bool error = false,
             bool persistent = false);
         std::string ActiveGroupId();

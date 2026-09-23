@@ -2,9 +2,6 @@
 #include <shellapi.h>
 #include <bcrypt.h>
 #include <d3d11.h>
-#include <mfapi.h>
-#include <mfidl.h>
-#include <mfreadwrite.h>
 #include <wincodec.h>
 
 #include <winrt/base.h>
@@ -27,6 +24,7 @@
 #include <vector>
 #include "MediaLibrary.h"
 #include "ThumbnailGenerator.h"
+#include "../MotionWallpaper.Common/MediaProbe.h"
 
 namespace fs = std::filesystem;
 
@@ -408,34 +406,19 @@ namespace
         }
     }
 
-    void validate_video(fs::path const& source)
+    void validate_video(fs::path const& source, std::atomic_bool const* cancelled)
     {
-        winrt::check_hresult(MFStartup(MF_VERSION, MFSTARTUP_FULL));
-        try {
-            winrt::com_ptr<IMFSourceReader> reader;
-            winrt::check_hresult(MFCreateSourceReaderFromURL(source.c_str(), nullptr, reader.put()));
-            winrt::com_ptr<IMFMediaType> mediaType;
-            winrt::check_hresult(reader->GetNativeMediaType(
-                static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, mediaType.put()));
-            UINT32 width{}, height{};
-            winrt::check_hresult(MFGetAttributeSize(mediaType.get(), MF_MT_FRAME_SIZE, &width, &height));
-            if (!motion::app::video_import_dimensions_allowed(width, height)) {
-                throw std::runtime_error("video resolution exceeds 8K import limit");
-            }
-            UINT32 frameRateNumerator{}, frameRateDenominator{};
-            winrt::check_hresult(MFGetAttributeRatio(mediaType.get(), MF_MT_FRAME_RATE,
-                &frameRateNumerator, &frameRateDenominator));
-            if (!frameRateNumerator || !frameRateDenominator) {
-                throw std::runtime_error("video frame rate is invalid");
-            }
-            if (!motion::app::video_import_frame_rate_allowed(
-                    frameRateNumerator, frameRateDenominator)) {
-                throw std::runtime_error("video frame rate exceeds 240 FPS import limit");
-            }
-            MFShutdown();
-        } catch (...) {
-            MFShutdown();
-            throw;
+        auto isCancelled = [&] { return cancelled && cancelled->load(std::memory_order_acquire); };
+        auto ffmpeg = motion::executable_directory() / L"Tools" / L"ffmpeg" / L"ffmpeg.exe";
+        auto metadata = motion::probe_video(ffmpeg, source, 10'000, isCancelled);
+        if (isCancelled()) throw std::runtime_error("import cancelled");
+        if (!metadata) throw std::runtime_error("video metadata probe failed");
+        if (!motion::app::video_import_dimensions_allowed(metadata->width, metadata->height)) {
+            throw std::runtime_error("video resolution exceeds 8K import limit");
+        }
+        if (!motion::app::video_import_frame_rate_allowed(
+                metadata->frameRateNumerator, metadata->frameRateDenominator)) {
+            throw std::runtime_error("video frame rate exceeds 240 FPS import limit");
         }
     }
 
@@ -812,7 +795,7 @@ namespace motion::app
             throw std::runtime_error("import source is not a readable file");
         }
         if (kind == "image") validate_image(source);
-        else validate_video(source);
+        else validate_video(source, cancelled);
 
         // Source validation can invoke external codecs. Never resolve or
         // create a destination after that slow operation unless the external
