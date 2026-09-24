@@ -3200,6 +3200,8 @@ namespace winrt::MotionWallpaper::implementation
 
     winrt::fire_and_forget MainWindow::ImportFiles(std::string kind, std::wstring title, std::wstring pattern)
     {
+        auto lifetime = get_strong();
+        if (closing.load(std::memory_order_acquire) || importing.load(std::memory_order_acquire)) co_return;
         auto weak = get_weak();
         auto dispatcher = DispatcherQueue();
         try {
@@ -3208,6 +3210,63 @@ namespace winrt::MotionWallpaper::implementation
             check_hresult(native->get_WindowHandle(&window));
             auto files = select_files(window, title.c_str(), pattern.c_str());
             if (files.empty()) co_return;
+            std::vector<std::wstring> displayNames;
+            {
+                StackPanel content;
+                content.Spacing(16);
+                content.MinWidth(380);
+                TextBlock description;
+                description.Text(L"为壁纸起个容易识别的名字。留空使用文件名，原文件不会重命名。");
+                description.TextWrapping(TextWrapping::Wrap);
+                content.Children().Append(description);
+                StackPanel fields;
+                fields.Spacing(16);
+                std::vector<TextBox> inputs;
+                for (auto const& path : files) {
+                    StackPanel field;
+                    field.Spacing(4);
+                    TextBlock sourceName;
+                    sourceName.Text(L"文件：" + path.filename().wstring());
+                    sourceName.FontSize(12);
+                    sourceName.Opacity(0.7);
+                    sourceName.TextTrimming(TextTrimming::CharacterEllipsis);
+                    ToolTipService::SetToolTip(sourceName, box_value(path.filename().wstring()));
+                    TextBox input;
+                    input.Header(box_value(L"壁纸名称"));
+                    input.MaxLength(100);
+                    input.Text(path.stem().wstring().substr(0, 100));
+                    input.PlaceholderText(L"留空使用文件名");
+                    input.SelectAll();
+                    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(
+                        input, L"壁纸名称：" + path.filename().wstring());
+                    field.Children().Append(sourceName);
+                    field.Children().Append(input);
+                    fields.Children().Append(field);
+                    inputs.push_back(input);
+                }
+                ScrollViewer scroll;
+                scroll.MaxHeight(400);
+                scroll.HorizontalScrollBarVisibility(ScrollBarVisibility::Disabled);
+                scroll.HorizontalContentAlignment(HorizontalAlignment::Stretch);
+                scroll.Content(fields);
+                content.Children().Append(scroll);
+                TextBlock duplicateHint;
+                duplicateHint.Text(L"重复文件会保留库中已有名称，之后可通过“重命名”修改。");
+                duplicateHint.FontSize(12);
+                duplicateHint.Opacity(0.7);
+                duplicateHint.TextWrapping(TextWrapping::Wrap);
+                content.Children().Append(duplicateHint);
+                ContentDialog dialog;
+                dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
+                dialog.Title(box_value(kind == "video" ? L"导入视频" : L"导入图片"));
+                dialog.Content(content);
+                dialog.PrimaryButtonText(L"开始导入");
+                dialog.CloseButtonText(L"取消");
+                dialog.DefaultButton(ContentDialogButton::Primary);
+                auto result = co_await dialog.ShowAsync();
+                if (closing.load(std::memory_order_acquire) || result != ContentDialogResult::Primary) co_return;
+                for (auto const& input : inputs) displayNames.emplace_back(input.Text().c_str());
+            }
             auto writeLease = TryAcquireLibraryWrite();
             if (!writeLease || importing.exchange(true)) co_return;
             auto library = mediaLibrary;
@@ -3254,7 +3313,7 @@ namespace winrt::MotionWallpaper::implementation
                                 self->ImportPercentText().Text(to_hstring(percent) + L"%");
                             }
                         });
-                    }, cancellation.get());
+                    }, cancellation.get(), displayNames[completedFiles]);
                     auto importedMedia = library->LoadMedia(groupId);
                     auto imported = std::find_if(importedMedia.begin(), importedMedia.end(), [&](auto const& media) {
                         return media.id == lastId;

@@ -109,7 +109,8 @@ namespace motion::app
         void DeleteGroup(motion::GroupMetadata const& group);
         using ImportProgress = std::function<void(uint64_t copiedBytes, uint64_t totalBytes)>;
         std::string Import(std::filesystem::path const& source, std::string const& kind, std::string const& groupId,
-            ImportProgress const& progress = {}, std::atomic_bool const* cancelled = nullptr);
+            ImportProgress const& progress = {}, std::atomic_bool const* cancelled = nullptr,
+            std::wstring const& displayName = {});
         void Rename(motion::MediaMetadata const& media, std::wstring const& name);
         void SetFavorite(motion::MediaMetadata const& media, bool favorite);
         void SetFavorite(std::vector<motion::MediaMetadata> const& media, bool favorite);

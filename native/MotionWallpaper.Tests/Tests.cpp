@@ -56,6 +56,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -4080,9 +4081,32 @@ namespace
             phase = "import";
             auto source = root / L"sample.png";
             write_test_bitmap(source);
-            auto mediaId = library.Import(source, "image", first.id);
+            auto readBytes = [](fs::path const& path) {
+                std::ifstream input(path, std::ios::binary);
+                return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+            };
+            auto sourceBytes = readBytes(source);
+            auto mediaId = library.Import(source, "image", first.id, {}, nullptr, L"  清晨海景 / 4K  ");
             auto imported = library.LoadMedia(first.id);
             require(imported.size() == 1 && imported.front().id == mediaId, "media import did not round-trip");
+            require(imported.front().name == L"清晨海景 / 4K" &&
+                imported.front().originalName == L"sample.png" && imported.front().fileName == L"source.png" &&
+                fs::is_regular_file(source) &&
+                readBytes(source) == sourceBytes &&
+                readBytes(library.MediaDirectory(imported.front()) / L"source.png") == sourceBytes,
+                "a custom import name was not persisted or changed the source name/content");
+            auto originalRevision = imported.front().revision;
+            require(library.Import(source, "image", first.id, {}, nullptr, L"另一个名字") == mediaId,
+                "custom names bypassed content deduplication");
+            imported = library.LoadMedia(first.id);
+            require(imported.size() == 1 && imported.front().name == L"清晨海景 / 4K" &&
+                imported.front().revision == originalRevision,
+                "duplicate import replaced the existing display name or metadata revision");
+            auto defaultNameId = library.Import(source, "image", second.id, {}, nullptr, L" \t ");
+            auto defaultNamed = library.LoadMedia(second.id);
+            require(defaultNamed.size() == 1 && defaultNamed.front().id == defaultNameId &&
+                defaultNamed.front().name == L"sample", "blank import names did not fall back to the file stem");
+            library.Delete(defaultNamed.front());
             require(imported.front().coverFileName.empty(),
                 "an image import exposed the full-resolution source as a UI thumbnail");
             phase = "lightweight image cover";

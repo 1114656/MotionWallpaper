@@ -779,7 +779,7 @@ namespace motion::app
     }
 
     std::string MediaLibrary::Import(fs::path const& source, std::string const& kind, std::string const& groupId,
-        ImportProgress const& progress, std::atomic_bool const* cancelled)
+        ImportProgress const& progress, std::atomic_bool const* cancelled, std::wstring const& displayName)
     {
         RequireTrustedLibrary();
         auto extension = source.extension().wstring();
@@ -831,7 +831,10 @@ namespace motion::app
             motion::MediaMetadata media;
             media.id = mediaId;
             media.groupId = groupId;
-            media.name = source.stem().wstring();
+            // A display name belongs only to metadata. Duplicate imports above
+            // keep the existing record, and source names/paths remain unchanged.
+            media.name = trim(displayName);
+            if (media.name.empty()) media.name = source.stem().wstring();
             media.kind = kind;
             media.originalName = source.filename().wstring();
             media.fileName = fileName;
