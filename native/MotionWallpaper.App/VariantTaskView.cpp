@@ -19,7 +19,8 @@ namespace
 
     std::wstring task_context(motion::app::VariantMediaSummary const& item)
     {
-        return item.media.name + L"，" + variant_mode_label(item.status.requestedMode) + L"优化版本";
+        return item.media.name + L"，" + variant_mode_label(item.status.failed
+            ? item.status.failedMode : item.status.requestedMode) + L"优化版本";
     }
 
     std::wstring eta_label(uint64_t seconds)
@@ -42,11 +43,13 @@ namespace motion::app
         bool taskWaitingForPower = item.status.waitingForPower ||
             (waitingForPower && !item.status.generating);
         std::wstring stateLabel;
-        if (item.status.paused) stateLabel = L"已停止 · 再次生成会从头开始";
+        if (item.status.failed) stateLabel = L"生成失败 · " + (item.status.failedReason.empty()
+            ? std::wstring(L"原文件已保留，可重试") : motion::utf8_to_wide(item.status.failedReason));
+        else if (item.status.paused) stateLabel = L"已停止 · 再次生成会从头开始";
         else if (item.status.generating) stateLabel = L"正在优化";
         else if (taskWaitingForPower) stateLabel = L"等待接通电源";
         else stateLabel = L"等待优化";
-        if (item.status.progressKnown && !item.status.paused) {
+        if (item.status.progressKnown && !item.status.paused && !item.status.failed) {
             stateLabel += L" · " + std::to_wstring(item.status.progressPercent) + L"%";
         }
         if (item.status.generating && item.status.estimatedRemainingKnown) {
@@ -57,25 +60,30 @@ namespace motion::app
         if (card.root) {
             Automation::AutomationProperties::SetName(card.root, hstring(context + L"任务"));
         }
-        if (card.stateText) card.stateText.Text(stateLabel);
+        if (card.stateText) {
+            card.stateText.Text(stateLabel);
+            card.stateText.TextTrimming(TextTrimming::CharacterEllipsis);
+            ToolTipService::SetToolTip(card.stateText, box_value(stateLabel));
+        }
         if (card.progress) {
             card.progress.Value(item.status.progressKnown ? item.status.progressPercent : 0);
             // FFmpeg reports a real media-time percentage once probing succeeds.
             // Queued jobs without a known duration remain honestly indeterminate;
             // paused/power-waiting jobs keep a stable bar instead of suggesting work.
             card.progress.IsIndeterminate(!item.status.progressKnown &&
-                !item.status.paused && !taskWaitingForPower);
+                !item.status.paused && !item.status.failed && !taskWaitingForPower);
             Automation::AutomationProperties::SetName(
                 card.progress, hstring(context + L"，" + stateLabel));
         }
         if (card.pause) {
-            auto actionLabel = item.status.paused ? std::wstring(L"重新生成") : std::wstring(L"停止");
+            auto actionLabel = item.status.failed ? std::wstring(L"重试")
+                : item.status.paused ? std::wstring(L"重新生成") : std::wstring(L"停止");
             card.pause.Content(box_value(actionLabel));
-            ToolTipService::SetToolTip(card.pause, box_value(item.status.paused
+            ToolTipService::SetToolTip(card.pause, box_value(item.status.paused || item.status.failed
                 ? L"从头生成完整副本" : L"停止本次生成；下次会从头开始，原文件保留"));
             // The click handler reads this current value rather than capturing
             // the state that existed when the card was first constructed.
-            card.pause.Tag(box_value(item.status.paused));
+            card.pause.Tag(box_value(item.status.paused || item.status.failed));
             Automation::AutomationProperties::SetName(
                 card.pause, hstring(context + L"，" + actionLabel + L"优化"));
         }
@@ -143,7 +151,7 @@ namespace motion::app
         layout.Children().Append(identity);
 
         TextBlock mode;
-        mode.Text(variant_mode_label(item.status.requestedMode));
+        mode.Text(variant_mode_label(item.status.failed ? item.status.failedMode : item.status.requestedMode));
         mode.VerticalAlignment(VerticalAlignment::Center);
         Grid::SetColumn(mode, 2);
         layout.Children().Append(mode);

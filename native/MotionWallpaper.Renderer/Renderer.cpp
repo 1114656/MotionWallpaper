@@ -88,6 +88,8 @@ namespace
     bool automaticDecodeStatusPending{};
     bool mediaEngineUsesDxgiManager{ true };
     HANDLE lowMemoryNotification{};
+    motion::renderer::IdleResidencyPolicy idleResidency;
+    bool idleResourcesCompacted{};
 
     void refresh_cursor_if_over_renderer()
     {
@@ -856,15 +858,19 @@ namespace
     void start_frame_timer() { frameScheduler.Start(videoWindow, frameIntervalMs); }
     void stop_frame_timer() { frameScheduler.Stop(); frameDeadline.Reset(); }
     void cancel_residency_timer() { KillTimer(videoWindow, residencyTimer); }
-    void enter_idle_residency()
+    void enter_idle_residency(bool releasePromptly = false)
     {
-        if (staticMedia) return;
+        if (staticMedia || idleResourcesCompacted) return;
+        auto now = GetTickCount64();
+        idleResidency.Begin(now, releasePromptly, low_memory_pressure());
         SetTimer(videoWindow, residencyTimer,
-            motion::renderer::residency_timer_delay_ms(low_memory_pressure()), nullptr);
+            idleResidency.Delay(now), nullptr);
     }
     void leave_idle_residency()
     {
         cancel_residency_timer();
+        idleResidency.Cancel();
+        idleResourcesCompacted = false;
     }
 
     void release_decoder()
@@ -886,12 +892,15 @@ namespace
         cancel_residency_timer();
         release_decoder();
         bool compacted = presenter.Compact();
+        idleResourcesCompacted = compacted;
+        idleResidency.Cancel();
         if (!compacted && videoWindow) {
             // Keep the already-paused renderer intact and retry slowly. A
             // transient DComp failure must not turn one low-memory notification
             // into permanent double-buffer residency or a tight wake loop.
-            SetTimer(videoWindow, residencyTimer,
-                motion::renderer::residency_memory_check_ms, nullptr);
+            auto now = GetTickCount64();
+            idleResidency.Retry(now);
+            SetTimer(videoWindow, residencyTimer, idleResidency.Delay(now), nullptr);
         }
         std::cerr << "residency " << (compacted ? "compact" : "decoder-only")
             << " presenter-mib " << (presenter.EstimatedPresenterBytes() / (1024 * 1024))
@@ -1028,6 +1037,7 @@ namespace
         show_renderer_window();
         if (playbackState == PlaybackState::Freezing || playbackState == PlaybackState::Pausing) {
             bool pausing = playbackState == PlaybackState::Pausing;
+            bool releasePromptly = !pausing || returnToDesktopAfterFreeze;
             pause_decoder();
             playbackState = pausing ? PlaybackState::Paused : PlaybackState::Frozen;
             stop_frame_timer();
@@ -1039,7 +1049,7 @@ namespace
                     return;
                 }
             }
-            enter_idle_residency();
+            enter_idle_residency(releasePromptly);
             acknowledge(pendingTargetRevision, "target", pausing ? "paused" : "frozen");
         } else if (playbackState == PlaybackState::Starting) {
             playbackState = PlaybackState::Playing;
@@ -1066,10 +1076,22 @@ namespace
         }
         pendingTargetRevision = revision;
         frameDeadline.Reset();
+        // The captured desktop already satisfies another freeze request. In
+        // particular, do not reopen a decoder that idle compaction released.
+        if (command == Command::DesktopFreeze && presentationMode == PresentationMode::Desktop &&
+            (playbackState == PlaybackState::Frozen || playbackState == PlaybackState::Paused)) {
+            playbackState = PlaybackState::Frozen;
+            stop_frame_timer();
+            pause_decoder();
+            enter_idle_residency(true);
+            acknowledge(revision, "target", "frozen");
+            return;
+        }
         presenter.BeginTargetTransition();
         if (command == Command::Pause) {
             bool returnToDesktop = motion::renderer::leaves_screensaver(presentationMode, command);
             if (staticMedia || !has_decoder() || playbackState == PlaybackState::Frozen || playbackState == PlaybackState::Paused) {
+                bool releasePromptly = returnToDesktop || playbackState == PlaybackState::Frozen;
                 playbackState = PlaybackState::Paused;
                 stop_frame_timer();
                 pause_decoder();
@@ -1079,7 +1101,7 @@ namespace
                     return;
                 }
                 returnToDesktopAfterFreeze = false;
-                enter_idle_residency();
+                enter_idle_residency(releasePromptly);
                 acknowledge(revision, "target", "paused");
             } else {
                 returnToDesktopAfterFreeze = returnToDesktop;
@@ -1139,7 +1161,7 @@ namespace
     {
         // Shutdown may leave MF callbacks queued. They must never terminate
         // or restart the independently running built-in decoder.
-        if (builtinSelected) return;
+        if (builtinSelected || !engine) return;
         if (FAILED(static_cast<HRESULT>(status))) {
             if (static_cast<HRESULT>(status) == MF_E_TOPO_CODEC_NOT_FOUND && !visualShown &&
                 create_builtin(sourcePath)) return;
@@ -1193,7 +1215,14 @@ namespace
                 return 0;
             }
             if (wParam == residencyTimer) {
-                if (motion::renderer::should_compact_idle(low_memory_pressure())) compact_idle_resources();
+                cancel_residency_timer();
+                // KillTimer does not remove an already queued WM_TIMER. A
+                // stale idle tick must never tear down resumed playback.
+                if (!staticMedia && !frame_rendering_active() && idleResidency.Active()) {
+                    auto now = GetTickCount64();
+                    if (idleResidency.Due(now)) compact_idle_resources();
+                    else SetTimer(videoWindow, residencyTimer, idleResidency.Delay(now), nullptr);
+                }
                 return 0;
             }
             break;

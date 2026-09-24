@@ -120,7 +120,8 @@ namespace motion::app
             motion::MediaMetadata const& keep, motion::MediaMetadata const& duplicate);
         void UpdateCover(motion::MediaMetadata const& media, std::wstring const& coverFileName);
         bool EnsureCover(motion::MediaMetadata const& media);
-        bool RequestOptimization(motion::MediaMetadata const& media, std::string const& mode);
+        bool RequestOptimization(motion::MediaMetadata const& media, std::string const& mode,
+            bool automatic = false);
         void PauseOptimization(motion::MediaMetadata const& media);
         void ResumeOptimization(motion::MediaMetadata const& media);
         void CancelOptimization(motion::MediaMetadata const& media);

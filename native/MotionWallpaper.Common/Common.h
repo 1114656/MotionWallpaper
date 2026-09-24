@@ -336,6 +336,12 @@ namespace motion
         std::filesystem::path const& path,
         Settings& destination) noexcept;
     void save_settings(std::filesystem::path const& path, Settings const& settings);
+    // Tray edits and App saves share the atomic JSON writer lock. An unrelated
+    // App save must not restore an outdated activity-playback preference.
+    void save_settings_with_playback_merge(std::filesystem::path const& path,
+        Settings& settings, bool activePlaybackExplicit = false);
+    Settings update_active_playback(std::filesystem::path const& path,
+        std::optional<bool> enabled = std::nullopt);
     std::optional<RuntimeState> load_runtime(std::filesystem::path const& path);
     bool try_load_runtime(std::filesystem::path const& path, RuntimeState& destination) noexcept;
     void save_runtime(std::filesystem::path const& path, RuntimeState const& runtime);

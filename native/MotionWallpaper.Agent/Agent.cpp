@@ -818,6 +818,7 @@ namespace
         bool gpuProbePending{};
         bool hasAlternativeDecodeAdapter{};
         motion::DisplayRefreshRate displayRefreshRate{ 60, 1 };
+        std::string performanceCopyReason;
     };
 
     std::vector<DisplayMediaTarget> display_media_targets(fs::path const& wallpapers, motion::Settings const& settings,
@@ -1238,8 +1239,7 @@ namespace
         [[nodiscard]] std::vector<motion::DisplayRuntimeState> RuntimeStates(
             std::vector<motion::DisplayTarget> const& displays,
             std::vector<DisplayMediaTarget> const& outputs,
-            motion::agent::RuntimeAction action, bool primaryOnly,
-            bool manuallyPaused = false) const
+            motion::agent::RuntimeAction action, bool primaryOnly) const
         {
             std::vector<motion::DisplayRuntimeState> result;
             result.reserve(displays.size());
@@ -1254,7 +1254,7 @@ namespace
                 case motion::agent::RuntimeAction::Locked: return "session-locked";
                 case motion::agent::RuntimeAction::Stopped: return "playback-stopped";
                 case motion::agent::RuntimeAction::DesktopPaused:
-                    return std::string(motion::agent::desktop_pause_reason(manuallyPaused));
+                    return "desktop-covered";
                 case motion::agent::RuntimeAction::DesktopFrozen:
                     return "active-playback-disabled";
                 default: return {};
@@ -1331,7 +1331,8 @@ namespace
                 } else if (output->performanceCopyPending) {
                     state.reason = "performance-copy-pending";
                 } else if (performanceCopyUnavailable) {
-                    state.reason = "performance-copy-unavailable";
+                    state.reason = output->performanceCopyReason.empty()
+                        ? "performance-copy-unavailable" : output->performanceCopyReason;
                 } else if (degraded) {
                     state.reason = snapshot.decode.reason.empty()
                         ? "compatibility-fallback" : snapshot.decode.reason;
@@ -1627,11 +1628,11 @@ namespace
             return std::exchange(screensaverPreviewRequested_, false);
         }
 
-        void SetTrayStatus(motion::agent::TrayStatus status, bool manuallyPaused)
+        void SetTrayStatus(motion::agent::TrayStatus status, bool activityPaused)
         {
-            bool changed = status_ != status || manuallyPaused_ != manuallyPaused;
+            bool changed = status_ != status || activityPaused_ != activityPaused;
             status_ = status;
-            manuallyPaused_ = manuallyPaused;
+            activityPaused_ = activityPaused;
             if (!changed || !window_) return;
             NOTIFYICONDATAW icon{ sizeof(icon) };
             icon.hWnd = window_;
@@ -1758,8 +1759,8 @@ namespace
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status.c_str());
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, commandTogglePlayback,
-                manuallyPaused_ ? L"恢复壁纸" : L"暂停壁纸");
-            AppendMenuW(menu, MF_STRING | (manuallyPaused_ ? MF_GRAYED : 0),
+                activityPaused_ ? L"恢复壁纸" : L"暂停壁纸");
+            AppendMenuW(menu, MF_STRING | (activityPaused_ ? MF_GRAYED : 0),
                 commandNextWallpaper, L"下一张");
             AppendMenuW(menu, MF_STRING, commandPreviewScreensaver, L"立即屏保");
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1857,7 +1858,8 @@ namespace
         bool togglePlaybackRequested_{};
         bool nextWallpaperRequested_{};
         bool screensaverPreviewRequested_{};
-        bool manuallyPaused_{};
+        // Menu presentation only; the authority is Settings::activePlaybackEnabled.
+        bool activityPaused_{};
         bool rawInputWakeEnabled_{};
         uint64_t topologyRevision_{};
         uint64_t inputRevision_{};
@@ -2232,7 +2234,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 trayControls.CancelScreensaverPreview();
                 runtimeEvents.SetScreensaverInputWakeEnabled(false);
                 runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::Unavailable,
-                    trayControls.ManuallyPaused());
+                    !settings.activePlaybackEnabled);
                 runtimeEvents.Wait(settingsEvent.get(), 1000);
                 continue;
             }
@@ -2305,6 +2307,15 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     lastCommandMessage = succeeded
                         ? "renderer-restart-scheduled" :
                         "renderer-not-found-or-stop-failed";
+                } else if (controlRequest.action == "resume-playback") {
+                    try {
+                        settings = motion::update_active_playback(configPath, true);
+                        reload = true;
+                        succeeded = true;
+                    } catch (...) {
+                        append_agent_log(root, L"无法保存活动播放设置，恢复请求未生效。");
+                    }
+                    lastCommandMessage = succeeded ? "active-playback-enabled" : "playback-setting-save-failed";
                 }
                 lastCommandId = controlRequest.requestId;
                 lastCommandAction = controlRequest.action;
@@ -2324,7 +2335,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 trayControls.CancelScreensaverPreview();
                 runtimeEvents.SetScreensaverInputWakeEnabled(false);
                 runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::Paused,
-                    trayControls.ManuallyPaused());
+                    !settings.activePlaybackEnabled);
                 publishRuntime({}, {}, "unavailable", "library-migration",
                     uniformDisplayStates("paused", "library-migration"));
                 if (!renderersStopped) {
@@ -2513,7 +2524,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 trayControls.CancelScreensaverPreview();
                 runtimeEvents.SetScreensaverInputWakeEnabled(false);
                 runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::Unavailable,
-                    trayControls.ManuallyPaused());
+                    !settings.activePlaybackEnabled);
                 publishRuntime({}, {}, "unavailable", "settings-unavailable",
                     uniformDisplayStates("failed", "settings-unavailable"));
                 reload = runtimeEvents.Wait(settingsEvent.get(), 1000);
@@ -2554,7 +2565,14 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
             bool locked = runtimeEvents.Locked();
             auto input = input_state();
             auto uptime = std::chrono::milliseconds(GetTickCount64());
-            if (runtimeEvents.TakeTogglePlaybackRequested()) trayControls.TogglePlayback();
+            if (runtimeEvents.TakeTogglePlaybackRequested()) {
+                try {
+                    settings = motion::update_active_playback(configPath);
+                    reload = true;
+                } catch (...) {
+                    append_agent_log(root, L"无法保存托盘播放开关，保留原来的活动播放设置。");
+                }
+            }
             if (runtimeEvents.TakeScreensaverPreviewRequested()) {
                 trayControls.RequestScreensaverPreview(input.tick, runtimeEvents.InputRevision());
             }
@@ -2598,6 +2616,10 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
             if (auto automaticScene = motion::automatic_scene_for_context(
                     settings, sceneContext)) {
                 (void)motion::apply_scene_profile(settings, *automaticScene);
+                // An automatic scene may temporarily inhibit playback, but
+                // must not re-enable a preference explicitly disabled by the user.
+                settings.activePlaybackEnabled = settings.activePlaybackEnabled &&
+                    restoreConfiguredSettings.configured.activePlaybackEnabled;
             }
             effectiveSettingsActive = true;
             videoOptimizer->SetStorageQuotaBytes(
@@ -2609,7 +2631,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 trayControls.CancelScreensaverPreview();
                 runtimeEvents.SetScreensaverInputWakeEnabled(false);
                 runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::DisplayOff,
-                    trayControls.ManuallyPaused());
+                    !restoreConfiguredSettings.configured.activePlaybackEnabled);
                 bool stopped = renderers.Stop();
                 bool mayPrepare = motion::agent::hidden_session_generation_allowed(
                     sessionAction, runtimeEvents.OnBattery(), stopped);
@@ -2623,7 +2645,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 trayControls.CancelScreensaverPreview();
                 runtimeEvents.SetScreensaverInputWakeEnabled(false);
                 runtimeEvents.SetTrayStatus(motion::agent::TrayStatus::Locked,
-                    trayControls.ManuallyPaused());
+                    !restoreConfiguredSettings.configured.activePlaybackEnabled);
                 bool stopped = renderers.Stop();
                 bool mayPrepare = motion::agent::hidden_session_generation_allowed(
                     sessionAction, runtimeEvents.OnBattery(), stopped);
@@ -2723,7 +2745,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 bool nextWallpaperRequested =
                     runtimeEvents.TakeNextWallpaperRequested();
                 if (motion::agent::tray_next_wallpaper_should_advance(
-                        nextWallpaperRequested, trayControls.ManuallyPaused())) {
+                        nextWallpaperRequested, !restoreConfiguredSettings.configured.activePlaybackEnabled)) {
                     auto currentGroupId = trayOverrideMediaId.empty()
                         ? (randomId.empty() ? settings.selectedGroupId : settings.randomGroupId)
                         : trayOverrideGroupId;
@@ -2882,9 +2904,6 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 auto state = motion::agent::reduce_runtime_action(settings,
                     { true, false, desktop_covered(), !outputs.empty(), screensaverIdle.count() / 1000 });
                 if (outputs.empty()) trayControls.CancelScreensaverPreview();
-                if (trayControls.ManuallyPaused() && !outputs.empty()) {
-                    state = motion::agent::RuntimeAction::DesktopPaused;
-                }
                 if (trayControls.ScreensaverPreviewActive() && !outputs.empty()) {
                     state = motion::agent::RuntimeAction::ScreensaverPlay;
                 }
@@ -2943,6 +2962,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                             resolved.performanceCopyRequired;
                         output.performanceCopyPending =
                             resolved.performanceCopyPending;
+                        output.performanceCopyReason = std::move(resolved.performanceCopyReason);
                         output.gpuProbePending = resolved.gpuProbePending;
                         output.media.path = std::move(resolved.path);
                         output.media.playbackLease = std::move(resolved.lease);
@@ -3335,8 +3355,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 auto statusAction = autoLockTriggered
                     ? motion::agent::RuntimeAction::Locked : state;
                 currentDisplayStates = renderers.RuntimeStates(displays, outputs,
-                    statusAction, settings.displayMode == "primary",
-                    trayControls.ManuallyPaused());
+                    statusAction, settings.displayMode == "primary");
                 if (optimizerQuiescenceBlocked) {
                     for (auto& display : currentDisplayStates) {
                         if (display.state == "failed") continue;
@@ -3399,7 +3418,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         currentDisplayStates.end(), [](auto const& display) {
                             return display.state == "failed";
                         }));
-                runtimeEvents.SetTrayStatus(trayStatus, trayControls.ManuallyPaused());
+                runtimeEvents.SetTrayStatus(trayStatus, !restoreConfiguredSettings.configured.activePlaybackEnabled);
                 bool originalFailureVisible = std::any_of(currentDisplayStates.begin(), currentDisplayStates.end(),
                     [](auto const& display) { return display.reason == "original-playback-failed"; });
                 if (!autoLockTriggered && (originalFailureVisible ||

@@ -66,6 +66,16 @@ MotionWallpaper 优先保证稳定播放与日常省电。导入的源文件保�
 
 `MotionWallpaper.exe` 是唯一需要手动启动的程序。它会自动启动常驻策略 Agent；小写命名的 Agent 和 Renderer 可执行文件都是内部组件。
 
+日常开发测试无需安装：双击仓库根目录的 `Start-Dev.cmd`，或执行以下命令：
+
+```powershell
+.\scripts\start-dev.ps1
+# 修改源码后，重新构建、运行测试并启动：
+.\scripts\start-dev.ps1 -Rebuild
+```
+
+启动脚本会先正常退出其他位置正在运行的 Motion，避免安装版和开发版混用后台服务。开发版固定使用 `build\Config` 和 `build\Wallpapers`，重新构建会保留这两个目录；不要手动删除整个 `build` 目录。已有开发版数据不会从安装版反复覆盖，重复启动会打开同一窗口。首次启动若尚无编译结果，会自动构建。
+
 ## 安装器与便携包
 
 推荐普通用户下载单 EXE 安装器。安装向导支持简体中文和英文，可选择安装位置，并可选创建桌面快捷方式：

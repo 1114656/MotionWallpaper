@@ -48,26 +48,18 @@ namespace motion::agent
         return rendererFailed ? TrayStatus::Failed : requested;
     }
 
-    // The event is always consumed by RuntimeEvents. While manually paused it
+    // The event is always consumed by RuntimeEvents. While activity playback is off it
     // is deliberately ignored, so it cannot become a delayed surprise change
     // when playback resumes.
     [[nodiscard]] constexpr bool tray_next_wallpaper_should_advance(
-        bool requested, bool manuallyPaused) noexcept
+        bool requested, bool activityPaused) noexcept
     {
-        return requested && !manuallyPaused;
+        return requested && !activityPaused;
     }
 
     class TrayControlState
     {
     public:
-        void TogglePlayback() noexcept
-        {
-            manuallyPaused_ = !manuallyPaused_;
-            if (manuallyPaused_) previewActive_ = false;
-        }
-
-        [[nodiscard]] bool ManuallyPaused() const noexcept { return manuallyPaused_; }
-
         void RequestScreensaverPreview(uint32_t inputTick, uint64_t inputRevision) noexcept
         {
             previewActive_ = true;
@@ -87,7 +79,6 @@ namespace motion::agent
         [[nodiscard]] bool ScreensaverPreviewActive() const noexcept { return previewActive_; }
 
     private:
-        bool manuallyPaused_{};
         bool previewActive_{};
         uint32_t previewInputTick_{};
         uint64_t previewInputRevision_{};

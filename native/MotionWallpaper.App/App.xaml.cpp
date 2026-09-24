@@ -24,7 +24,7 @@ namespace
             if (owner != found.processId || !IsWindowVisible(window)) return TRUE;
             wchar_t title[64]{};
             GetWindowTextW(window, title, ARRAYSIZE(title));
-            if (wcscmp(title, L"MotionWallpaper") != 0) return TRUE;
+            if (wcscmp(title, L"Motion") != 0 && wcscmp(title, L"MotionWallpaper") != 0) return TRUE;
             found.window = window;
             return FALSE;
         }, reinterpret_cast<LPARAM>(&search));

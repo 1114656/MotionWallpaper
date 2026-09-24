@@ -32,6 +32,9 @@ namespace motion::agent
         // or running in this optimizer instance.
         bool performanceCopyPending{};
         bool gpuProbePending{};
+        // Why a required copy cannot be queued; carried through to the UI so
+        // cancelled work is not presented as an invisible running task.
+        std::string performanceCopyReason;
     };
 
     class VideoOptimizer

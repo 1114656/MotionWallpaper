@@ -16,12 +16,20 @@
 #include <optional>
 #include <unordered_map>
 
+namespace motion::agent { class VideoStillPreview; }
+
 namespace winrt::MotionWallpaper::implementation
 {
     struct MainWindow : MainWindowT<MainWindow>
     {
         MainWindow();
 
+        void WallpaperNav_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
+        void DisplaysNav_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
+        void StorageNav_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
+        void IdentifyDisplays_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
+        void Quality_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
+        void ApplyWallpaper_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void Settings_Changed(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void Policy_Changed(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const&);
         void SystemSettings_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
@@ -69,7 +77,7 @@ namespace winrt::MotionWallpaper::implementation
         void SceneAutoSwitch_Changed(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
 
     private:
-        enum class AppPage { Settings, Variants, WallpaperGroup };
+        enum class AppPage { Settings, Variants, WallpaperGroup, Displays, Storage };
 
         std::filesystem::path root;
         std::filesystem::path applicationRoot;
@@ -97,11 +105,21 @@ namespace winrt::MotionWallpaper::implementation
         std::vector<motion::MediaMetadata> filteredMedia;
         std::vector<motion::DisplayTarget> displays;
         std::string selectedDisplayId;
+        std::optional<motion::MediaMetadata> draftMedia;
+        std::shared_ptr<motion::agent::VideoStillPreview> workspacePreviews;
+        std::shared_ptr<void> previewFileLease;
+        std::filesystem::path previewSource, previewImagePath;
+        std::wstring displayCardsFingerprint;
+        int previewPollsRemaining{};
+        int displayRefreshTicks{};
+        void RefreshWorkspace();
+        void RefreshDraftImage();
         Microsoft::UI::Dispatching::DispatcherQueueTimer settingsSaveTimer{ nullptr };
         Microsoft::UI::Dispatching::DispatcherQueueTimer catalogSearchTimer{ nullptr };
         Microsoft::UI::Dispatching::DispatcherQueueTimer statusHideTimer{ nullptr };
         Microsoft::UI::Dispatching::DispatcherQueueTimer settingsReloadTimer{ nullptr };
         std::filesystem::file_time_type runtimeWriteTime{};
+        std::filesystem::file_time_type playbackSettingsWriteTime{};
         std::atomic_bool importing{};
         std::shared_ptr<std::atomic_bool> importCancellation{ std::make_shared<std::atomic_bool>() };
         std::atomic_bool coversRefreshing{};
@@ -126,8 +144,9 @@ namespace winrt::MotionWallpaper::implementation
         std::chrono::steady_clock::time_point originalRecoveryRequestedAt{};
         std::string draggedGroupId;
 
-        void SaveSettings();
-        bool TrySaveSettings() noexcept;
+        void SaveSettings(bool activePlaybackExplicit = false);
+        bool TrySaveSettings(bool activePlaybackExplicit = false) noexcept;
+        void ReloadPlaybackPreference();
         void ReloadExternalSelection();
         void ApplySettingsToControls();
         void LoadGroups();

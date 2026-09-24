@@ -72,6 +72,7 @@ namespace motion
         bool cancelled{};
         bool failed{};
         std::string failedMode;
+        std::string failedReason;
         bool waitingForPower{};
         uint32_t progressPercent{};
         bool progressKnown{};
@@ -720,16 +721,27 @@ namespace motion
     {
         auto newline = record.find('\n');
         return !context.empty() && newline != std::string_view::npos &&
-            record.substr(0, newline) == mode && record.substr(newline + 1) == context;
+            record.substr(0, newline) == mode &&
+            record.substr(newline + 1, record.find('\n', newline + 1) - newline - 1) == context;
+    }
+
+    inline std::string variant_failure_reason(std::string_view record)
+    {
+        auto first = record.find('\n');
+        if (first == std::string_view::npos) return {};
+        auto second = record.find('\n', first + 1);
+        return second == std::string_view::npos ? std::string{} : std::string(record.substr(second + 1));
     }
 
     inline bool fail_variant_generation(std::filesystem::path const& mediaDirectory,
-        VariantGenerationRequest const& expected, std::string const& context = {}) noexcept
+        VariantGenerationRequest const& expected, std::string const& context = {},
+        std::string const& reason = {}) noexcept
     {
         auto locked = lock_variant_request(mediaDirectory, expected);
         if (!locked) return false;
         if (!write_small_file(variant_failed_path(mediaDirectory), expected.mode +
-            (context.empty() ? std::string{} : "\n" + context))) return false;
+            (context.empty() && reason.empty() ? std::string{} : "\n" + context) +
+            (reason.empty() ? std::string{} : "\n" + reason))) return false;
         if (!mark_locked_request_for_deletion(locked.get())) {
             std::error_code ignored;
             std::filesystem::remove(variant_failed_path(mediaDirectory), ignored);
@@ -747,6 +759,67 @@ namespace motion
         auto current = read_variant_generation_request(mediaDirectory);
         if (!current || (!expectedMode.empty() && current.mode != expectedMode)) return false;
         return fail_variant_generation(mediaDirectory, current);
+    }
+
+    // Import and playback use the same non-destructive enqueue operation.
+    // Only explicit user retries may clear a failure, cancellation or pause.
+    inline VariantGenerationRequest ensure_variant_generation_request(
+        std::filesystem::path const& mediaDirectory, std::string const& mode,
+        VariantProgressState initialState = VariantProgressState::queued) noexcept
+    {
+        namespace fs = std::filesystem;
+        try {
+            if (!motion::valid_variant_request_mode(mode)) return {};
+            auto blocked = [&] {
+                std::error_code error;
+                return (fs::is_regular_file(
+                            motion::variant_cancelled_path(mediaDirectory), error) && !error) ||
+                    motion::variant_generation_paused(mediaDirectory) ||
+                    motion::variant_generation_suppressed(mediaDirectory, mode) ||
+                    motion::variant_failure_mode(motion::read_small_file(
+                        motion::variant_failed_path(mediaDirectory), 8192)) == mode;
+            };
+            if (blocked()) return {};
+
+            auto current = motion::read_variant_generation_request(mediaDirectory);
+            if (current) return current.mode == mode ? current :
+                motion::VariantGenerationRequest{};
+
+            motion::VariantGenerationRequest created{
+                mode, motion::new_variant_request_id() };
+            auto serialized = motion::serialize_variant_request(created);
+            if (serialized.empty()) return {};
+            motion::unique_handle request(CreateFileW(
+                motion::variant_request_path(mediaDirectory).c_str(),
+                GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, nullptr));
+            if (!request) {
+                auto error = GetLastError();
+                if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) return {};
+                current = motion::read_variant_generation_request(mediaDirectory);
+                return current.mode == mode ? current :
+                    motion::VariantGenerationRequest{};
+            }
+            DWORD written{};
+            bool published = WriteFile(request.get(), serialized.data(),
+                    static_cast<DWORD>(serialized.size()), &written, nullptr) &&
+                written == static_cast<DWORD>(serialized.size()) &&
+                FlushFileBuffers(request.get());
+            if (!published) motion::mark_locked_request_for_deletion(request.get());
+            request.reset();
+            if (!published) return {};
+            if (blocked()) {
+                auto locked = lock_variant_request(mediaDirectory, created);
+                if (locked) mark_locked_request_for_deletion(locked.get());
+                return {};
+            }
+            if (motion::read_variant_generation_request(mediaDirectory) != created) return {};
+            // The request is authoritative even if this optional progress
+            // write loses a race. A later policy pass will repair visibility.
+            motion::write_variant_progress_if_current(
+                mediaDirectory, created, initialState);
+            return created;
+        } catch (...) { return {}; }
     }
 
     inline VariantCacheStatus inspect_variant_cache(std::filesystem::path const& mediaDirectory) noexcept
@@ -779,10 +852,11 @@ namespace motion
                 unique_handle failure(CreateFileW(variant_failed_path(mediaDirectory).c_str(), GENERIC_READ,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL, nullptr));
-                char value[32]{};
+                char value[8192]{};
                 DWORD read{};
                 if (failure && ReadFile(failure.get(), value, sizeof(value) - 1, &read, nullptr)) {
                     result.failedMode = variant_failure_mode(std::string_view(value, read));
+                    result.failedReason = variant_failure_reason(std::string_view(value, read));
                 }
             }
             result.balancedSuppressed = variant_generation_suppressed(mediaDirectory, "balanced");

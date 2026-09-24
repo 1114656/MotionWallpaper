@@ -1,4 +1,5 @@
 #include "../MotionWallpaper.Common/Common.h"
+#include "WallpaperAssignmentTests.h"
 #include "../MotionWallpaper.Common/DisplayTopology.h"
 #include "../MotionWallpaper.Common/SceneProfiles.h"
 #include "../MotionWallpaper.Agent/RandomSelectionPolicy.h"
@@ -367,27 +368,28 @@ namespace
             "inactive desktop should freeze");
         require(motion::agent::reduce_runtime_action(settings, { true, false, false, false, 60 }) == RuntimeAction::Stopped,
             "missing media should stop");
+        settings.desktopPlayback = false;
+        require(motion::agent::reduce_runtime_action(settings, { true, false, false, true, 29 }) == RuntimeAction::Stopped,
+            "screensaver-only mode kept a desktop renderer alive before idle");
+        require(motion::agent::reduce_runtime_action(settings, { true, false, false, true, 30 }) == RuntimeAction::ScreensaverPlay,
+            "disabling desktop playback also disabled the independent screen saver");
+        require(motion::agent::reduce_runtime_action(settings, { true, false, false, true, 0 }) == RuntimeAction::Stopped,
+            "screensaver-only wake retained a playback route");
     }
 
     void tray_controls_preview_and_cycle_without_polling()
     {
         motion::agent::TrayControlState controls;
-        require(!controls.ManuallyPaused() && !controls.ScreensaverPreviewActive(),
-            "tray controls did not start in the normal playback state");
-        controls.TogglePlayback();
-        require(controls.ManuallyPaused(), "tray pause command did not pause playback");
-
+        require(!controls.ScreensaverPreviewActive(), "screensaver preview started unexpectedly");
         controls.RequestScreensaverPreview(10, 20);
-        require(controls.ScreensaverPreviewActive() && controls.ManuallyPaused(),
-            "screen saver preview did not preserve the user's paused state");
+        require(controls.ScreensaverPreviewActive(), "screen saver preview did not start");
         require(!controls.ObserveInput(10, 20) && controls.ScreensaverPreviewActive(),
             "screen saver preview dismissed without a new input event");
         require(controls.ObserveInput(10, 21) && !controls.ScreensaverPreviewActive(),
             "a raw input event did not dismiss screen saver preview immediately");
-        require(controls.ManuallyPaused(),
-            "leaving screen saver preview unexpectedly resumed a paused wallpaper");
-        controls.TogglePlayback();
-        require(!controls.ManuallyPaused(), "tray resume command did not resume playback");
+        controls.RequestScreensaverPreview(30, 40);
+        controls.CancelScreensaverPreview();
+        require(!controls.ScreensaverPreviewActive(), "screen saver preview cancellation failed");
 
         std::vector<std::string> ids{ "c", "a", "b", "b" };
         require(motion::agent::next_media_id(ids, "a") == "b",
@@ -879,15 +881,29 @@ namespace
             "non-focused fullscreen window no longer covers the desktop");
     }
 
-    void normal_pause_keeps_decoder_hot()
+    void paused_decoder_residency_has_a_bounded_resume_window()
     {
-        require(!motion::renderer::should_compact_idle(false),
-            "normal pause still destroys the decoder and causes a resume GPU spike");
-        require(motion::renderer::residency_timer_delay_ms(false) == 30'000,
-            "idle memory pressure checks became too frequent");
-        require(motion::renderer::should_compact_idle(true) &&
-            motion::renderer::residency_timer_delay_ms(true) == 250,
-            "low-memory pause no longer releases decoder resources promptly");
+        motion::renderer::IdleResidencyPolicy policy;
+        require(!policy.Active() && !policy.Due(0), "idle residency was armed before a pause");
+        policy.Begin(1000, false, false);
+        require(!policy.Due(30'999) && policy.Due(31'000),
+            "ordinary pause no longer has a bounded 30-second resume window");
+        policy.Begin(20'000, false, false);
+        require(policy.Due(31'000), "repeated pause postponed resource release indefinitely");
+        policy.Cancel();
+        require(!policy.Due(60'000), "a stale pause deadline survived playback resume");
+        policy.Begin(70'000, false, false);
+        require(!policy.Due(99'999), "a new pause inherited an earlier deadline");
+        policy.Begin(71'000, true, false);
+        require(!policy.Due(71'249) && policy.Due(71'250),
+            "explicit static desktop did not shorten the decoder residency window");
+        policy.Retry(72'000);
+        require(!policy.Due(101'999) && policy.Due(102'000),
+            "failed surface compaction no longer has a bounded retry delay");
+        policy.Cancel();
+        policy.Begin(200'000, false, true);
+        require(policy.Delay(200'000) == 250 && policy.Due(200'250),
+            "memory pressure no longer releases paused resources promptly");
     }
 
     void stable_agent_states_do_not_poll_at_twenty_hertz()
@@ -2470,6 +2486,7 @@ namespace
         auto paused = optimizer.ResolveWithLease(
             optimizerSource, "balanced", 32, 32, 30, false, true);
         require(paused.performanceCopyRequired &&
+            paused.performanceCopyReason == "performance-copy-paused" &&
             !paused.performanceCopyPending &&
             motion::read_variant_generation_request(mediaDirectory) == automaticRequest &&
             motion::variant_generation_paused(mediaDirectory),
@@ -2480,10 +2497,22 @@ namespace
         auto cancelled = optimizer.ResolveWithLease(
             optimizerSource, "balanced", 32, 32, 30, false, true);
         require(cancelled.performanceCopyRequired &&
+            cancelled.performanceCopyReason == "performance-copy-cancelled" &&
             !cancelled.performanceCopyPending &&
             !motion::read_variant_generation_request(mediaDirectory) &&
             fs::is_regular_file(motion::variant_cancelled_path(mediaDirectory)),
             "Resolve recreated a user-cancelled automatic request");
+
+        require(motion::request_variant_generation(mediaDirectory, "balanced"),
+            "the user could not retry a cancelled performance copy");
+        auto resumedRequest = motion::read_variant_generation_request(mediaDirectory);
+        auto resumedCopy = optimizer.ResolveWithLease(
+            optimizerSource, "balanced", 32, 32, 30, false, true);
+        require(resumedRequest && resumedRequest.requestId != automaticRequest.requestId &&
+            resumedCopy.performanceCopyRequired && resumedCopy.performanceCopyReason.empty() &&
+            !motion::inspect_variant_cache(mediaDirectory).cancelled &&
+            motion::inspect_variant_cache(mediaDirectory).queued,
+            "explicit regeneration retained the cancellation or failed to create a visible task");
 
         require(motion::request_variant_generation(mediaDirectory, "balanced"),
             "the suppression-state integration request could not be created");
@@ -2492,6 +2521,7 @@ namespace
         auto suppressed = optimizer.ResolveWithLease(
             optimizerSource, "balanced", 32, 32, 30, false, true);
         require(suppressed.performanceCopyRequired &&
+            suppressed.performanceCopyReason == "performance-copy-deleted" &&
             !motion::read_variant_generation_request(mediaDirectory) &&
             motion::variant_generation_suppressed(mediaDirectory, "balanced"),
             "Resolve recreated a suppressed automatic request");
@@ -2506,9 +2536,10 @@ namespace
             optimizerSource, "balanced", 32, 32, 30, false, true);
         require(failed.performanceCopyRequired &&
             !failed.performanceCopyPending &&
-            motion::read_variant_generation_request(mediaDirectory).mode == "balanced" &&
-            !fs::is_regular_file(motion::variant_failed_path(mediaDirectory)),
-            "a legacy failure without an environment fingerprint permanently blocked automatic retry");
+            failed.performanceCopyReason == "performance-copy-failed" &&
+            !motion::read_variant_generation_request(mediaDirectory) &&
+            fs::is_regular_file(motion::variant_failed_path(mediaDirectory)),
+            "an automatic playback pass erased a failure and retried without user intent");
         // Windows' H.264 decoder rejects a 32x32 OpenH264 stream; use the
         // existing 64x64 source size for this real playback-validation case.
         auto cached = mediaDirectory / L"Variants" / L"balanced-30-64x64-v7.mp4";
@@ -3034,6 +3065,32 @@ namespace
             "renderer integration process did not stop");
     }
 
+    void wait_for_renderer_compaction(RendererProcess& renderer, std::chrono::seconds timeout,
+        uint64_t pendingPauseRevision = 0)
+    {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        bool released{};
+        bool compacted{};
+        bool acknowledged = !pendingPauseRevision;
+        std::string diagnostic;
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto line = read_protocol_line(renderer.output.get(), std::chrono::milliseconds(500));
+            diagnostic += line + "\n";
+            if (line.starts_with("decoder released ")) released = true;
+            if (line.starts_with("residency compact ")) {
+                require(released, "presenter compacted without releasing its video decoder");
+                compacted = true;
+            }
+            auto ack = motion::protocol::parse_ack(line);
+            if (ack.channel == motion::protocol::AckChannel::Target &&
+                ack.revision == pendingPauseRevision && ack.state == "paused") acknowledged = true;
+            if (compacted && acknowledged) return;
+            if (line.starts_with("error ")) break;
+        }
+        std::cerr << diagnostic;
+        throw std::runtime_error("paused Renderer did not release decoder and swap-chain resources");
+    }
+
     void real_video_renderer_separates_cpu_decode_and_gpu_presentation(fs::path const& root)
     {
         // Reuse the independently decoded H.264 fixture from the MF probe.
@@ -3094,6 +3151,7 @@ namespace
             auto frozen = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
             require(frozen.channel == motion::protocol::AckChannel::Target && frozen.revision == 2 && frozen.state == "frozen",
                 "video Renderer did not capture both outputs for freeze");
+            wait_for_renderer_compaction(renderer, std::chrono::seconds(5));
             renderer.Send("desktop-play 3\n");
             auto resumed = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
             require(resumed.channel == motion::protocol::AckChannel::Target && resumed.revision == 3 && resumed.state == "playing",
@@ -3106,7 +3164,20 @@ namespace
             auto repeatedFreeze = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
             require(repeatedFreeze.channel == motion::protocol::AckChannel::Target && repeatedFreeze.revision == 5 && repeatedFreeze.state == "frozen",
                 "consecutive freeze commands stalled the video Renderer");
-            stop_renderer(renderer, 6);
+            wait_for_renderer_compaction(renderer, std::chrono::seconds(5));
+            renderer.Send("desktop-freeze 6\n");
+            bool acknowledged{};
+            auto repeatDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (std::chrono::steady_clock::now() < repeatDeadline) {
+                auto line = read_protocol_line(renderer.output.get(), std::chrono::milliseconds(100));
+                require(!line.starts_with("pipeline decode ") && !line.starts_with("decoder released ") &&
+                    !line.starts_with("error "), "repeated freeze reopened or disturbed a released decoder");
+                auto ack = motion::protocol::parse_ack(line);
+                acknowledged = acknowledged || (ack.channel == motion::protocol::AckChannel::Target &&
+                    ack.revision == 6 && ack.state == "frozen");
+            }
+            require(acknowledged, "compacted desktop did not acknowledge another freeze");
+            stop_renderer(renderer, 7);
         }
     }
 
@@ -3164,6 +3235,49 @@ namespace
         auto renderer = launch_hidden_image_renderer(root, L"selection-first-frame.bmp");
         (void)apply_and_wait_for_first_frame(renderer, "desktop-play", 101);
         stop_renderer(renderer, 102);
+    }
+
+    void real_video_pause_releases_after_grace_and_screensaver_exit(fs::path const& root)
+    {
+        auto renderer = launch_hidden_renderer(root / L"decode-probe-h264.mp4", L"video", L"software", {}, true);
+        (void)apply_and_wait_for_first_frame(renderer, "desktop-play", 1);
+        auto pause = [&](uint64_t revision) {
+            renderer.Send("pause " + std::to_string(revision) + "\n");
+            auto ack = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
+            require(ack.channel == motion::protocol::AckChannel::Target && ack.revision == revision && ack.state == "paused",
+                "video Renderer did not pause");
+        };
+        pause(2);
+        auto pausedAt = std::chrono::steady_clock::now();
+        // Deliberately do not drain stdout during this wait: an early release
+        // caused by genuine memory pressure must still be observed below.
+        Sleep(10'000);
+        renderer.Send("pause 3\n");
+        wait_for_renderer_compaction(renderer, std::chrono::seconds(24), 3);
+        require(std::chrono::steady_clock::now() - pausedAt < std::chrono::seconds(35),
+            "ordinary pause retained decoding resources beyond its bounded window");
+        (void)apply_and_wait_for_first_frame(renderer, "desktop-play", 4);
+
+        auto window = wait_for_renderer_window(renderer.id, std::chrono::seconds(2));
+        require(window && PostMessageW(window, WM_TIMER, 2, 0), "could not inject an already-queued idle timer");
+        uint64_t firstSerial{}, lastSerial{};
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto line = read_protocol_line(renderer.output.get(), std::chrono::milliseconds(200));
+            require(!line.starts_with("decoder released ") && !line.starts_with("error "),
+                "a stale idle timer interrupted resumed video");
+            auto heartbeat = motion::protocol::parse_playback_heartbeat(line);
+            if (heartbeat && heartbeat->revision == 4) {
+                if (!firstSerial) firstSerial = heartbeat->serial;
+                lastSerial = heartbeat->serial;
+            }
+        }
+        require(lastSerial > firstSerial && firstSerial > 0, "compacted playback failed to advance after resume");
+        (void)apply_and_wait_for_first_frame(renderer, "screensaver-play", 5);
+        pause(6);
+        wait_for_renderer_compaction(renderer, std::chrono::seconds(5));
+        (void)apply_and_wait_for_first_frame(renderer, "screensaver-play", 7);
+        stop_renderer(renderer, 8);
     }
 
     void renderer_crash_recovery_reaches_first_frame_again(fs::path const& root)
@@ -3564,6 +3678,11 @@ namespace
         require(!motion::request_runtime_control(controlPath, "delete-renderer", {}) &&
             motion::load_runtime_control_request(controlPath)->requestId == *requestId,
             "an invalid runtime command was accepted or replaced a valid request");
+        auto resumeId = motion::request_runtime_control(controlPath, "resume-playback", {});
+        auto resume = motion::load_runtime_control_request(controlPath);
+        require(resumeId && resume && resume->requestId == *resumeId &&
+            resume->action == "resume-playback" && resume->displayId.empty(),
+            "settings resume could not cross the durable Agent command channel");
     }
 
     void display_runtime_status_has_trustworthy_precedence()
@@ -3604,6 +3723,83 @@ namespace
             agent.find("RuntimeStates(displays, outputs") != std::string::npos &&
             agent.find("lastCommandSucceeded = succeeded") != std::string::npos,
             "Agent no longer consumes, targets, and acknowledges Renderer recovery commands");
+    }
+
+    void shared_playback_preference_survives_stale_settings_saves(fs::path const& root)
+    {
+        auto path = root / L"shared-playback" / L"settings.json";
+        motion::Settings settings;
+        require(settings.performanceMode == "balanced", "first-run quality is not balanced");
+        settings.screensaverEnabled = true;
+        settings.continueWhenCovered = false;
+        motion::save_settings(path, settings);
+        auto staleApp = settings;
+        auto paused = motion::update_active_playback(path);
+        require(!paused.activePlaybackEnabled && paused.screensaverEnabled,
+            "tray pause did not persist the shared preference or disabled screensaver");
+        staleApp.performanceMode = "original";
+        motion::save_settings_with_playback_merge(path, staleApp);
+        require(!staleApp.activePlaybackEnabled &&
+            motion::load_settings(path)->performanceMode == "original",
+            "an unrelated App save restored stale playback or reset the chosen quality");
+        staleApp.activePlaybackEnabled = true;
+        motion::save_settings_with_playback_merge(path, staleApp, true);
+        require(motion::load_settings(path)->activePlaybackEnabled,
+            "explicit settings enable did not resume the persisted preference");
+        motion::update_active_playback(path, false);
+        std::exception_ptr firstError, secondError;
+        auto toggleMany = [&](std::exception_ptr& error) {
+            try {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                for (int index = 0; index < 10; ++index) motion::update_active_playback(path);
+                winrt::uninit_apartment();
+            } catch (...) { error = std::current_exception(); }
+        };
+        std::thread first(toggleMany, std::ref(firstError));
+        std::thread second(toggleMany, std::ref(secondError));
+        first.join(); second.join();
+        if (firstError) std::rethrow_exception(firstError);
+        if (secondError) std::rethrow_exception(secondError);
+        auto saved = *motion::load_settings(path);
+        require(!saved.activePlaybackEnabled && saved.performanceMode == "original",
+            "concurrent tray toggles lost an update or changed unrelated settings");
+        using motion::agent::RuntimeAction;
+        require(motion::agent::reduce_runtime_action(saved, { true, false, false, true, 0 }) == RuntimeAction::DesktopFrozen &&
+            motion::agent::reduce_runtime_action(saved, { true, false, false, true, saved.idleTimeoutSeconds }) == RuntimeAction::ScreensaverPlay,
+            "shared activity pause interferes with screensaver playback");
+        saved.activePlaybackEnabled = true;
+        require(motion::agent::reduce_runtime_action(saved, { true, false, true, true, 0 }) == RuntimeAction::DesktopPaused &&
+            saved.activePlaybackEnabled,
+            "automatic coverage pause mutated the shared user preference");
+    }
+
+    void automatic_import_requests_preserve_terminal_states(fs::path const& root)
+    {
+        auto directory = root / L"import-queue";
+        fs::create_directories(directory);
+        auto first = motion::ensure_variant_generation_request(directory, "balanced");
+        require(first && motion::inspect_variant_cache(directory).queued,
+            "automatic import did not create a visible durable task");
+        require(motion::ensure_variant_generation_request(directory, "balanced") == first &&
+            !motion::ensure_variant_generation_request(directory, "power-saver"),
+            "repeated import replaced an active request");
+        require(motion::fail_variant_generation(directory, first, "source-and-driver", "磁盘空间不足"),
+            "generation failure could not be persisted");
+        auto failed = motion::inspect_variant_cache(directory);
+        require(failed.failed && failed.failedMode == "balanced" && failed.failedReason == "磁盘空间不足" &&
+            !failed.queued && !motion::ensure_variant_generation_request(directory, "balanced"),
+            "automatic import cleared the failure reason or silently retried");
+        require(motion::request_variant_generation(directory, "balanced"), "explicit retry failed");
+        auto retry = motion::read_variant_generation_request(directory);
+        require(retry.requestId != first.requestId && !motion::inspect_variant_cache(directory).failed,
+            "retry did not clear failure and receive a fresh identity");
+        require(!motion::fail_variant_generation(directory, first, {}, "stale worker") &&
+            motion::read_variant_generation_request(directory) == retry,
+            "a stale failure replaced the retried task");
+        require(motion::cancel_variant_generation(directory) &&
+            !motion::ensure_variant_generation_request(directory, "balanced") &&
+            motion::inspect_variant_cache(directory).cancelled,
+            "repeated import undid the user's cancellation");
     }
 
     void concurrent_settings_writers_never_publish_torn_json(fs::path const& root)
@@ -4476,12 +4672,15 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(application_data_location_preserves_portable_and_legacy_libraries(root));
         RUN_TEST(settings_round_trip_clears_empty_values(root));
         RUN_TEST(scene_profiles_and_layout_round_trip(root));
+        RUN_TEST(motion::tests::wallpaper_apply_is_explicit_and_target_scoped(require));
         RUN_TEST(legacy_settings_are_migrated(root));
         RUN_TEST(coupled_lock_and_display_off_settings_are_migrated(root));
         RUN_TEST(unsafe_media_paths_are_rejected(root));
         RUN_TEST(desktop_state_is_deterministic());
         RUN_TEST(presentation_state_has_explicit_priorities());
         RUN_TEST(tray_controls_preview_and_cycle_without_polling());
+        RUN_TEST(shared_playback_preference_survives_stale_settings_saves(root));
+        RUN_TEST(automatic_import_requests_preserve_terminal_states(root));
         RUN_TEST(identifiers_are_path_safe());
         RUN_TEST(future_settings_are_rejected(root));
         RUN_TEST(custom_library_settings_require_owned_safe_roots(root));
@@ -4494,7 +4693,7 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(external_media_remains_authoritative_during_own_screensaver());
         RUN_TEST(display_off_waits_for_the_post_lock_delay());
         RUN_TEST(fullscreen_coverage_is_not_limited_to_foreground());
-        RUN_TEST(normal_pause_keeps_decoder_hot());
+        RUN_TEST(paused_decoder_residency_has_a_bounded_resume_window());
         RUN_TEST(stable_agent_states_do_not_poll_at_twenty_hertz());
         RUN_TEST(battery_power_pauses_optional_variant_generation());
         RUN_TEST(motion::tests::transcode_lifecycle_survives_session_transitions(require));
@@ -4542,6 +4741,7 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(renderer_ack_channels_are_isolated());
         RUN_TEST(decode_modes_have_distinct_fallback_contracts());
         RUN_TEST(real_video_renderer_separates_cpu_decode_and_gpu_presentation(root));
+        RUN_TEST(real_video_pause_releases_after_grace_and_screensaver_exit(root));
         RUN_TEST(motion::tests::builtin_video_clock_pixels_and_resume(root,require));
         RUN_TEST(selected_media_reaches_real_renderer_first_frame(root));
         RUN_TEST(renderer_crash_recovery_reaches_first_frame_again(root));

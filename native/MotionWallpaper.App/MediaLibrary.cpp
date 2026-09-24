@@ -1637,7 +1637,8 @@ namespace motion::app
         }
     }
 
-    bool MediaLibrary::RequestOptimization(motion::MediaMetadata const& media, std::string const& mode)
+    bool MediaLibrary::RequestOptimization(motion::MediaMetadata const& media, std::string const& mode,
+        bool automatic)
     {
         std::scoped_lock lock(mutex_);
         RequireTrustedLibrary();
@@ -1646,6 +1647,7 @@ namespace motion::app
         RecoverInterruptedVariantDeletions(directory);
         std::error_code error;
         if (!fs::is_regular_file(directory / media.fileName, error) || error) return false;
+        if (automatic) return static_cast<bool>(motion::ensure_variant_generation_request(directory, mode));
         return motion::request_variant_generation(directory, mode);
     }
 

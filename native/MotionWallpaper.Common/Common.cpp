@@ -75,7 +75,7 @@ namespace
 
     bool valid_runtime_control_action(std::string const& value) noexcept
     {
-        return value == "retry" || value == "restart-renderer";
+        return value == "retry" || value == "restart-renderer" || value == "resume-playback";
     }
 
     bool safe_media_tag(std::wstring_view value) noexcept
@@ -370,27 +370,36 @@ namespace
         return motion::utf8_to_wide(bytes);
     }
 
+    class JsonWriteLock
+    {
+    public:
+        explicit JsonWriteLock(fs::path const& path)
+        {
+            auto identity = fs::absolute(path).lexically_normal().wstring();
+            uint64_t hash = 1469598103934665603ULL;
+            for (auto character : identity) {
+                hash ^= static_cast<uint16_t>(towlower(character));
+                hash *= 1099511628211ULL;
+            }
+            auto mutexName = L"Local\\MotionWallpaper.AtomicJson." + std::to_wstring(hash);
+            handle_.reset(CreateMutexW(nullptr, FALSE, mutexName.c_str()));
+            if (!handle_) throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
+            auto waitResult = WaitForSingleObject(handle_.get(), 10'000);
+            if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED) {
+                throw std::runtime_error("timed out waiting for atomic JSON writer");
+            }
+        }
+        ~JsonWriteLock() { ReleaseMutex(handle_.get()); }
+        JsonWriteLock(JsonWriteLock const&) = delete;
+        JsonWriteLock& operator=(JsonWriteLock const&) = delete;
+    private:
+        motion::unique_handle handle_;
+    };
+
     void write_text_atomic(fs::path const& path, std::wstring const& value)
     {
         fs::create_directories(path.parent_path());
-        auto identity = fs::absolute(path).lexically_normal().wstring();
-        uint64_t hash = 1469598103934665603ULL;
-        for (auto character : identity) {
-            hash ^= static_cast<uint16_t>(towlower(character));
-            hash *= 1099511628211ULL;
-        }
-        auto mutexName = L"Local\\MotionWallpaper.AtomicJson." + std::to_wstring(hash);
-        motion::unique_handle writeMutex(CreateMutexW(nullptr, FALSE, mutexName.c_str()));
-        if (!writeMutex) throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
-        auto waitResult = WaitForSingleObject(writeMutex.get(), 10'000);
-        if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED) {
-            throw std::runtime_error("timed out waiting for atomic JSON writer");
-        }
-        struct MutexRelease
-        {
-            HANDLE value{};
-            ~MutexRelease() { if (value) ReleaseMutex(value); }
-        } release{ writeMutex.get() };
+        JsonWriteLock lock(path);
         static std::atomic_uint64_t temporarySequence{};
         auto temporary = path.parent_path() /
             (path.filename().wstring() + L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
@@ -1291,6 +1300,30 @@ namespace motion
         }
         object.Insert(L"scenes", scenes);
         write_text_atomic(path, object.Stringify().c_str());
+    }
+
+    void save_settings_with_playback_merge(fs::path const& path, Settings& settings,
+        bool activePlaybackExplicit)
+    {
+        JsonWriteLock lock(path);
+        if (!activePlaybackExplicit && fs::exists(path)) {
+            auto current = load_settings(path);
+            if (!current) throw std::runtime_error("cannot merge playback into invalid settings");
+            settings.activePlaybackEnabled = current->activePlaybackEnabled;
+        }
+        auto scene = find_scene_profile(settings, settings.activeSceneId);
+        if (!scene || !scene_profile_matches_settings(*scene, settings)) settings.activeSceneId.clear();
+        save_settings(path, settings);
+    }
+
+    Settings update_active_playback(fs::path const& path, std::optional<bool> enabled)
+    {
+        JsonWriteLock lock(path);
+        auto current = load_settings(path);
+        if (!current) throw std::runtime_error("cannot update playback in invalid settings");
+        current->activePlaybackEnabled = enabled.value_or(!current->activePlaybackEnabled);
+        save_settings_with_playback_merge(path, *current, true);
+        return *current;
     }
 
     std::optional<RuntimeState> load_runtime(fs::path const& path)

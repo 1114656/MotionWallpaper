@@ -41,14 +41,14 @@ namespace motion::app
         }
         // Create the first-run document or canonicalize a schema version that
         // this binary successfully parsed and migrated in memory.
-        motion::save_settings(path_, settings);
+        motion::save_settings_with_playback_merge(path_, settings);
         ApplyStartupPreference(settings.startWithWindows);
         return settings;
     }
 
-    bool SettingsStore::Save(motion::Settings const& settings) const
+    bool SettingsStore::Save(motion::Settings& settings, bool activePlaybackExplicit) const
     {
-        motion::save_settings(path_, settings);
+        motion::save_settings_with_playback_merge(path_, settings, activePlaybackExplicit);
         ApplyStartupPreference(settings.startWithWindows);
         return motion::notify_settings_changed();
     }

@@ -842,9 +842,9 @@ namespace motion::agent
             auto trust = AcquireLibraryTrust();
             if (libraryTrust_ && !trust) return {};
             auto sourceResult = [&](bool performanceCopyRequired = false,
-                bool performanceCopyPending = false) -> ResolvedVideoPath {
+                bool performanceCopyPending = false, std::string reason = {}) -> ResolvedVideoPath {
                 return { source, RetainLibraryPlaybackLease(trust, acquirePlaybackLease),
-                    performanceCopyRequired, performanceCopyPending };
+                    performanceCopyRequired, performanceCopyPending, false, std::move(reason) };
             };
             if (source.empty()) return {};
             auto stableSource = StablePath(source);
@@ -890,7 +890,8 @@ namespace motion::agent
                 if (selectedPerformanceMode) {
                     auto request = EnsureAutomaticRequest(source.parent_path(), mode,
                         motion::VariantProgressState::queued);
-                    if (request) FailGeneration(source.parent_path(), request);
+                    if (request) FailGeneration(source.parent_path(), request, {},
+                        "视频信息读取失败，请检查源文件和视频工具后重试。");
                 }
                 return sourceResult(true);
             }
@@ -928,12 +929,14 @@ namespace motion::agent
             // not adoption of an already validated copy or presentation
             // safety. Once we know a missing copy is genuinely required,
             // retain that fact even when work cannot be queued.
-            if (fs::is_regular_file(motion::variant_cancelled_path(*stableMediaDirectory)) ||
-                motion::variant_generation_paused(*stableMediaDirectory) ||
-                motion::variant_generation_suppressed(*stableMediaDirectory, mode) ||
-                GenerationFailed(source.parent_path(), mode, failureContext)) {
-                return sourceResult(playbackCopyMode);
-            }
+            if (fs::is_regular_file(motion::variant_cancelled_path(*stableMediaDirectory)))
+                return sourceResult(playbackCopyMode, false, "performance-copy-cancelled");
+            if (motion::variant_generation_paused(*stableMediaDirectory))
+                return sourceResult(playbackCopyMode, false, "performance-copy-paused");
+            if (motion::variant_generation_suppressed(*stableMediaDirectory, mode))
+                return sourceResult(playbackCopyMode, false, "performance-copy-deleted");
+            if (GenerationFailed(source.parent_path(), mode))
+                return sourceResult(playbackCopyMode, false, "performance-copy-failed");
             bool battery = on_battery();
             auto durableRequest = selectedPerformanceMode
                 ? EnsureAutomaticRequest(source.parent_path(), mode,
@@ -1045,7 +1048,8 @@ namespace motion::agent
                 rates_[rateKey] = rate;
             }
             if (!rate.width || !rate.height || !rate.numerator || !rate.denominator) {
-                FailGeneration(mediaDirectory, durableRequest);
+                FailGeneration(mediaDirectory, durableRequest, {},
+                    "视频信息读取失败，请检查源文件和视频工具后重试。");
                 return;
             }
             auto dimensions = video_sdr_variant_dimensions(mode, rate.width, rate.height, targetWidth, targetHeight);
@@ -1315,7 +1319,7 @@ namespace motion::agent
 
         [[nodiscard]] bool GenerationFailed(
             fs::path const& configuredMediaDirectory,
-            std::string const& mode, std::string const& context) const noexcept
+            std::string const& mode) const noexcept
         {
             auto access = AcquireStableAccess(configuredMediaDirectory);
             if (!access) return true;
@@ -1326,11 +1330,9 @@ namespace motion::agent
             DWORD read{};
             if (!ReadFile(failure.get(), value, sizeof(value), &read, nullptr)) return true;
             std::string_view record(value, read);
-            if (motion::variant_failure_mode(record) != mode) return false;
-            if (motion::variant_failure_context_matches(record, mode, context)) return true;
-            // Delete only this locked stale failure, never user pause/cancel/
-            // suppression markers or a new record from a concurrent UI retry.
-            return !motion::mark_locked_request_for_deletion(failure.get());
+            // Failures are durable user-visible results. Driver/probe changes
+            // must not silently erase them and restart expensive work.
+            return motion::variant_failure_mode(record) == mode;
         }
 
         // Playback-created work is a real library task: publish one durable,
@@ -1341,56 +1343,9 @@ namespace motion::agent
             fs::path const& configuredMediaDirectory, std::string const& mode,
             motion::VariantProgressState initialState) const noexcept
         {
-            if (!motion::valid_variant_request_mode(mode)) return {};
             auto access = AcquireStableAccess(configuredMediaDirectory);
-            if (!access) return {};
-            auto const& mediaDirectory = access->path;
-            auto blocked = [&] {
-                std::error_code error;
-                return (fs::is_regular_file(
-                            motion::variant_cancelled_path(mediaDirectory), error) && !error) ||
-                    motion::variant_generation_paused(mediaDirectory) ||
-                    motion::variant_generation_suppressed(mediaDirectory, mode) ||
-                    motion::variant_failure_mode(motion::read_small_file(
-                        motion::variant_failed_path(mediaDirectory))) == mode;
-            };
-            if (blocked()) return {};
-
-            auto current = motion::read_variant_generation_request(mediaDirectory);
-            if (current) return current.mode == mode ? current :
-                motion::VariantGenerationRequest{};
-
-            motion::VariantGenerationRequest created{
-                mode, motion::new_variant_request_id() };
-            auto serialized = motion::serialize_variant_request(created);
-            if (serialized.empty()) return {};
-            motion::unique_handle request(CreateFileW(
-                motion::variant_request_path(mediaDirectory).c_str(),
-                GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr, CREATE_NEW,
-                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, nullptr));
-            if (!request) {
-                auto error = GetLastError();
-                if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) return {};
-                current = motion::read_variant_generation_request(mediaDirectory);
-                return current.mode == mode ? current :
-                    motion::VariantGenerationRequest{};
-            }
-            DWORD written{};
-            bool published = WriteFile(request.get(), serialized.data(),
-                    static_cast<DWORD>(serialized.size()), &written, nullptr) &&
-                written == static_cast<DWORD>(serialized.size()) &&
-                FlushFileBuffers(request.get());
-            if (!published) motion::mark_locked_request_for_deletion(request.get());
-            request.reset();
-            if (!published || blocked() ||
-                motion::read_variant_generation_request(mediaDirectory) != created) {
-                return {};
-            }
-            // The request is authoritative even if this optional progress
-            // write loses a race. A later policy pass will repair visibility.
-            motion::write_variant_progress_if_current(
-                mediaDirectory, created, initialState);
-            return created;
+            return access ? motion::ensure_variant_generation_request(access->path, mode, initialState)
+                : motion::VariantGenerationRequest{};
         }
 
         [[nodiscard]] bool GenerationPaused(
@@ -1441,10 +1396,11 @@ namespace motion::agent
         }
 
         bool FailGeneration(fs::path const& configuredMediaDirectory,
-            motion::VariantGenerationRequest const& request, std::string const& context = {}) const noexcept
+            motion::VariantGenerationRequest const& request, std::string const& context = {},
+            std::string const& reason = {}) const noexcept
         {
             auto access = AcquireStableAccess(configuredMediaDirectory);
-            return access && motion::fail_variant_generation(access->path, request, context);
+            return access && motion::fail_variant_generation(access->path, request, context, reason);
         }
 
         [[nodiscard]] bool ReuseEquivalentVariant(fs::path const& configuredSource,
@@ -1759,7 +1715,8 @@ namespace motion::agent
                     condition_.notify_all();
                     continue;
                 }
-                auto transcodeResult = Transcode(request, stop);
+                std::wstring failureReason = L"生成失败，请检查磁盘空间、源文件或显卡驱动后重试。";
+                auto transcodeResult = Transcode(request, stop, failureReason);
                 // No status, cleanup, or cache write is safe after a removable
                 // drive was replaced at the configured path. The Agent notices
                 // the same loss on its next policy loop and joins this worker.
@@ -1804,16 +1761,21 @@ namespace motion::agent
                 }
                 if (succeeded && !accepted) {
                     RemoveVariantIfUnleased(request.destination, nullptr, true);
+                    failureReason = L"生成副本未通过最终播放校验，原视频已保留，请重试。";
                 }
-                if (!succeeded && !paused && request.explicitRequest && !stop.stop_requested() && !obsolete &&
+                if (!accepted && !paused && request.explicitRequest && !stop.stop_requested() && !obsolete &&
                     !cancelled && !suppressed && !superseded) {
+                    auto reasonLength = (std::min)(failureReason.size(), size_t{ 512 });
+                    if (reasonLength && failureReason[reasonLength - 1] >= 0xd800 &&
+                        failureReason[reasonLength - 1] <= 0xdbff) --reasonLength;
                     FailGeneration(
-                        request.source.parent_path(), request.durableRequest, request.failureContext);
+                        request.source.parent_path(), request.durableRequest, request.failureContext,
+                        motion::wide_to_utf8(failureReason.substr(0, reasonLength)));
                 }
                 {
                     std::lock_guard lock(mutex_);
                     active_.reset();
-                    if (!succeeded && !paused && !stop.stop_requested() && !obsolete && !cancelled &&
+                    if (!accepted && !paused && !stop.stop_requested() && !obsolete && !cancelled &&
                         !suppressed && !superseded) failed_.insert(request.Key());
                 }
                 condition_.notify_all();
@@ -1847,7 +1809,7 @@ namespace motion::agent
             }
         }
 
-        VideoTranscodeResult Transcode(Request const& request, std::stop_token stop)
+        VideoTranscodeResult Transcode(Request const& request, std::stop_token stop, std::wstring& failureReason)
         {
             auto operationTrust = AcquireLibraryTrust();
             if (libraryTrust_ && !operationTrust) return VideoTranscodeResult::cancelled;
@@ -1917,6 +1879,7 @@ namespace motion::agent
                 if (!has_transcode_space(directory, *stableSource,
                         { request.width, request.height, request.targetFps, request.duration100ns })) {
                     append_log(logRoot_, L"磁盘空间不足，跳过壁纸优化副本生成。");
+                    failureReason = L"磁盘空间不足，释放空间后可重试。";
                     return VideoTranscodeResult::failed;
                 }
                 auto targetFps = request.targetFps;
@@ -2051,6 +2014,7 @@ namespace motion::agent
                     return result;
                 }
                 if (result != VideoTranscodeResult::succeeded) {
+                    if (!error.empty()) failureReason = error;
                     append_log(logRoot_, copyLabel + L" " +
                         std::to_wstring(request.width) + L"x" + std::to_wstring(request.height) + L" / " +
                         std::to_wstring(targetFps) + L" FPS 不可用: " + error);
@@ -2064,6 +2028,7 @@ namespace motion::agent
                         ? VideoTranscodeResult::paused : VideoTranscodeResult::cancelled;
                 }
                 if (!fs::is_regular_file(temporary) || !fs::file_size(temporary)) {
+                    failureReason = L"转码没有生成有效文件，请查看日志后重试。";
                     removeTemporaryIfTrusted();
                     return VideoTranscodeResult::failed;
                 }
@@ -2090,6 +2055,7 @@ namespace motion::agent
                 }
                 if (!matchingDimensions || !matchingRate || !matchingCodec ||
                     !matchingVisualMetadata || !matchingDuration || !decodesFirstFrame) {
+                    failureReason = L"副本的分辨率、帧率、色彩或播放校验失败，请重试。";
                     append_log(logRoot_, copyLabel + L"校验失败（实际 " +
                         std::to_wstring(actual.width) + L"x" + std::to_wstring(actual.height) + L", " +
                         std::to_wstring(actual.numerator) + L"/" + std::to_wstring(actual.denominator) +
@@ -2106,6 +2072,7 @@ namespace motion::agent
                 }
                 if (!MoveFileExW(temporary.c_str(), destinationAccess->path.c_str(),
                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                    failureReason = L"无法保存完成的副本，请检查目录权限和文件占用后重试。";
                     append_log(logRoot_, L"无法原子发布壁纸优化副本，继续保留上一份可用副本。");
                     removeTemporaryIfTrusted();
                     return VideoTranscodeResult::failed;
