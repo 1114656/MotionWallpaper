@@ -123,6 +123,7 @@ namespace motion::app
         bool EnsureCover(motion::MediaMetadata const& media);
         bool RequestOptimization(motion::MediaMetadata const& media, std::string const& mode,
             bool automatic = false);
+        bool RequestColorCompatibility(motion::MediaMetadata const& media, bool enabled);
         void PauseOptimization(motion::MediaMetadata const& media);
         void ResumeOptimization(motion::MediaMetadata const& media);
         void CancelOptimization(motion::MediaMetadata const& media);

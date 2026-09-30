@@ -216,6 +216,7 @@ namespace
         uint32_t width{};
         uint32_t height{};
         uint32_t refreshRateHz{};
+        motion::agent::VideoColorCapabilities color;
     };
 
     enum class PerformancePreviewStage
@@ -316,7 +317,8 @@ namespace
         bool Apply(Target target, MediaSelection const& media, std::string const& decodeMode,
             std::string const& displayMode, uint32_t frameRateCap,
             std::vector<std::wstring> const& monitorDevices = {},
-            std::wstring const& decodeAdapter = {}, bool originalPlayback = false)
+            std::wstring const& decodeAdapter = {}, bool originalPlayback = false,
+            std::vector<std::wstring> const& coveredDevices = {})
         {
             auto now = std::chrono::steady_clock::now();
             std::wstring requestKey = media.path.wstring() + L"\n" + motion::utf8_to_wide(media.kind) + L"\n" +
@@ -362,10 +364,12 @@ namespace
                 FailAndBackOff();
                 return false;
             }
-            if (target != target_ || (awaitingAck && now - targetSentAt_ >= 2s)) {
-                if (target != target_) targetFirstSentAt_ = now;
+            bool coverageChanged = coveredDevices != coveredDevices_;
+            if (target != target_ || coverageChanged || (awaitingAck && now - targetSentAt_ >= 2s)) {
+                if (target != target_ || coverageChanged) targetFirstSentAt_ = now;
                 target_ = target;
-                targetRevision_ = Send(TargetName(target));
+                coveredDevices_ = coveredDevices;
+                targetRevision_ = Send(TargetName(target), coveredDevices_);
                 targetSentAt_ = now;
             }
             if (TargetReady()) {
@@ -661,7 +665,8 @@ namespace
             return true;
         }
 
-        uint64_t Send(std::string const& command)
+        uint64_t Send(std::string const& command,
+            std::vector<std::wstring> const& coveredDevices = {})
         {
             if (!inputWrite_) return 0;
             uint64_t revision = ++revision_;
@@ -670,7 +675,11 @@ namespace
                 std::scoped_lock lock(healthMutex_);
                 health_.Reset(revision, GetTickCount64());
             }
-            std::string value = command + " " + std::to_string(revision) + "\n";
+            std::string value = command + " " + std::to_string(revision);
+            if (command == "desktop-play") {
+                for (auto const& device : coveredDevices) value += " " + motion::wide_to_utf8(device);
+            }
+            value += '\n';
             DWORD written{};
             if (!WriteFile(inputWrite_.get(), value.data(), static_cast<DWORD>(value.size()), &written, nullptr) ||
                 written != static_cast<DWORD>(value.size())) {
@@ -778,6 +787,7 @@ namespace
         std::wstring decodeAdapter_;
         std::string displayMode_{ "primary" };
         std::vector<std::wstring> monitorDevices_;
+        std::vector<std::wstring> coveredDevices_;
         std::wstring requestedKey_;
         Target target_{ Target::Unknown };
         uint64_t revision_{};
@@ -819,7 +829,12 @@ namespace
         bool hasAlternativeDecodeAdapter{};
         motion::DisplayRefreshRate displayRefreshRate{ 60, 1 };
         std::string performanceCopyReason;
+        motion::agent::VideoColorCapabilities color;
+        bool covered{};
     };
+
+    uint32_t color_key(motion::agent::VideoColorCapabilities color)
+    { return (color.wideColor ? 1u : 0u) | (color.hdr ? 2u : 0u); }
 
     std::vector<DisplayMediaTarget> display_media_targets(fs::path const& wallpapers, motion::Settings const& settings,
         std::string const& defaultGroupId, std::string const& defaultMediaId,
@@ -836,7 +851,10 @@ namespace
             DisplayMediaTarget target{ primary == displays.end() ? std::string{} : primary->id,
                 primary == displays.end() ? std::wstring{} : primary->deviceName,
                 defaultGroupId, defaultMediaId, std::move(defaultMedia), width, height, refreshRate };
-            if (primary != displays.end()) target.displayRefreshRate = motion::effective_display_refresh_rate(*primary);
+            if (primary != displays.end()) {
+                target.displayRefreshRate = motion::effective_display_refresh_rate(*primary);
+                target.color = {primary->advancedColorEnabled, primary->hdrEnabled};
+            }
             return { std::move(target) };
         }
 
@@ -857,6 +875,7 @@ namespace
                     targets.push_back({ display.id, display.deviceName,
                         std::move(groupId), std::move(mediaId), std::move(assigned), width, height, display.refreshRateHz });
                     targets.back().displayRefreshRate = motion::effective_display_refresh_rate(display);
+                    targets.back().color = {display.advancedColorEnabled, display.hdrEnabled};
                     continue;
                 }
             }
@@ -864,6 +883,7 @@ namespace
                 targets.push_back({ display.id, display.deviceName,
                     std::move(groupId), std::move(mediaId), defaultMedia, width, height, display.refreshRateHz });
                 targets.back().displayRefreshRate = motion::effective_display_refresh_rate(display);
+                    targets.back().color = {display.advancedColorEnabled, display.hdrEnabled};
             }
         }
         return targets;
@@ -880,6 +900,8 @@ namespace
             // synthetic square made from unrelated landscape/portrait maxima.
             if (result.width && motion::agent::video_display_aspect(result.width, result.height) !=
                 motion::agent::video_display_aspect(output.targetWidth, output.targetHeight)) continue;
+            if (result.width && result.color != output.color) continue;
+            result.color = output.color;
             result.width = (std::max)(result.width, output.targetWidth);
             result.height = (std::max)(result.height, output.targetHeight);
             result.refreshRateHz = (std::max)(result.refreshRateHz, output.targetRefreshRate);
@@ -891,7 +913,8 @@ namespace
             [](auto const& display) { return display.primary; });
         if (primary == displays.end()) return {};
         return { static_cast<uint32_t>(primary->bounds.right - primary->bounds.left),
-            static_cast<uint32_t>(primary->bounds.bottom - primary->bounds.top), primary->refreshRateHz };
+            static_cast<uint32_t>(primary->bounds.bottom - primary->bounds.top), primary->refreshRateHz,
+            {primary->advancedColorEnabled, primary->hdrEnabled} };
     }
 
     class RendererPool
@@ -997,9 +1020,20 @@ namespace
                 if (!renderer) renderer = std::make_unique<Renderer>(executable_);
                 auto routeTarget = freezeRoute && target != Renderer::Target::ScreensaverPlay
                     ? Renderer::Target::DesktopFreeze : target;
+                std::vector<std::wstring> coveredDevices;
+                bool routeCovered = true;
+                for (auto const& candidate : outputs) {
+                    auto routeDisplay = desiredDisplayKeys.find(candidate.displayId);
+                    if (routeDisplay == desiredDisplayKeys.end() || routeDisplay->second != routeKey) continue;
+                    if (candidate.covered) coveredDevices.push_back(candidate.deviceName);
+                    else routeCovered = false;
+                }
+                if (routeTarget == Renderer::Target::DesktopPlay && routeCovered && !coveredDevices.empty())
+                    routeTarget = Renderer::Target::Paused;
+                if (routeTarget != Renderer::Target::DesktopPlay) coveredDevices.clear();
                 bool applied = renderer->Apply(routeTarget, output->media, decodeMode,
                     primaryOnly ? "primary" : "monitor", routeFrameRateCap,
-                    route.monitorDevices, output->decodeAdapter, output->originalPlayback);
+                    route.monitorDevices, output->decodeAdapter, output->originalPlayback, coveredDevices);
                 auto decode = renderer->DecodeState();
                 auto snapshot = renderer->RuntimeSnapshot();
                 auto failureAction = motion::agent::automatic_decode_failure_action(
@@ -1243,12 +1277,12 @@ namespace
         {
             std::vector<motion::DisplayRuntimeState> result;
             result.reserve(displays.size());
-            bool paused = action == motion::agent::RuntimeAction::DisplayOff ||
+            bool globallyPaused = action == motion::agent::RuntimeAction::DisplayOff ||
                 action == motion::agent::RuntimeAction::Locked ||
                 action == motion::agent::RuntimeAction::Stopped ||
                 action == motion::agent::RuntimeAction::DesktopPaused ||
                 action == motion::agent::RuntimeAction::DesktopFrozen;
-            auto pausedReason = [&]() -> std::string {
+            auto globalPausedReason = [&]() -> std::string {
                 switch (action) {
                 case motion::agent::RuntimeAction::DisplayOff: return "display-off";
                 case motion::agent::RuntimeAction::Locked: return "session-locked";
@@ -1270,11 +1304,16 @@ namespace
                 });
                 if (output == outputs.end()) {
                     state.state = "paused";
-                    state.reason = paused ? pausedReason() :
+                    state.reason = globallyPaused ? globalPausedReason() :
                         (primaryOnly ? "not-targeted" : "no-wallpaper");
                     result.push_back(std::move(state));
                     continue;
                 }
+                bool covered = action == motion::agent::RuntimeAction::DesktopPlay && output->covered;
+                bool paused = globallyPaused || covered;
+                auto pausedReason = [&]() {
+                    return covered ? std::string("desktop-covered") : globalPausedReason();
+                };
                 state.groupId = output->groupId;
                 state.mediaId = output->mediaId;
                 Renderer::Snapshot snapshot;
@@ -1418,7 +1457,9 @@ namespace
                     output.decodeAdapter + L"\n" +
                     std::to_wstring(output.playbackFrameRateCap) + L"\n" +
                     motion::display_refresh_rate_key(output.displayRefreshRate) + L"\n" +
+                    std::to_wstring(color_key(output.color)) + L"\n" +
                     (output.media.sourceBacked ? L"source" : L"derived") + L"\n" +
+                    (output.covered ? L"covered" : L"visible") + L"\n" +
                     (output.performanceCopyRequired ? L"copy-required" : L"copy-ready");
             }
             return key;
@@ -1891,29 +1932,33 @@ namespace
         return true;
     }
 
-    bool window_covers_display(HWND window)
+    std::vector<motion::agent::DisplayCoverage> desktop_coverage()
     {
-        if (!visible_application_window(window)) return false;
-        HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
-        MONITORINFO info{ sizeof(info) };
-        if (!monitor || !GetMonitorInfoW(monitor, &info)) return false;
-        RECT bounds{};
-        if (FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &bounds, sizeof(bounds))) && !GetWindowRect(window, &bounds)) return false;
-        auto windowBounds = window_bounds(bounds);
-        return motion::agent::covers_display(windowBounds, window_bounds(info.rcMonitor)) ||
-            motion::agent::covers_display(windowBounds, window_bounds(info.rcWork));
-    }
-
-    bool desktop_covered()
-    {
-        bool covered{};
+        std::vector<motion::agent::DisplayCoverage> coverage;
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM parameter) -> BOOL {
+            MONITORINFOEXW info{};
+            info.cbSize = sizeof(info);
+            if (GetMonitorInfoW(monitor, &info)) {
+                reinterpret_cast<std::vector<motion::agent::DisplayCoverage>*>(parameter)->push_back({
+                    info.szDevice, window_bounds(info.rcMonitor), window_bounds(info.rcWork) });
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&coverage));
         EnumWindows([](HWND window, LPARAM parameter) -> BOOL {
-            auto result = reinterpret_cast<bool*>(parameter);
-            if (!window_covers_display(window)) return TRUE;
-            *result = true;
-            return FALSE;
-        }, reinterpret_cast<LPARAM>(&covered));
-        return covered;
+            if (!visible_application_window(window)) return TRUE;
+            wchar_t name[128]{};
+            GetClassNameW(window, name, ARRAYSIZE(name));
+            // Our fullscreen screensaver must not pause its own desktop routes
+            // while it is moving back underneath the user's windows.
+            if (!_wcsicmp(name, L"MotionWallpaper.Native.Renderer")) return TRUE;
+            RECT bounds{};
+            if (FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &bounds, sizeof(bounds))) &&
+                !GetWindowRect(window, &bounds)) return TRUE;
+            motion::agent::mark_covered_displays(window_bounds(bounds),
+                *reinterpret_cast<std::vector<motion::agent::DisplayCoverage>*>(parameter));
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&coverage));
+        return coverage;
     }
 
     void enable_eco_qos()
@@ -2069,6 +2114,7 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
             static_cast<uint32_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
         bool physicalVideoDeviceAvailable = physical_video_device_available();
         std::string gpuEnvironment;
+        std::wstring displayColorEnvironment;
         std::string publishedGroupId, publishedMediaId, publishedDecodePath, publishedDecodeReason;
         std::string publishedPerformanceMode, publishedActiveSceneId;
         bool effectiveSettingsActive{};
@@ -2535,16 +2581,29 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 nextOptimizationRequestScan = now + (importedRequests.empty() ? 10s : 1s);
             }
             auto displays = motion::enumerate_displays();
+            std::wstring currentColorEnvironment;
+            for (auto const& display : displays) {
+                currentColorEnvironment += display.deviceName + L":" +
+                    std::to_wstring(display.advancedColorEnabled) + L":" +
+                    std::to_wstring(display.hdrEnabled) + L":" + std::to_wstring(display.sdrWhiteScale) + L";";
+            }
+            if (displayColorEnvironment != currentColorEnvironment) {
+                // Windows may change HDR/ACM without a geometry notification.
+                // Recreate presenters so a prior SDR route cannot mask HDR.
+                renderers.TopologyChanged();
+                displayColorEnvironment = std::move(currentColorEnvironment);
+            }
             auto prepareImported = [&] {
                 if (importedRequests.empty()) return;
                 for (auto const& request : importedRequests) {
                     auto targets = display_media_targets(wallpapers, settings,
                         settings.selectedGroupId, settings.selectedMediaId, request.mode, displays);
                     auto target = optimization_target_size(targets, request.media.id, displays);
-                    std::map<std::pair<uint32_t, uint32_t>, OptimizationTarget> aspects;
+                    std::map<std::tuple<std::pair<uint32_t, uint32_t>, uint32_t>, OptimizationTarget> aspects;
                     for (auto const& output : targets) {
                         if (output.mediaId != request.media.id) continue;
-                        auto& required = aspects[motion::agent::video_display_aspect(output.targetWidth, output.targetHeight)];
+                        auto& required = aspects[{motion::agent::video_display_aspect(output.targetWidth, output.targetHeight), color_key(output.color)}];
+                        required.color = output.color;
                         required.width = (std::max)(required.width, output.targetWidth);
                         required.height = (std::max)(required.height, output.targetHeight);
                         required.refreshRateHz = (std::max)(required.refreshRateHz, output.targetRefreshRate);
@@ -2554,11 +2613,11 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     // a ready landscape copy repeatedly cancels portrait work.
                     for (auto const& [_, required] : aspects) {
                         auto resolved = videoOptimizer->ResolveWithLease(request.media.path, request.mode,
-                            required.width, required.height, required.refreshRateHz, false, false);
+                            required.width, required.height, required.refreshRateHz, false, false, required.color);
                         if (resolved.performanceCopyRequired || resolved.gpuProbePending) { target = required; break; }
                     }
                     videoOptimizer->Prepare(request.media.path, request.mode,
-                        target.width, target.height, target.refreshRateHz);
+                        target.width, target.height, target.refreshRateHz, target.color);
                 }
             };
 
@@ -2901,8 +2960,17 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                 bool holdExistingRenderer = selectedMediaTemporarilyMissing && missingMediaSince &&
                     now - *missingMediaSince < 2s;
                 if (!outputs.empty() || !selectedMediaTemporarilyMissing) missingMediaSince.reset();
+                std::vector<std::wstring> targetDevices;
+                for (auto const& output : outputs) targetDevices.push_back(output.deviceName);
+                auto coverage = motion::agent::select_display_coverage(
+                    settings.continueWhenCovered ? std::vector<motion::agent::DisplayCoverage>{} : desktop_coverage(),
+                    targetDevices);
+                for (auto& output : outputs) {
+                    output.covered = std::find(coverage.coveredDevices.begin(), coverage.coveredDevices.end(),
+                        output.deviceName) != coverage.coveredDevices.end();
+                }
                 auto state = motion::agent::reduce_runtime_action(settings,
-                    { true, false, desktop_covered(), !outputs.empty(), screensaverIdle.count() / 1000 });
+                    { true, false, coverage.allCovered, !outputs.empty(), screensaverIdle.count() / 1000 });
                 if (outputs.empty()) trayControls.CancelScreensaverPreview();
                 if (trayControls.ScreensaverPreviewActive() && !outputs.empty()) {
                     state = motion::agent::RuntimeAction::ScreensaverPlay;
@@ -2927,15 +2995,16 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                     onBattery, powerSaverNeedsPriority || !importedRequests.empty(), playbackIdle);
                 auto resolveVideoOutputs = [&](bool onlySoftwareTargets = false,
                     bool allowGenerationRequest = false) {
-                    using ResolveKey = std::tuple<std::wstring, bool, std::pair<uint32_t, uint32_t>>;
+                    using ResolveKey = std::tuple<std::wstring, bool, std::pair<uint32_t, uint32_t>, uint32_t>;
                     std::map<ResolveKey, OptimizationTarget> requiredVideoTargets;
                     for (auto const& output : outputs) {
                         if (output.media.kind != "video" || !output.media.sourceBacked) continue;
                         if (onlySoftwareTargets && !output.softwarePlaybackTarget) continue;
                         auto key = ResolveKey{ output.media.path.wstring(),
                             output.softwarePlaybackTarget,
-                            motion::agent::video_display_aspect(output.targetWidth, output.targetHeight) };
+                            motion::agent::video_display_aspect(output.targetWidth, output.targetHeight), color_key(output.color) };
                         auto& required = requiredVideoTargets[key];
+                        required.color = output.color;
                         auto profile = motion::agent::software_playback_profile(
                             output.softwarePlaybackTarget,
                             logicalProcessors, output.targetWidth, output.targetHeight,
@@ -2953,11 +3022,11 @@ int WINAPI wWinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int)
                         auto source = output.media.path;
                         auto const required = requiredVideoTargets[{ source.wstring(),
                             output.softwarePlaybackTarget,
-                            motion::agent::video_display_aspect(output.targetWidth, output.targetHeight) }];
+                            motion::agent::video_display_aspect(output.targetWidth, output.targetHeight), color_key(output.color) }];
                         auto resolved = videoOptimizer->ResolveWithLease(source, settings.performanceMode,
                             required.width, required.height, required.refreshRateHz,
                             output.softwarePlaybackTarget,
-                            allowGenerationRequest);
+                            allowGenerationRequest, required.color);
                         output.performanceCopyRequired =
                             resolved.performanceCopyRequired;
                         output.performanceCopyPending =

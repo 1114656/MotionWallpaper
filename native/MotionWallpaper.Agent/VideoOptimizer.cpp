@@ -47,6 +47,7 @@ namespace
         uint32_t encodedHeight{};
         uint64_t duration100ns{};
         bool matchesSdrOutput{};
+        motion::VideoProbeInfo info;
         uint32_t profile{};
         bool profileKnown{};
         motion::agent::VideoSourceCodec codec{ motion::agent::VideoSourceCodec::Unknown };
@@ -56,6 +57,8 @@ namespace
     {
         uint32_t width{}, height{}, targetFps{};
         uint64_t duration100ns{};
+        motion::agent::VideoColorOptions colorOptions;
+        motion::VideoProbeInfo sourceInfo;
         bool operator==(VariantValidationSpec const&) const = default;
     };
 
@@ -106,6 +109,7 @@ namespace
         auto info = motion::probe_video(ffmpeg, source, 10000, cancelled);
         if (!info) return {};
         SourceRate result;
+        result.info = *info;
         result.numerator = info->frameRateNumerator;
         result.denominator = info->frameRateDenominator;
         result.width = info->width;
@@ -670,7 +674,7 @@ namespace
                     auto name = entries->path().filename().wstring();
                     if (!name.starts_with(variant_prefix(mode)) || name.ends_with(L".part.mp4") ||
                         entries->path().extension() != L".mp4") continue;
-                    Candidate candidate{ entries->path(), name.ends_with(L"-v7.mp4"),
+                    Candidate candidate{ entries->path(), motion::variant_policy_version(name) >= 7,
                         entries->last_write_time(itemError) };
                     if (itemError) continue;
                     if (!keep || (candidate.currentPolicy && !keep->currentPolicy) ||
@@ -791,6 +795,8 @@ namespace motion::agent
             bool softwareFallbackAllowed{ true };
             bool softwarePlaybackTarget{};
             std::string failureContext;
+            VideoColorOptions colorOptions;
+            motion::VideoProbeInfo sourceInfo;
 
             [[nodiscard]] std::wstring Key() const
             {
@@ -837,7 +843,7 @@ namespace motion::agent
         ResolvedVideoPath ResolveWithLease(fs::path const& source, std::string const& requestedMode,
             uint32_t targetWidth, uint32_t targetHeight, uint32_t targetRefreshRate,
             bool softwarePlaybackTarget, bool acquirePlaybackLease,
-            bool allowGenerationRequest)
+            bool allowGenerationRequest, VideoColorCapabilities colorCapabilities)
         {
             auto trust = AcquireLibraryTrust();
             if (libraryTrust_ && !trust) return {};
@@ -855,6 +861,8 @@ namespace motion::agent
             // selection. It must never adopt or generate a replacement.
             if (requestedMode == "original") return sourceResult();
             auto mode = softwarePlaybackTarget ? std::string("cpu-smooth") : requestedMode;
+            VideoColorOptions colorOptions{mode == "balanced", colorCapabilities,
+                mode == "balanced" && motion::variant_compatibility_color_enabled(*stableMediaDirectory)};
             bool selectedPerformanceMode = !softwarePlaybackTarget &&
                 (mode == "balanced" || mode == "power-saver");
             bool playbackCopyMode = selectedPerformanceMode || softwarePlaybackTarget;
@@ -883,7 +891,8 @@ namespace motion::agent
                 mode, dimensions.first, dimensions.second,
                 rate.numerator, rate.denominator,
                 targetRefreshRate);
-            bool codecNeedsVariant = !rate.matchesSdrOutput;
+            decision.fileName = video_color_variant_name(decision.fileName, colorOptions);
+            bool codecNeedsVariant = !rate.matchesSdrOutput || colorOptions.compatibility;
             if (!video_needs_variant(rate.numerator, rate.denominator, decision.targetFps,
                 rate.width, rate.height, dimensions.first, dimensions.second) && !codecNeedsVariant) return sourceResult();
             if (!rate.width || !rate.height || !rate.numerator || !rate.denominator) {
@@ -900,7 +909,7 @@ namespace motion::agent
 
             std::shared_ptr<void> playbackLease;
             auto playbackLeaseOutput = acquirePlaybackLease ? &playbackLease : nullptr;
-            VariantValidationSpec expected{ dimensions.first, dimensions.second, decision.targetFps, rate.duration100ns };
+            VariantValidationSpec expected{ dimensions.first, dimensions.second, decision.targetFps, rate.duration100ns, colorOptions, rate.info };
             if (TryAdoptVariant(source, mode, destination, expected, playbackLeaseOutput, trust)) {
                 return { destination, std::move(playbackLease), false, false };
             }
@@ -948,6 +957,8 @@ namespace motion::agent
             if (selectedPerformanceMode && !durableRequest) {
                 return sourceResult(true);
             }
+            if (mode == "balanced" && motion::variant_compatibility_color_enabled(*stableMediaDirectory) !=
+                    colorOptions.compatibility) return sourceResult(true);
             bool performanceCopyPending{};
             {
                 std::lock_guard lock(mutex_);
@@ -975,7 +986,7 @@ namespace motion::agent
                         durableRequest, currentGeneration,
                         static_cast<bool>(durableRequest),
                         true,
-                        softwarePlaybackTarget, failureContext });
+                        softwarePlaybackTarget, failureContext, colorOptions, rate.info });
                     if (softwarePlaybackTarget) {
                         append_log(logRoot_, L"源视频无法直接播放，已排队生成 H.264 兼容副本: " +
                             source.filename().wstring());
@@ -1006,7 +1017,7 @@ namespace motion::agent
         }
 
         void Prepare(fs::path const& source, std::string const& mode,
-            uint32_t targetWidth, uint32_t targetHeight, uint32_t targetRefreshRate)
+            uint32_t targetWidth, uint32_t targetHeight, uint32_t targetRefreshRate, VideoColorCapabilities colorCapabilities)
         {
             auto trust = AcquireLibraryTrust();
             if (libraryTrust_ && !trust) return;
@@ -1015,11 +1026,15 @@ namespace motion::agent
             auto stableSource = StablePath(source);
             auto stableMediaDirectory = StablePath(mediaDirectory);
             if (!stableSource || !stableMediaDirectory) return;
+            VideoColorOptions colorOptions{mode == "balanced", colorCapabilities,
+                mode == "balanced" && motion::variant_compatibility_color_enabled(*stableMediaDirectory)};
             auto durableRequest = motion::read_variant_generation_request(*stableMediaDirectory);
             if (durableRequest.mode != mode) return;
             auto durableRequestIsCurrent = [&] {
                 if (!LibraryTrusted()) return false;
                 return motion::read_variant_generation_request(*stableMediaDirectory) == durableRequest &&
+                    (mode != "balanced" || motion::variant_compatibility_color_enabled(*stableMediaDirectory) ==
+                        colorOptions.compatibility) &&
                     !fs::is_regular_file(motion::variant_cancelled_path(*stableMediaDirectory)) &&
                     !motion::variant_generation_paused(*stableMediaDirectory) &&
                     !motion::variant_generation_suppressed(*stableMediaDirectory, mode);
@@ -1055,8 +1070,9 @@ namespace motion::agent
             auto dimensions = video_sdr_variant_dimensions(mode, rate.width, rate.height, targetWidth, targetHeight);
             auto decision = video_variant_decision(mode, dimensions.first, dimensions.second,
                 rate.numerator, rate.denominator, targetRefreshRate);
+            decision.fileName = video_color_variant_name(decision.fileName, colorOptions);
             if (!durableRequestIsCurrent()) return;
-            if (rate.matchesSdrOutput && !video_needs_variant(rate.numerator, rate.denominator, decision.targetFps,
+            if (!colorOptions.compatibility && rate.matchesSdrOutput && !video_needs_variant(rate.numerator, rate.denominator, decision.targetFps,
                 rate.width, rate.height, dimensions.first, dimensions.second)) {
                 CompleteGeneration(mediaDirectory, durableRequest);
                 return;
@@ -1065,7 +1081,7 @@ namespace motion::agent
             auto inventory = video_gpu_inventory_async();
             if (inventory.pending) return;
             auto failureContext = FailureContext(*stableSource, destination, inventory);
-            VariantValidationSpec expected{ dimensions.first, dimensions.second, decision.targetFps, rate.duration100ns };
+            VariantValidationSpec expected{ dimensions.first, dimensions.second, decision.targetFps, rate.duration100ns, colorOptions, rate.info };
             if (TryAdoptVariant(source, mode, destination, expected)) {
                 CompleteGeneration(mediaDirectory, durableRequest);
                 return;
@@ -1111,7 +1127,7 @@ namespace motion::agent
                         pending_.push_back(Request{ source, destination, decision.targetFps,
                             dimensions.first, dimensions.second, rate.duration100ns, mode,
                             durableRequest, generation_.load(std::memory_order_relaxed), true,
-                            true, false, failureContext });
+                            true, false, failureContext, colorOptions, rate.info });
                         condition_.notify_one();
                     }
                     publishState = motion::VariantProgressState::queued;
@@ -1371,6 +1387,13 @@ namespace motion::agent
             return fs::is_regular_file(motion::variant_cancelled_path(*stable), error) && !error;
         }
 
+        [[nodiscard]] bool ColorRequestCurrent(Request const& request) const noexcept
+        {
+            if (request.mode != "balanced") return true;
+            auto stable = StablePath(request.source.parent_path());
+            return stable && motion::variant_compatibility_color_enabled(*stable) == request.colorOptions.compatibility;
+        }
+
         bool WriteProgress(fs::path const& configuredMediaDirectory,
             motion::VariantGenerationRequest const& request,
             motion::VariantProgressState state, uint32_t percent = 0,
@@ -1600,11 +1623,16 @@ namespace motion::agent
             // process wait. Invalid fingerprints are remembered too so a
             // damaged cache is not probed again on every policy iteration.
             auto actual = source_rate(ffmpeg_, stableDestination, cancelled);
-            bool valid = actual.matchesSdrOutput &&
+            // v8 BT.709 copies and explicitly validated automatic compatibility
+            // fallbacks remain usable. New encodes additionally enforce the
+            // exact attempted profile in VideoTranscoder before publication.
+            bool valid = video_matches_color_options(actual.info, expected.sourceInfo, expected.colorOptions, true) &&
                 video_variant_dimensions_match(actual.width, actual.height, expected.width, expected.height) &&
                 video_variant_rate_matches(actual.numerator, actual.denominator, expected.targetFps) &&
                 video_variant_duration_matches(actual.duration100ns, expected.duration100ns, expected.targetFps) &&
-                video_candidate_decodes_first_frame(stableDestination, cancelled);
+                (video_color_requires_builtin({actual.info.bitDepth == 10, actual.info.colorPrimaries,
+                    actual.info.colorTransfer, actual.info.colorSpace}) ? video_candidate_plays_builtin(stableDestination, expected.targetFps, cancelled) :
+                    video_candidate_decodes_first_frame(stableDestination, cancelled));
             if (cancelled()) return false;
             {
                 std::lock_guard lock(mutex_);
@@ -1612,7 +1640,7 @@ namespace motion::agent
                 validatedVariants_[configuredDestination] = {
                     *sourceFingerprint, *variantFingerprint, expected, valid };
             }
-            if (!valid) append_log(logRoot_, L"优化缓存已损坏或不符合 SDR 规格，将重新生成: " +
+            if (!valid) append_log(logRoot_, L"优化缓存已损坏或不符合所需色彩/播放规格，将重新生成: " +
                 configuredDestination.filename().wstring());
             return valid;
         }
@@ -1629,6 +1657,8 @@ namespace motion::agent
             motion::unique_handle pinnedVariant;
             if (!ValidateVariantForAdoption(*stableSource, destinationAccess->path,
                     destination, expected, pinnedVariant)) return false;
+            if (mode == "balanced" && motion::variant_compatibility_color_enabled(*stableMediaDirectory) !=
+                    expected.colorOptions.compatibility) return false;
             bool shouldRetain{};
             bool shouldTouchUseTime{};
             auto now = std::chrono::steady_clock::now();
@@ -1731,7 +1761,7 @@ namespace motion::agent
                 bool succeeded = transcodeResult == VideoTranscodeResult::succeeded;
                 bool paused = transcodeResult == VideoTranscodeResult::paused ||
                     GenerationPaused(request.source.parent_path());
-                bool obsolete = request.generation != generation_.load(std::memory_order_relaxed);
+                bool obsolete = request.generation != generation_.load(std::memory_order_relaxed) || !ColorRequestCurrent(request);
                 bool cancelled = GenerationCancelled(request.source.parent_path());
                 bool suppressed = GenerationSuppressed(
                     request.source.parent_path(), request.mode);
@@ -1743,7 +1773,7 @@ namespace motion::agent
                 bool accepted = succeeded && !paused && !obsolete && !cancelled && !suppressed && !superseded;
                 if (accepted) {
                     accepted = TryAdoptVariant(request.source, request.mode, request.destination,
-                        { request.width, request.height, request.targetFps, request.duration100ns });
+                        { request.width, request.height, request.targetFps, request.duration100ns, request.colorOptions, request.sourceInfo });
                     if (accepted) {
                         if (request.explicitRequest) {
                             WriteProgress(request.source.parent_path(),
@@ -1838,6 +1868,8 @@ namespace motion::agent
                     *stableMediaDirectory);
                 bool cancelled = stop.stop_requested() ||
                     request.generation != generation_.load(std::memory_order_relaxed) ||
+                    (request.mode == "balanced" &&
+                        motion::variant_compatibility_color_enabled(*stableMediaDirectory) != request.colorOptions.compatibility) ||
                     fs::is_regular_file(motion::variant_cancelled_path(*stableMediaDirectory)) ||
                     motion::variant_generation_suppressed(*stableMediaDirectory, request.mode) ||
                     (request.explicitRequest
@@ -1895,6 +1927,9 @@ namespace motion::agent
                         trustLost = true;
                         return false;
                     }
+                    if (request.mode == "balanced" &&
+                        motion::variant_compatibility_color_enabled(*stableMediaDirectory) != request.colorOptions.compatibility)
+                        return false;
                     if (fs::is_regular_file(motion::variant_cancelled_path(*stableMediaDirectory)) ||
                         motion::variant_generation_paused(*stableMediaDirectory) ||
                         motion::variant_generation_suppressed(*stableMediaDirectory, request.mode)) {
@@ -1970,6 +2005,7 @@ namespace motion::agent
                     }
                 };
                 auto validationCancelled = [&] { return control() != VideoTranscodeControl::running; };
+                auto original = source_rate(ffmpeg_, *stableSource, validationCancelled);
                 auto validatePreview = [&](fs::path const& candidate,
                     VideoTranscodeBackend, VideoTranscodeCodec codec) {
                     if (!LibraryTrusted()) {
@@ -1977,12 +2013,16 @@ namespace motion::agent
                         return false;
                     }
                     auto actual = source_rate(ffmpeg_, candidate, validationCancelled);
-                    return codec == VideoTranscodeCodec::H264 && video_variant_dimensions_match(
+                    return actual.info.codecName == (codec == VideoTranscodeCodec::HevcMain10 ? "hevc" : "h264") &&
+                        video_matches_color_options(actual.info, original.info, request.colorOptions, true) && video_variant_dimensions_match(
                             actual.width, actual.height, request.width, request.height) &&
                         video_variant_rate_matches(
                             actual.numerator, actual.denominator, targetFps) &&
-                        actual.matchesSdrOutput && actual.duration100ns > 0 &&
-                        video_candidate_decodes_first_frame(candidate, validationCancelled);
+                        actual.duration100ns > 0 &&
+                        (video_color_requires_builtin({actual.info.bitDepth == 10, actual.info.colorPrimaries,
+                            actual.info.colorTransfer, actual.info.colorSpace}) ?
+                            video_candidate_plays_builtin(candidate, targetFps, validationCancelled) :
+                            video_candidate_decodes_first_frame(candidate, validationCancelled));
                 };
                 auto validateCandidate = [&](fs::path const& candidate,
                     VideoTranscodeBackend backend, VideoTranscodeCodec codec) {
@@ -2007,7 +2047,7 @@ namespace motion::agent
                     control, error, &selectedBackend, request.softwareFallbackAllowed,
                     request.softwarePlaybackTarget, request.duration100ns, publishProgress,
                     validateCandidate, &selectedCodec, pathAccess,
-                    [&](std::wstring const& message) { append_log(logRoot_, message); }, validatePreview);
+                    [&](std::wstring const& message) { append_log(logRoot_, message); }, validatePreview, request.colorOptions);
                 if (trustLost || !LibraryTrusted()) return VideoTranscodeResult::cancelled;
                 if (result == VideoTranscodeResult::cancelled || result == VideoTranscodeResult::paused) {
                     removeTemporaryIfTrusted();
@@ -2041,12 +2081,15 @@ namespace motion::agent
                     actual.numerator, actual.denominator, targetFps);
                 bool matchingDimensions = video_variant_dimensions_match(
                     actual.width, actual.height, request.width, request.height);
-                bool matchingCodec = selectedCodec == VideoTranscodeCodec::H264 &&
-                    actual.codec == VideoSourceCodec::H264;
-                bool matchingVisualMetadata = actual.matchesSdrOutput;
+                bool matchingCodec = actual.codec == (selectedCodec == VideoTranscodeCodec::H264 ?
+                    VideoSourceCodec::H264 : VideoSourceCodec::Hevc);
+                bool matchingVisualMetadata = video_matches_color_options(actual.info, original.info, request.colorOptions, true);
                 bool matchingDuration = video_variant_duration_matches(
                     actual.duration100ns, request.duration100ns, targetFps);
-                bool decodesFirstFrame = video_candidate_decodes_first_frame(temporary, validationCancelled);
+                bool decodesFirstFrame = video_color_requires_builtin({actual.info.bitDepth == 10,
+                    actual.info.colorPrimaries, actual.info.colorTransfer, actual.info.colorSpace}) ?
+                    video_candidate_plays_builtin(temporary, targetFps, validationCancelled) :
+                    video_candidate_decodes_first_frame(temporary, validationCancelled);
                 finalControl = control();
                 if (finalControl != VideoTranscodeControl::running) {
                     removeTemporaryIfTrusted();
@@ -2139,24 +2182,24 @@ namespace motion::agent
         bool softwarePlaybackTarget)
     {
         return impl_->ResolveWithLease(source, performanceMode, targetWidth, targetHeight,
-            targetRefreshRate, softwarePlaybackTarget, false, true).path;
+            targetRefreshRate, softwarePlaybackTarget, false, true, {}).path;
     }
     ResolvedVideoPath VideoOptimizer::ResolveWithLease(fs::path const& source,
         std::string const& performanceMode, uint32_t targetWidth, uint32_t targetHeight,
         uint32_t targetRefreshRate, bool softwarePlaybackTarget,
-        bool allowGenerationRequest)
+        bool allowGenerationRequest, VideoColorCapabilities colorCapabilities)
     {
         return impl_->ResolveWithLease(source, performanceMode, targetWidth, targetHeight,
-            targetRefreshRate, softwarePlaybackTarget, true, allowGenerationRequest);
+            targetRefreshRate, softwarePlaybackTarget, true, allowGenerationRequest, colorCapabilities);
     }
     VideoPlaybackLease VideoOptimizer::AcquirePlaybackLease(fs::path const& path)
     {
         return impl_->AcquirePlaybackLease(path);
     }
     void VideoOptimizer::Prepare(fs::path const& source, std::string const& performanceMode,
-        uint32_t targetWidth, uint32_t targetHeight, uint32_t targetRefreshRate)
+        uint32_t targetWidth, uint32_t targetHeight, uint32_t targetRefreshRate, VideoColorCapabilities colorCapabilities)
     {
-        impl_->Prepare(source, performanceMode, targetWidth, targetHeight, targetRefreshRate);
+        impl_->Prepare(source, performanceMode, targetWidth, targetHeight, targetRefreshRate, colorCapabilities);
     }
     std::wstring VideoOptimizer::SourceHardwareDecodeAdapter(fs::path const& source,
         std::wstring const& preferredAdapter, uint64_t aggregateOutputPixels)

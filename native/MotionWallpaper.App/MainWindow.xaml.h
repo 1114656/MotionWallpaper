@@ -184,6 +184,7 @@ namespace winrt::MotionWallpaper::implementation
         void Navigate(AppPage page);
         void RefreshVariants();
         void RequestVariant(motion::MediaMetadata const& media, std::string const& mode);
+        void ConfirmColorCompatibility(motion::MediaMetadata const& media, bool enabled);
         void SetVariantPaused(motion::MediaMetadata const& media, bool paused);
         void CancelVariant(motion::MediaMetadata const& media);
         void ConfirmDeleteVariantSelection(motion::MediaMetadata const& media, uint8_t selection);

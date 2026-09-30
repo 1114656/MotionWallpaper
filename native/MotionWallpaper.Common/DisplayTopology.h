@@ -46,6 +46,9 @@ namespace motion
         // fractional Hz. refreshRateHz stays the existing integer profile
         // input; this field partitions playback.
         DisplayRefreshRate refreshRate;
+        bool advancedColorEnabled{};
+        bool hdrEnabled{};
+        float sdrWhiteScale{1.0f};
     };
 
     [[nodiscard]] inline DisplayRefreshRate effective_display_refresh_rate(

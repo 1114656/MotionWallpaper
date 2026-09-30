@@ -106,7 +106,7 @@ namespace
         if (reason == "display-off") return L"显示器已关闭";
         if (reason == "session-locked") return L"Windows 已锁定";
         if (reason == "playback-stopped") return L"桌面播放已关闭";
-        if (reason == "desktop-covered") return L"全屏应用正在覆盖桌面";
+        if (reason == "desktop-covered") return L"这块屏幕被其他窗口覆盖，壁纸已自动暂停";
         if (reason == "manual-pause") return L"已从托盘暂停，可点击恢复壁纸或重新开启活动时播放";
         if (reason == "active-playback-disabled") return L"活动时播放已关闭，保留静态画面";
         if (reason == "not-targeted") return L"当前模式不播放到这块屏幕";
@@ -288,6 +288,7 @@ namespace
             append_fingerprint(output, item.status.failedReason);
             append_fingerprint(output, static_cast<uint64_t>(item.status.balancedSuppressed));
             append_fingerprint(output, static_cast<uint64_t>(item.status.powerSaverSuppressed));
+            append_fingerprint(output, static_cast<uint64_t>(item.status.compatibilityColor));
             append_fingerprint(output, item.balanced.files);
             append_fingerprint(output, item.balanced.bytes);
             append_fingerprint(output, static_cast<uint64_t>(item.balanced.sharedStorage));
@@ -1319,6 +1320,8 @@ namespace winrt::MotionWallpaper::implementation
         else if (copyBlocked) RuntimeStatusSummary().Text(std::to_wstring(copyBlocked) + L" 块屏幕显示静态预览，需重新生成性能副本");
         else if (degraded) RuntimeStatusSummary().Text(std::to_wstring(degraded) + L" 块屏幕正在使用兼容播放路径");
         else if (paused && !applied) RuntimeStatusSummary().Text(L"所有屏幕均已暂停");
+        else if (paused) RuntimeStatusSummary().Text(std::to_wstring(applied) + L" 块屏幕已应用，" +
+            std::to_wstring(paused) + L" 块屏幕已暂停");
         else RuntimeStatusSummary().Text(L"所有目标屏幕均已确认应用");
         UpdateOriginalPlaybackWarnings(states);
     }
@@ -2790,6 +2793,31 @@ namespace winrt::MotionWallpaper::implementation
                 panel.Children().Append(heading);
                 panel.Children().Append(detail);
                 panel.Children().Append(action);
+                if (mode == "balanced") {
+                    HyperlinkButton compatibility;
+                    auto compatibilityLabel = item.status.compatibilityColor
+                        ? L"恢复自动生成" : L"颜色异常？兼容生成";
+                    compatibility.Content(box_value(compatibilityLabel));
+                    compatibility.FontSize(12);
+                    compatibility.HorizontalAlignment(HorizontalAlignment::Left);
+                    compatibility.Padding(ThicknessHelper::FromLengths(0, 3, 0, 3));
+                    compatibility.IsEnabled(item.sourceAvailable && !item.status.queued &&
+                        !item.status.generating && !item.status.paused);
+                    Automation::AutomationProperties::SetName(compatibility,
+                        hstring(item.media.name + L"，平衡副本，" + compatibilityLabel));
+                    ToolTipService::SetToolTip(compatibility, box_value(!item.sourceAvailable
+                        ? L"需要保留源文件才能更改生成方式"
+                        : item.status.queued || item.status.generating || item.status.paused
+                            ? L"请等待或取消这个视频的现有任务后再更改"
+                            : item.status.compatibilityColor
+                                ? L"当前使用兼容颜色转换；恢复自动后优先使用通过检查的快速路径"
+                                : L"画面偏灰或颜色异常时，使用兼容颜色转换生成平衡副本"));
+                    compatibility.Click([weak = get_weak(), media = item.media,
+                        enabled = !item.status.compatibilityColor](auto const&, auto const&) {
+                        if (auto self = weak.get()) self->ConfirmColorCompatibility(media, enabled);
+                    });
+                    panel.Children().Append(compatibility);
+                }
                 Grid::SetColumn(panel, column);
                 layout.Children().Append(panel);
             };
@@ -3713,6 +3741,70 @@ namespace winrt::MotionWallpaper::implementation
         } catch (...) {
             ShowStatus(L"无法创建优化任务，请检查媒体库是否可写。", true);
         }
+    }
+
+    void MainWindow::ConfirmColorCompatibility(motion::MediaMetadata const& media, bool enabled)
+    {
+        {
+            auto writeLease = TryAcquireLibraryWrite();
+            if (!writeLease) return;
+            try {
+                auto current = mediaLibrary->VariantStatus(media);
+                if (current.queued || current.generating || current.paused) {
+                    ShowStatus(L"请等待或取消这个视频的现有任务后，再更改生成方式。");
+                    return;
+                }
+                if (!mediaLibrary->SourceAvailable(media)) {
+                    ShowStatus(L"源文件已不存在，无法更改生成方式。", true);
+                    return;
+                }
+                if (current.compatibilityColor == enabled) {
+                    variantViewFingerprint.clear();
+                    RefreshVariants();
+                    return;
+                }
+            } catch (...) {
+                ShowStatus(L"无法读取视频状态，请检查媒体库是否可用。", true);
+                return;
+            }
+        }
+
+        ContentDialog dialog;
+        dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
+        dialog.Title(box_value(enabled ? L"使用兼容方式生成平衡副本？" : L"恢复自动生成平衡副本？"));
+        dialog.Content(box_value(media.name + (enabled
+            ? L"\n\n画面偏灰或颜色异常时，可改用 CPU 进行兼容颜色转换，之后仍尽量由显卡编码。兼容时保留 10-bit，生成可能更慢。\n\n仅影响这个视频的平衡副本；原文件保留，通过检查后会按当前平衡模式自动应用。以后可在此恢复自动生成。"
+            : L"\n\n恢复自动选择通过检查的快速处理方式；必要时仍会使用兼容转换。可复用已有的有效自动平衡副本。\n\n仅影响这个视频的平衡副本，原文件保留。")));
+        dialog.PrimaryButtonText(enabled ? L"兼容生成" : L"恢复自动");
+        dialog.CloseButtonText(L"取消");
+        dialog.DefaultButton(ContentDialogButton::Primary);
+        auto operation = dialog.ShowAsync();
+        operation.Completed([weak = get_weak(), media, enabled](auto const& result,
+            winrt::Windows::Foundation::AsyncStatus status) {
+            if (status != winrt::Windows::Foundation::AsyncStatus::Completed ||
+                result.GetResults() != ContentDialogResult::Primary) return;
+            if (auto self = weak.get()) {
+                auto writeLease = self->TryAcquireLibraryWrite();
+                if (!writeLease) return;
+                try {
+                    if (!self->mediaLibrary->RequestColorCompatibility(media, enabled)) {
+                        self->variantViewFingerprint.clear();
+                        self->RefreshVariants();
+                        self->ShowStatus(L"生成方式未更改：请确认源文件存在、没有进行中的任务，且媒体库可写。", true);
+                        return;
+                    }
+                    if (!motion::notify_settings_changed() || !self->runtimeState.agentProcessId ||
+                        !process_is_running(self->runtimeState.agentProcessId)) self->StartController();
+                    self->variantViewFingerprint.clear();
+                    self->RefreshVariants();
+                    self->ShowStatus(enabled
+                        ? L"已创建兼容平衡副本任务；原文件保留，通过检查后会按当前性能模式自动应用。"
+                        : L"已恢复自动生成；通过检查后会按当前性能模式使用自动平衡副本。");
+                } catch (...) {
+                    self->ShowStatus(L"无法更改生成方式，请检查媒体库是否可写。", true);
+                }
+            }
+        });
     }
 
     void MainWindow::SetVariantPaused(motion::MediaMetadata const& media, bool paused)

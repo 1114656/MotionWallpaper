@@ -2,6 +2,9 @@
 #include "TextEncoding.h"
 
 #include <algorithm>
+#include <dxgi1_6.h>
+#pragma comment(lib, "dxgi.lib")
+#include <wrl/client.h>
 
 namespace motion
 {
@@ -70,7 +73,7 @@ namespace motion
             for (auto const& path : paths) {
                 if (!(path.flags & DISPLAYCONFIG_PATH_ACTIVE) || !path.targetInfo.targetAvailable) continue;
                 auto rate = display_path_refresh_rate(path, modes);
-                if (!rate) continue;
+
                 DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
                 source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
                 source.header.size = sizeof(source);
@@ -82,7 +85,18 @@ namespace motion
                 });
                 // Clone targets share one logical desktop monitor. Follow the
                 // first active path in Windows' priority order for that view.
-                if (display != displays.end() && !display->refreshRate.numerator) display->refreshRate = *rate;
+                if (display == displays.end() || display->refreshRate.numerator) continue;
+                if (rate) display->refreshRate = *rate;
+                DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color{};
+                color.header = { DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, sizeof(color),
+                    path.targetInfo.adapterId, path.targetInfo.id };
+                if (DisplayConfigGetDeviceInfo(&color.header) == ERROR_SUCCESS)
+                    display->advancedColorEnabled = color.advancedColorEnabled != 0;
+                DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+                white.header = { DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, sizeof(white),
+                    path.targetInfo.adapterId, path.targetInfo.id };
+                if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel)
+                    display->sdrWhiteScale = std::clamp(white.SDRWhiteLevel / 1000.f, 1.f, 12.5f);
             }
         }
 
@@ -127,6 +141,27 @@ namespace motion
         std::vector<DisplayTarget> displays;
         EnumDisplayMonitors(nullptr, nullptr, collect_display, reinterpret_cast<LPARAM>(&displays));
         collect_precise_refresh_rates(displays);
+        // The legacy AdvancedColor flag also covers WCG SDR. Determine HDR
+        // from the current DXGI signal color space, not panel marketing/EDID.
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+            for (UINT index = 0; index < 64; ++index) {
+                Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+                if (factory->EnumAdapters1(index, &adapter) != S_OK) break;
+                for (UINT number = 0; number < 64; ++number) {
+                    Microsoft::WRL::ComPtr<IDXGIOutput> output;
+                    if (adapter->EnumOutputs(number, &output) != S_OK) break;
+                    Microsoft::WRL::ComPtr<IDXGIOutput6> modern;
+                    DXGI_OUTPUT_DESC1 desc{};
+                    if (FAILED(output.As(&modern)) || FAILED(modern->GetDesc1(&desc)) || !desc.AttachedToDesktop) continue;
+                    for (auto& display : displays) {
+                        if (_wcsicmp(display.deviceName.c_str(), desc.DeviceName) != 0) continue;
+                        display.hdrEnabled = display.advancedColorEnabled &&
+                            desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                    }
+                }
+            }
+        }
         std::stable_sort(displays.begin(), displays.end(), [](auto const& left, auto const& right) {
             if (left.primary != right.primary) return left.primary;
             if (left.bounds.left != right.bounds.left) return left.bounds.left < right.bounds.left;

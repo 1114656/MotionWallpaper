@@ -21,6 +21,7 @@ namespace motion
         // Coded width/height remain unchanged; callers swap their display
         // dimensions for a 90/270-degree container rotation.
         int rotationDegrees{};
+        bool operator==(VideoProbeInfo const&) const = default;
     };
 
     // ffprobe is distributed alongside ffmpeg. Inspect only the first video

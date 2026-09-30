@@ -1654,6 +1654,28 @@ namespace motion::app
         return motion::request_variant_generation(directory, mode);
     }
 
+    bool MediaLibrary::RequestColorCompatibility(motion::MediaMetadata const& media, bool enabled)
+    {
+        std::scoped_lock lock(mutex_);
+        RequireTrustedLibrary();
+        if (media.kind != "video" || !motion::valid_id(media.id) ||
+            !motion::valid_id(media.groupId)) return false;
+        auto directory = ResolveMediaDirectory(media);
+        RecoverInterruptedVariantDeletions(directory);
+        auto current = motion::load_media(directory / L"metadata.json");
+        if (!current || current->id != media.id || current->kind != "video" ||
+            !motion::safe_file_name(current->fileName)) return false;
+        std::error_code error;
+        if (!fs::is_regular_file(directory / current->fileName, error) || error) return false;
+        auto status = motion::inspect_variant_cache(directory);
+        if (status.queued || status.generating || status.paused) return false;
+        if (status.compatibilityColor == enabled) return false;
+        RequireTrustedLibrary();
+        // Common publishes the preference and a fresh request token together,
+        // without replacing work concurrently queued by the agent.
+        return motion::request_variant_color_compatibility(directory, enabled);
+    }
+
     void MediaLibrary::PauseOptimization(motion::MediaMetadata const& media)
     {
         std::scoped_lock lock(mutex_);

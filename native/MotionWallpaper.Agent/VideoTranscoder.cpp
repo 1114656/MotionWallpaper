@@ -114,7 +114,7 @@ namespace
         std::wstring const& hardwareType, std::wstring const& deviceName,
         uint32_t dxgiAdapterIndex, std::wstring const& format, bool hardwareDecode,
         std::wstring const& downloadFormat, std::wstring const& colorFilter, bool upload = true,
-        bool gpuScale = false)
+        bool gpuScale = false, std::wstring const& gpuColorMetadata = {})
     {
         std::wstring specification;
         if (hardwareType == L"qsv") {
@@ -151,7 +151,7 @@ namespace
             // the selected physical GPU through resize and hardware encode.
             filter += hardwareType == L"qsv" ? L",scale_qsv=w=" : L",scale_d3d11=width=";
             filter += std::to_wstring(width) + (hardwareType == L"qsv" ? L":h=" : L":height=") + std::to_wstring(height) +
-                L":format=nv12,setsar=1,sidedata=mode=delete";
+                L":format=" + format + L",setsar=1,sidedata=mode=delete," + gpuColorMetadata;
             arguments.push_back(std::move(filter));
             return;
         }
@@ -183,7 +183,8 @@ namespace
         motion::agent::VideoTranscodeRateControl const& rate,
         bool hardwareDecode, std::wstring const& downloadFormat,
         std::wstring const& colorFilter, std::wstring const& frameRate, bool preview = false,
-        bool gpuScale = false, uint32_t cudaIndex = 0)
+        bool gpuScale = false, uint32_t cudaIndex = 0,
+        motion::agent::VideoColorProfile const& color = {})
     {
         using motion::agent::VideoTranscodeBackend;
         using motion::agent::VideoTranscodeCodec;
@@ -193,6 +194,7 @@ namespace
             std::to_wstring(motion::agent::video_transcode_worker_threads(std::thread::hardware_concurrency())), L"-y"
         };
         bool h264 = codec == VideoTranscodeCodec::H264;
+        auto gpuColorMetadata = gpuScale ? video_gpu_color_metadata_filter(color).value() : std::wstring{};
         auto backend = candidate.backend;
         switch (backend) {
         case VideoTranscodeBackend::nvidiaNvenc:
@@ -202,7 +204,12 @@ namespace
                     L"-hwaccel", L"cuda", L"-hwaccel_device", L"mwm_cuda", L"-hwaccel_output_format", L"cuda",
                     L"-i", source.wstring(), L"-map", L"0:v:0", L"-map_metadata", L"-1", L"-an", L"-vf",
                     L"fps=" + frameRate + L",scale_cuda=w=" + std::to_wstring(width) + L":h=" + std::to_wstring(height) +
-                    L":format=nv12:interp_algo=lanczos:passthrough=0,setsar=1,sidedata=mode=delete"
+                    // The pinned FFmpeg generic CUDA kernels corrupt P010
+                    // frames on Pascal. The tested fixed kernels preserve
+                    // 10-bit samples for both identity copies and downscales.
+                    // Keep a separate output pool to release decode surfaces.
+                    L":format=" + (h264 ? std::wstring(L"nv12") : std::wstring(L"p010le")) +
+                    L":interp_algo=lanczos:passthrough=0:use_filters=0,setsar=1,sidedata=mode=delete," + gpuColorMetadata
                 });
             } else {
                 append_hardware_upload_input(arguments, source, width, height, frameRate,
@@ -219,7 +226,7 @@ namespace
         case VideoTranscodeBackend::intelQsv:
             append_hardware_upload_input(arguments, source, width, height, frameRate,
                 L"qsv", L"mwm_qsv", candidate.adapter.dxgiAdapterIndex,
-                h264 ? L"nv12" : L"p010le", hardwareDecode, downloadFormat, colorFilter, true, gpuScale);
+                h264 ? L"nv12" : L"p010le", hardwareDecode, downloadFormat, colorFilter, true, gpuScale, gpuColorMetadata);
             arguments.insert(arguments.end(), {
                 L"-c:v", h264 ? L"h264_qsv" : L"hevc_qsv",
                 L"-preset", L"medium", L"-profile:v", h264 ? L"high" : L"main10"
@@ -229,7 +236,7 @@ namespace
         case VideoTranscodeBackend::amdAmf:
             append_hardware_upload_input(arguments, source, width, height, frameRate,
                 L"d3d11va", L"mwm_amf", candidate.adapter.dxgiAdapterIndex,
-                h264 ? L"nv12" : L"p010le", hardwareDecode, downloadFormat, colorFilter, true, gpuScale);
+                h264 ? L"nv12" : L"p010le", hardwareDecode, downloadFormat, colorFilter, true, gpuScale, gpuColorMetadata);
             arguments.insert(arguments.end(), {
                 L"-c:v", h264 ? L"h264_amf" : L"hevc_amf",
                 L"-usage", L"transcoding", L"-quality", L"balanced",
@@ -258,10 +265,22 @@ namespace
             append_bounded_rate(arguments, rate);
             break;
         }
+        // Some encoder wrappers (notably OpenH264) omit primaries/transfer
+        // from their SPS even when AVCodecContext is tagged. Write matching
+        // VUI explicitly, so a valid fallback is not rejected as untagged.
+        if (h264) {
+            auto primaries = color.primaries == "smpte432" ? 12 : color.primaries == "bt2020" ? 9 : 1;
+            auto transfer = color.transfer == "bt470m" ? 4 : color.transfer == "iec61966-2-1" ? 13 :
+                color.transfer == "bt2020-10" ? 14 : 1;
+            auto matrix = color.matrix == "bt2020nc" ? 9 : 1;
+            arguments.insert(arguments.end(), {L"-bsf:v", L"h264_metadata=colour_primaries=" +
+                std::to_wstring(primaries) + L":transfer_characteristics=" + std::to_wstring(transfer) +
+                L":matrix_coefficients=" + std::to_wstring(matrix) + L":video_full_range_flag=0"});
+        }
         if (preview) arguments.insert(arguments.end(), { L"-t", L"2" });
         arguments.insert(arguments.end(), {
-            L"-color_primaries", L"bt709", L"-color_trc", L"bt709",
-            L"-colorspace", L"bt709", L"-color_range", L"tv",
+            L"-color_primaries", motion::utf8_to_wide(color.primaries), L"-color_trc", motion::utf8_to_wide(color.transfer),
+            L"-colorspace", motion::utf8_to_wide(color.matrix), L"-color_range", L"tv",
             L"-r", frameRate, L"-fps_mode", L"cfr", L"-tag:v",
             h264 ? L"avc1" : L"hvc1",
             L"-movflags", L"+faststart", destination.wstring()
@@ -801,6 +820,21 @@ namespace motion::agent
         }
     }
 
+    bool video_candidate_plays_builtin(fs::path const& candidate, uint32_t targetFps,
+        std::function<bool()> const& cancelled) noexcept
+    {
+        try {
+            std::wstring executable(32768, L'\0');
+            auto length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+            if (!length || length >= executable.size()) return false;
+            executable.resize(length);
+            auto renderer = fs::path(executable).parent_path() / L"motionwallpaper-renderer.exe";
+            return motion::media_tool_detail::run_bounded(renderer,
+                { L"--probe-builtin-playback", candidate.wstring(), std::to_wstring(targetFps) },
+                20000, cancelled).has_value();
+        } catch (...) { return false; }
+    }
+
     VideoTranscodeResult transcode_video(
         fs::path const& ffmpeg,
         fs::path const& source,
@@ -819,7 +853,8 @@ namespace motion::agent
         VideoTranscodeCodec* selectedCodec,
         VideoTranscodePathAccess const& pathAccess,
         std::function<void(std::wstring const&)> const& diagnostic,
-        VideoTranscodeCandidateValidator const& validatePreview)
+        VideoTranscodeCandidateValidator const& validatePreview,
+        VideoColorOptions colorOptions, bool preferTenBit)
     {
         if (selectedBackend) selectedBackend->clear();
         std::error_code fileError;
@@ -852,13 +887,19 @@ namespace motion::agent
             return VideoTranscodeResult::unsupported;
         }
         probeAccess.reset();
-        auto colorPlan = video_transcode_color_plan(*sourceInfo, width, height);
+        if (softwarePlaybackTarget) colorOptions = {};
+        bool tryTenBit = colorOptions.adaptive && preferTenBit && sourceInfo->bitDepth >= 10;
+        auto color = video_color_profile(*sourceInfo, colorOptions, tryTenBit);
+        auto colorPlan = video_transcode_color_plan(*sourceInfo, width, height, VideoColorOutput::Bt709Video, color);
         if (!colorPlan) {
             error = L"源视频色彩信息不明确或不受支持，无法安全转换为 SDR 副本";
             return VideoTranscodeResult::unsupported;
         }
         if (diagnostic) {
-            if (colorPlan->toneMapped) diagnostic(L"HDR 副本采用线性光色调映射，输出为 8-bit BT.709 SDR");
+            diagnostic(L"副本色彩目标: " + std::to_wstring(color.tenBit ? 10 : 8) + L"-bit / " +
+                motion::utf8_to_wide(color.primaries + " / " + color.transfer));
+            if (colorOptions.compatibility) diagnostic(L"兼容副本：保留 CPU 色彩转换，规范到 BT.709 SDR；优先使用硬件解码和编码");
+            if (colorPlan->toneMapped) diagnostic(L"HDR 副本采用线性光色调映射，输出为目标色域 SDR");
             else if (colorPlan->assumedSdr) diagnostic(L"源视频部分色彩标记缺失，按常见 SDR 视频约定转换为 BT.709");
         }
         auto effectiveDuration100ns = sourceInfo->duration100ns ? sourceInfo->duration100ns : sourceDuration100ns;
@@ -896,7 +937,8 @@ namespace motion::agent
                 std::lock_guard lock(encoderFailureMutex);
                 if (encoderDriverFailures.contains(failureKey)) continue;
             }
-            auto codec = video_transcode_backend_codec(backend, softwareFallbackAllowed);
+            if (tryTenBit && backend == VideoTranscodeBackend::softwareOpenH264) continue;
+            auto codec = video_transcode_backend_codec(backend, tryTenBit);
             auto backendName = video_transcode_backend_name(backend);
             if (backend != VideoTranscodeBackend::softwareOpenH264) {
                 backendName += codec == VideoTranscodeCodec::H264
@@ -916,7 +958,7 @@ namespace motion::agent
             auto hardwareDecodeAttempts = canHardwareDecode
                 ? hardwareEncoder ? 1u : static_cast<uint32_t>(decoderCandidates.size()) : 0u;
             bool tryGpuScale = hardwareEncoder && canHardwareDecode &&
-                video_gpu_scale_eligible(*sourceInfo, width, height);
+                video_gpu_scale_eligible(*sourceInfo, width, height, color, colorOptions);
             auto decodeAttempts = hardwareDecodeAttempts + 1u + (tryGpuScale ? 1u : 0u);
             for (uint32_t decodeAttempt = 0; decodeAttempt < decodeAttempts; ++decodeAttempt) {
                 bool gpuScale = tryGpuScale && decodeAttempt == 0;
@@ -957,7 +999,7 @@ namespace motion::agent
                 fileError.clear();
                 fs::remove(destination, fileError);
                 auto arguments = transcode_arguments(ffmpeg, source, destination, width, height,
-                    targetFps, boundCandidate, codec, rate, hardwareDecode, downloadFormat, colorPlan->filter, frameRate, true, gpuScale, cudaIndex);
+                    targetFps, boundCandidate, codec, rate, hardwareDecode, downloadFormat, colorPlan->filter, frameRate, true, gpuScale, cudaIndex, color);
                 auto resolvedDurationMicroseconds = effectiveDuration100ns / 10;
                 bool stalled{};
                 bool driverIncompatible{};
@@ -970,17 +1012,16 @@ namespace motion::agent
                     resolvedDurationMicroseconds, {}, resolvedDurationMicroseconds, stalled,
                     driverIncompatible, 45000);
                 if (result == VideoTranscodeResult::succeeded) {
-                    bool previewValid{};
-                    if (validatePreview) {
-                        previewValid = validatePreview(destination, backend, codec);
-                    } else {
-                        auto previewInfo = motion::probe_video(ffmpeg, destination, 10000, cancelled);
-                        previewValid = previewInfo && previewInfo->codecName == "h264" &&
-                            previewInfo->bitDepth == 8 && previewInfo->pixelFormat == "yuv420p" &&
-                            previewInfo->width == width && previewInfo->height == height &&
-                            previewInfo->colorTransfer == "bt709" && previewInfo->colorPrimaries == "bt709" &&
-                            previewInfo->colorSpace == "bt709" && previewInfo->colorRange == "tv" &&
-                            video_candidate_decodes_first_frame(destination, cancelled);
+                    // A caller may accept both the adaptive and compatible
+                    // final profiles. Each attempted graph must still produce
+                    // its own exact declared color, never just plausible tags.
+                    auto previewInfo = motion::probe_video(ffmpeg, destination, 10000, cancelled);
+                    bool previewValid = previewInfo && video_matches_color_profile(*previewInfo, color) &&
+                        previewInfo->width == width && previewInfo->height == height;
+                    if (previewValid) {
+                        previewValid = validatePreview ? validatePreview(destination, backend, codec) :
+                            (video_color_requires_builtin(color) ? video_candidate_plays_builtin(destination, targetFps, cancelled)
+                                : video_candidate_decodes_first_frame(destination, cancelled));
                     }
                     if (!previewValid) {
                         error = backendName + L" 的短片段预检未通过输出格式或 Windows 播放验证";
@@ -1002,7 +1043,7 @@ namespace motion::agent
                         } else {
                             if (boundCandidate.adapterBound) boundCandidate.adapter.dxgiAdapterIndex = *currentIndex;
                             arguments = transcode_arguments(ffmpeg, source, destination, width, height,
-                                targetFps, boundCandidate, codec, rate, hardwareDecode, downloadFormat, colorPlan->filter, frameRate, false, gpuScale, cudaIndex);
+                                targetFps, boundCandidate, codec, rate, hardwareDecode, downloadFormat, colorPlan->filter, frameRate, false, gpuScale, cudaIndex, color);
                             if (diagnostic) diagnostic(gpuScale
                                 ? L"生成优先：硬件解码、GPU 缩放与硬件编码保持在同一显卡，省去内存往返"
                                 : L"生成优先：兼容色彩转换，滤镜线程数 " +
@@ -1066,7 +1107,10 @@ namespace motion::agent
                     fs::remove(destination, fileError);
                     break;
                 }
-                if (validateCandidate && !validateCandidate(destination, backend, codec)) {
+                auto finalInfo = motion::probe_video(ffmpeg, destination, 10000, cancelled);
+                bool exactFinalColor = finalInfo && video_matches_color_profile(*finalInfo, color) &&
+                    finalInfo->width == width && finalInfo->height == height;
+                if (!exactFinalColor || (validateCandidate && !validateCandidate(destination, backend, codec))) {
                     fs::remove(destination, fileError);
                     if (gpuScale) continue;
                     break;
@@ -1084,6 +1128,21 @@ namespace motion::agent
             }
         }
 
+        if (tryTenBit) {
+            if (diagnostic) diagnostic(L"10-bit 硬件编码/播放预检未通过，回退 8-bit；原文件保持不变");
+            return transcode_video(ffmpeg, source, destination, width, height, targetFps, control, error,
+                selectedBackend, softwareFallbackAllowed, softwarePlaybackTarget, sourceDuration100ns,
+                progress, validateCandidate, selectedCodec, pathAccess, diagnostic, validatePreview, colorOptions, false);
+        }
+        if (colorOptions.adaptive && !colorOptions.compatibility) {
+            if (diagnostic) diagnostic(L"自动色彩路径不可用，重试 CPU 色彩转换的 BT.709 SDR 兼容副本；兼容时保留源 10-bit 精度");
+            colorOptions.compatibility = true;
+            // Bit-depth support and color support are independent. Exhaust
+            // adaptive 10/8 first, then normalize color and recheck 10/8.
+            return transcode_video(ffmpeg, source, destination, width, height, targetFps, control, error,
+                selectedBackend, softwareFallbackAllowed, softwarePlaybackTarget, sourceDuration100ns,
+                progress, validateCandidate, selectedCodec, pathAccess, diagnostic, validatePreview, colorOptions, true);
+        }
         error = L"可用的编码后端均不支持该视频规格";
         if (!attemptedBackends.empty()) error += L"（已尝试：" + attemptedBackends + L"）";
         return VideoTranscodeResult::unsupported;

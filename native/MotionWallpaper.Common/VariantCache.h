@@ -19,6 +19,8 @@ namespace motion
 {
     [[nodiscard]] inline int variant_policy_version(std::wstring_view name) noexcept
     {
+        if (name.ends_with(L"-v9.mp4")) return 9;
+        if (name.ends_with(L"-v8.mp4")) return 8;
         if (name.ends_with(L"-v7.mp4")) return 7;
         if (name.ends_with(L"-v6.mp4")) return 6;
         if (name.ends_with(L"-v5.mp4")) return 5;
@@ -80,6 +82,8 @@ namespace motion
         bool estimatedRemainingKnown{};
         bool balancedSuppressed{};
         bool powerSaverSuppressed{};
+        // Per-video balanced fallback; power-saver has its own fixed SDR contract.
+        bool compatibilityColor{};
         uint64_t bytes{};
         uint32_t files{};
         std::vector<VariantCacheFile> entries;
@@ -159,6 +163,11 @@ namespace motion
     inline std::filesystem::path variant_progress_path(std::filesystem::path const& mediaDirectory)
     {
         return mediaDirectory / L".optimization-progress";
+    }
+
+    inline std::filesystem::path variant_compatibility_color_path(std::filesystem::path const& mediaDirectory)
+    {
+        return mediaDirectory / L".optimization-compatible-color";
     }
 
     inline std::filesystem::path variant_suppressed_path(std::filesystem::path const& mediaDirectory,
@@ -275,6 +284,24 @@ namespace motion
         } catch (...) {
             return {};
         }
+    }
+
+    [[nodiscard]] inline bool variant_compatibility_color_enabled(
+        std::filesystem::path const& mediaDirectory) noexcept
+    {
+        return read_small_file(variant_compatibility_color_path(mediaDirectory)) == "compatible-v1";
+    }
+
+    inline bool set_variant_compatibility_color(std::filesystem::path const& mediaDirectory,
+        bool enabled) noexcept
+    {
+        try {
+            auto path = variant_compatibility_color_path(mediaDirectory);
+            if (enabled) return write_small_file(path, "compatible-v1");
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            return !error;
+        } catch (...) { return false; }
     }
 
     [[nodiscard]] inline bool valid_variant_request_mode(std::string_view mode) noexcept
@@ -826,6 +853,7 @@ namespace motion
     {
         VariantCacheStatus result;
         try {
+            result.compatibilityColor = variant_compatibility_color_enabled(mediaDirectory);
             auto request = read_variant_generation_request(mediaDirectory);
             result.requestedMode = request.mode;
             result.queued = !result.requestedMode.empty();
@@ -913,5 +941,47 @@ namespace motion
             }
         } catch (...) {}
         return result;
+    }
+
+    // Reserve the idle request with an exclusive handle. Readers cannot see a
+    // GUID until its color preference is ready, and automatic enqueue cannot
+    // overwrite the reservation. All I/O is scoped by the caller's library lease.
+    inline bool request_variant_color_compatibility(std::filesystem::path const& mediaDirectory,
+        bool enabled) noexcept
+    {
+        try {
+            auto status = inspect_variant_cache(mediaDirectory);
+            if (status.queued || status.generating || status.paused) return false;
+            VariantGenerationRequest request{ "balanced", new_variant_request_id() };
+            auto serialized = serialize_variant_request(request);
+            if (serialized.empty()) return false;
+            unique_handle reservation(CreateFileW(variant_request_path(mediaDirectory).c_str(),
+                GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, nullptr));
+            if (!reservation) return false;
+            DWORD written{};
+            if (!WriteFile(reservation.get(), serialized.data(), static_cast<DWORD>(serialized.size()),
+                    &written, nullptr) || written != serialized.size() || !FlushFileBuffers(reservation.get())) {
+                mark_locked_request_for_deletion(reservation.get());
+                return false;
+            }
+            auto previous = variant_compatibility_color_enabled(mediaDirectory);
+            if (!set_variant_compatibility_color(mediaDirectory, enabled)) {
+                mark_locked_request_for_deletion(reservation.get());
+                return false;
+            }
+            for (auto const& marker : { variant_cancelled_path(mediaDirectory), variant_paused_path(mediaDirectory),
+                    variant_failed_path(mediaDirectory), variant_suppressed_path(mediaDirectory, "balanced") }) {
+                std::error_code error;
+                std::filesystem::remove(marker, error);
+                if (error) {
+                    set_variant_compatibility_color(mediaDirectory, previous);
+                    mark_locked_request_for_deletion(reservation.get());
+                    return false;
+                }
+            }
+            write_variant_progress(mediaDirectory, request, VariantProgressState::queued);
+            return true;
+        } catch (...) { return false; }
     }
 }

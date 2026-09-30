@@ -18,7 +18,8 @@ namespace motion::renderer {
             bool allowSoftware, unsigned displayRate, double resumeSeconds = 0);
         HRESULT Tick(LONGLONG* timestamp);
         HRESULT Size(DWORD* width, DWORD* height) const;
-        HRESULT Draw(ID3D11Texture2D* destination, MFVideoNormalizedRect const& crop);
+        HRESULT Draw(ID3D11Texture2D* destination, MFVideoNormalizedRect const& crop,
+            float sdrWhiteScale = 1.0f, bool hdrOutput = true);
         void Play();
         void Pause();
         double CurrentTime() const;

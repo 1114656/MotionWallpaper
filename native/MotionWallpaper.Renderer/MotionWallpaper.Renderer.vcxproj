@@ -26,7 +26,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile><WarningLevel>Level4</WarningLevel><LanguageStandard>stdcpp20</LanguageStandard><AdditionalIncludeDirectories>$(ProjectDir)..\..\.tools\ffmpeg-sdk\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions></ClCompile>
-    <Link><SubSystem>Console</SubSystem><AdditionalDependencies>d3dcompiler.lib;mfplat.lib;mf.lib;mfreadwrite.lib;mfuuid.lib;windowscodecs.lib;ole32.lib;oleaut32.lib;d3d11.lib;dxgi.lib;dcomp.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><SubSystem>Console</SubSystem><AdditionalDependencies>windowsapp.lib;d3dcompiler.lib;mfplat.lib;mf.lib;mfreadwrite.lib;mfuuid.lib;windowscodecs.lib;ole32.lib;oleaut32.lib;d3d11.lib;dxgi.lib;dcomp.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="Renderer.cpp" /><ClCompile Include="BuiltinVideo.cpp" /></ItemGroup>
   <ItemGroup><ClInclude Include="BuiltinVideo.h" /><ClInclude Include="FfmpegApi.h" /><ClInclude Include="BuiltinVideoShader.h" /></ItemGroup>

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "VideoColorProfile.h"
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -34,11 +35,10 @@ namespace motion::agent
     enum class VideoTranscodeCodec { H264, HevcMain10 };
 
     [[nodiscard]] constexpr VideoTranscodeCodec video_transcode_backend_codec(
-        VideoTranscodeBackend, bool) noexcept
+        VideoTranscodeBackend backend, bool tenBit) noexcept
     {
-        // Performance copies have one presentation contract irrespective of
-        // encoder or source bit depth. Originals are retained separately.
-        return VideoTranscodeCodec::H264;
+        return tenBit && backend != VideoTranscodeBackend::softwareOpenH264
+            ? VideoTranscodeCodec::HevcMain10 : VideoTranscodeCodec::H264;
     }
 
     struct VideoTranscodeAdapter
@@ -132,7 +132,11 @@ namespace motion::agent
         VideoTranscodeCodec* selectedCodec = nullptr,
         VideoTranscodePathAccess const& pathAccess = {},
         std::function<void(std::wstring const&)> const& diagnostic = {},
-        VideoTranscodeCandidateValidator const& validatePreview = {});
+        VideoTranscodeCandidateValidator const& validatePreview = {},
+        VideoColorOptions colorOptions = {}, bool preferTenBit = true);
+
+    [[nodiscard]] bool video_candidate_plays_builtin(std::filesystem::path const& candidate,
+        uint32_t targetFps, std::function<bool()> const& cancelled = {}) noexcept;
 
     // Run by Agent/Tests --probe-video-first-frame before ordinary startup.
     // It is isolated because an installed decoder can hang inside ReadSample.

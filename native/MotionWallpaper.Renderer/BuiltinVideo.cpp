@@ -23,7 +23,7 @@ namespace {
     double now_seconds() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     struct FrameDelete { void operator()(AVFrame* frame) const { if (frame) FfmpegApi::Get().av_frame_free(&frame); } };
     using Frame = std::unique_ptr<AVFrame, FrameDelete>;
-    struct ShaderParameters { std::array<float,4> crop, range, yuv, gamut0, gamut1, gamut2, options, sampling; };
+    struct ShaderParameters { std::array<float,4> crop, range, yuv, gamut0, gamut1, gamut2, options, sampling, output; };
     bool color_parameters(AVFrame const& frame, bool tenBit, ShaderParameters& p) {
         auto& api=FfmpegApi::Get();
         if (api.av_frame_get_side_data(&frame,AV_FRAME_DATA_DOVI_METADATA)) return false;
@@ -442,7 +442,7 @@ HRESULT BuiltinVideo::Size(DWORD* width,DWORD* height) const {
     if(impl_->rotation==90 || impl_->rotation==270)std::swap(*width,*height);
     return *width && *height?S_OK:E_PENDING;
 }
-HRESULT BuiltinVideo::Draw(ID3D11Texture2D* destination,MFVideoNormalizedRect const& crop) {
+HRESULT BuiltinVideo::Draw(ID3D11Texture2D* destination,MFVideoNormalizedRect const& crop, float sdrWhiteScale, bool hdrOutput) {
     if(!impl_ || !destination || !impl_->current)return E_POINTER;
     auto& self=*impl_;
     if(!self.CreateShaders())return E_FAIL;
@@ -451,6 +451,8 @@ HRESULT BuiltinVideo::Draw(ID3D11Texture2D* destination,MFVideoNormalizedRect co
     ComPtr<ID3D11RenderTargetView> target;
     status=self.device->CreateRenderTargetView(destination,nullptr,&target);if(FAILED(status))return status;
     self.params.crop={crop.left,crop.top,crop.right,crop.bottom};
+    self.params.output={description.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1.f : 0.f,
+        std::clamp(sdrWhiteScale, 1.f, 12.5f), hdrOutput ? 1.f : 0.f, 0};
     auto* context=self.context.Get();
     context->UpdateSubresource(self.constants.Get(),0,nullptr,&self.params,0,0);
     D3D11_VIEWPORT viewport{0,0,static_cast<float>(description.Width),static_cast<float>(description.Height),0,1};

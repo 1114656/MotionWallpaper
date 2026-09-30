@@ -146,6 +146,7 @@ $testExecutable = Join-Path $projectRoot 'native\x64\Release\MotionWallpaper.Tes
 # Import/probe integration tests use the exact tools shipped with the app,
 # including when CI skips publishing the UI payload.
 & (Join-Path $PSScriptRoot 'prepare-ffmpeg.ps1') -Destination (Join-Path (Split-Path -Parent $testExecutable) 'Tools\ffmpeg')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'native\x64\Release\MotionWallpaper.App\motionwallpaper-renderer.exe') -Destination (Split-Path -Parent $testExecutable) -Force
 & $testExecutable
 if ($LASTEXITCODE -ne 0) { throw "Native tests failed with exit code $LASTEXITCODE" }
 

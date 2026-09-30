@@ -29,6 +29,7 @@
 #include "LibraryBackupTests.h"
 #include "TranscodeLifecycleTests.h"
 #include "VideoTranscodeColorTests.h"
+#include "ColorCompatibilityRequestTests.h"
 #include "VideoStillPreviewTests.h"
 #include "MediaProbeTests.h"
 #include "OriginalPlaybackRecoveryTests.h"
@@ -37,6 +38,8 @@
 #include "StartupEnvironmentTests.h"
 #include "VideoGpuProbeTests.h"
 #include "RendererPipeTests.h"
+#include "RendererCoverageTests.h"
+#include "DisplayCoverageTests.h"
 #include "SwapChainTimingTests.h"
 #include "DisplayRefreshRoutingTests.h"
 #include "SoftwareVideoTransferTests.h"
@@ -1238,7 +1241,7 @@ namespace
         auto publish = optimizer.find(
             "MoveFileExW(temporary.c_str(), destinationAccess->path.c_str()");
         auto decodeProbe = optimizer.find(
-            "bool decodesFirstFrame = video_candidate_decodes_first_frame(temporary, validationCancelled)");
+            "bool decodesFirstFrame =");
         require(publish != std::string::npos &&
             decodeProbe != std::string::npos && decodeProbe < publish &&
             optimizer.find("validateCandidate, &selectedCodec", prepare) < publish &&
@@ -1247,14 +1250,14 @@ namespace
             optimizer.find("fs::rename(temporary, request.destination") == std::string::npos,
             "a completed performance copy is still published through a delete/rename gap");
         auto candidateVisualCheck = optimizer.find(
-            "actual.matchesSdrOutput && actual.duration100ns > 0", prepare);
+            "video_matches_color_options(actual.info, original.info, request.colorOptions, true)", prepare);
         auto finalVisualCheck = optimizer.find(
-            "matchingVisualMetadata = actual.matchesSdrOutput",
+            "matchingVisualMetadata = video_matches_color_options(actual.info, original.info, request.colorOptions, true)",
             candidateVisualCheck);
         require(optimizer.find("video_matches_sdr_output(") != std::string::npos &&
             candidateVisualCheck != std::string::npos && finalVisualCheck != std::string::npos &&
             candidateVisualCheck < finalVisualCheck && finalVisualCheck < publish,
-            "candidate/final acceptance does not enforce the SDR output contract");
+            "candidate/final acceptance does not enforce the selected color output contract");
         auto finalControlBeforePublish = optimizer.rfind("finalControl = control()", publish);
         auto finalControlAfterPublish = optimizer.find("finalControl = control()", publish);
         auto accepted = optimizer.find("accepted = TryAdoptVariant(");
@@ -2543,7 +2546,7 @@ namespace
             "an automatic playback pass erased a failure and retried without user intent");
         // Windows' H.264 decoder rejects a 32x32 OpenH264 stream; use the
         // existing 64x64 source size for this real playback-validation case.
-        auto cached = mediaDirectory / L"Variants" / L"balanced-30-64x64-v7.mp4";
+        auto cached = mediaDirectory / L"Variants" / L"balanced-30-64x64-adaptive-sdr-v8.mp4";
         fs::create_directories(cached.parent_path());
         std::ofstream(cached, std::ios::binary) << "truncated but nonempty performance copy";
         require(fs::is_regular_file(cached) && fs::file_size(cached) > 0,
@@ -2578,12 +2581,12 @@ namespace
         using motion::agent::VideoTranscodeBackend;
         using motion::agent::VideoTranscodeCodec;
         require(motion::agent::video_transcode_backend_codec(
-            VideoTranscodeBackend::nvidiaNvenc, true) == VideoTranscodeCodec::H264 &&
+            VideoTranscodeBackend::nvidiaNvenc, true) == VideoTranscodeCodec::HevcMain10 &&
             motion::agent::video_transcode_backend_codec(
                 VideoTranscodeBackend::nvidiaNvenc, false) == VideoTranscodeCodec::H264 &&
             motion::agent::video_transcode_backend_codec(
                 VideoTranscodeBackend::softwareOpenH264, false) == VideoTranscodeCodec::H264,
-            "encoder availability changed the portable H.264 output contract");
+            "10-bit hardware preference or explicit H.264 fallback changed");
 
         auto unboundedHevc = motion::agent::video_transcode_rate_control(
             2560, 1440, 60, VideoTranscodeCodec::HevcMain10);
@@ -2657,7 +2660,7 @@ namespace
             acceleratedCpuPlayback[0].backend == VideoTranscodeBackend::nvidiaNvenc &&
             acceleratedCpuPlayback[1].backend == VideoTranscodeBackend::softwareOpenH264 &&
             motion::agent::video_transcode_backend_codec(
-                acceleratedCpuPlayback[0].backend, true) == VideoTranscodeCodec::H264,
+                acceleratedCpuPlayback[0].backend, false) == VideoTranscodeCodec::H264,
             "CPU playback copy did not prefer hardware H.264 before its software fallback");
         require(!motion::agent::video_transcode_backend_order(
             {}, 1920, 1080, 60, true, false, true).empty(),
@@ -4437,7 +4440,7 @@ namespace
             "wallpaper runtime state is published before the Renderer ACK");
         require(agent.find("RendererPool") != std::string::npos && agent.find("display_media_targets") != std::string::npos,
             "per-display renderer routing is no longer active");
-        require(agent.find("EnumWindows(") != std::string::npos && agent.find("desktop_covered()") != std::string::npos,
+        require(agent.find("EnumWindows(") != std::string::npos && agent.find("desktop_coverage()") != std::string::npos,
             "fullscreen coverage regressed to foreground-window-only detection");
     }
 
@@ -4587,13 +4590,80 @@ int wmain(int argc, wchar_t** argv)
         if (phase == L"committed") transaction->CommitPreparedTarget();
         ExitProcess(71);
     }
+    if (argc == 4 && (std::wstring_view(argv[1]) == L"--optimize-video" ||
+        std::wstring_view(argv[1]) == L"--optimize-color-cycle")) {
+        // Explicit integration command; creates only a separate test library.
+        auto library=fs::path(argv[3]);
+        auto media=library/L"Groups"/L"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"/L"Videos"/
+            L"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        fs::create_directories(media);
+        auto source=media/L"source.mov";
+        fs::copy_file(argv[2],source,fs::copy_options::overwrite_existing);
+        motion::agent::VideoOptimizer optimizer(library,library/L"Logs",motion::executable_directory());
+        optimizer.SetGenerationAllowed(true);
+        bool colorCycle = std::wstring_view(argv[1]) == L"--optimize-color-cycle";
+        unsigned phase{};
+        fs::path automaticCopy;
+        auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(150);
+        while(std::chrono::steady_clock::now()<deadline) {
+            optimizer.Prepare(source,"balanced",1920,1080,60);
+            auto result=optimizer.ResolveWithLease(source,"balanced",1920,1080,60);
+            if(!result.performanceCopyRequired && result.path!=source) {
+                auto info=motion::probe_video(motion::ffmpeg_executable_path(motion::executable_directory()),result.path);
+                bool compatible = colorCycle && phase == 1;
+                if(!info || info->width!=1920 || info->height!=1080 ||
+                    !result.path.filename().wstring().ends_with(compatible ? L"-compatible-v9.mp4" : L"-v8.mp4")) return 4;
+                auto again=optimizer.ResolveWithLease(source,"balanced",1920,1080,60);
+                if(again.path!=result.path || again.performanceCopyRequired) return 5;
+                auto original=optimizer.ResolveWithLease(source,"original",1920,1080,60);
+                if(original.path!=source || original.performanceCopyRequired) return 6;
+                std::cout << "adopted=" << motion::wide_to_utf8(result.path.wstring()) << " depth=" << info->bitDepth
+                    << " fps=" << info->frameRateNumerator << '/' << info->frameRateDenominator << std::endl;
+                if (colorCycle && phase < 2) {
+                    if (!phase) automaticCopy = result.path;
+                    else if (info->colorPrimaries != "bt709" || info->colorTransfer != "bt709") return 9;
+                    if (motion::request_variant_color_compatibility(media, !phase)) ++phase;
+                    Sleep(200);
+                    continue;
+                }
+                if (colorCycle && (result.path != automaticCopy ||
+                    motion::variant_compatibility_color_enabled(media))) return 10;
+                return 0;
+            }
+            if(result.performanceCopyReason=="performance-copy-failed")return 7;
+            Sleep(200);
+        }
+        return 8;
+    }
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--test-color-output") {
+        try {
+            fs::create_directories(argv[2]);
+            motion::tests::builtin_scRGB_preserves_highlights_and_gamut(fs::path(argv[2]), require);
+            return 0;
+        } catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 3; }
+    }
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--display-color-capabilities") {
+        for (auto const& d : motion::enumerate_displays()) std::cout << motion::wide_to_utf8(d.deviceName)
+            << " wide=" << d.advancedColorEnabled << " hdr=" << d.hdrEnabled << " white=" << d.sdrWhiteScale
+            << " size=" << d.bounds.right-d.bounds.left << 'x' << d.bounds.bottom-d.bounds.top
+            << " hz=" << d.refreshRateHz << '\n';
+        return 0;
+    }
     if (argc == 8 && (std::wstring_view(argv[1]) == L"--transcode-video" ||
         std::wstring_view(argv[1]) == L"--transcode-reject-first-preview" ||
         std::wstring_view(argv[1]) == L"--transcode-main10-video" ||
+        std::wstring_view(argv[1]) == L"--transcode-balanced-sdr" ||
+        std::wstring_view(argv[1]) == L"--transcode-compatible-sdr" ||
+        std::wstring_view(argv[1]) == L"--transcode-reject-auto-color" ||
+        std::wstring_view(argv[1]) == L"--transcode-fallback8-video" ||
         std::wstring_view(argv[1]) == L"--transcode-cpu-video")) {
         bool cpuPlayback = std::wstring_view(argv[1]) == L"--transcode-cpu-video";
         bool main10 = std::wstring_view(argv[1]) == L"--transcode-main10-video";
         bool rejectFirstPreview = std::wstring_view(argv[1]) == L"--transcode-reject-first-preview";
+        bool balancedSdr = std::wstring_view(argv[1]) == L"--transcode-balanced-sdr";
+        bool compatibleSdr = std::wstring_view(argv[1]) == L"--transcode-compatible-sdr";
+        bool rejectAutoColor = std::wstring_view(argv[1]) == L"--transcode-reject-auto-color";
+        bool forceFallback = std::wstring_view(argv[1]) == L"--transcode-fallback8-video";
         uint32_t previews{};
         std::wstring selectedBackend;
         motion::agent::VideoTranscodeCandidateValidator previewValidator;
@@ -4607,6 +4677,21 @@ int wmain(int argc, wchar_t** argv)
                 info->height == static_cast<uint32_t>(_wtoi(argv[6])) &&
                 motion::agent::video_candidate_decodes_first_frame(path);
         };
+        if (forceFallback) previewValidator = [&](fs::path const& path, auto, auto codec) {
+            ++previews;
+            if (codec == motion::agent::VideoTranscodeCodec::HevcMain10) return false;
+            auto info = motion::probe_video(argv[2], path);
+            return info && motion::agent::video_matches_sdr_output(info->codecName, info->pixelFormat, info->bitDepth,
+                info->colorTransfer, info->colorPrimaries, info->colorSpace, info->colorRange) &&
+                motion::agent::video_candidate_decodes_first_frame(path);
+        };
+        if (rejectAutoColor) previewValidator = [&](fs::path const& path, auto, auto) {
+            ++previews;
+            auto info = motion::probe_video(argv[2], path);
+            if (!info || info->colorTransfer != "bt709" || info->colorPrimaries != "bt709") return false;
+            return info->bitDepth == 10 ? motion::agent::video_candidate_plays_builtin(path, _wtoi(argv[7])) :
+                motion::agent::video_candidate_decodes_first_frame(path);
+        };
         std::wstring error;
         auto result = motion::agent::transcode_video(
             argv[2], argv[3], argv[4], static_cast<uint32_t>(_wtoi(argv[5])),
@@ -4618,7 +4703,8 @@ int wmain(int argc, wchar_t** argv)
                     static_cast<uint32_t>(value.backend) << " percent=" << value.percent <<
                     " processed_us=" << value.processedMicroseconds << " duration_us=" <<
                     value.durationMicroseconds << " started=" << value.attemptStarted << '\n';
-            }, {}, nullptr, {}, [](std::wstring const& message) { std::cout << motion::wide_to_utf8(message) << '\n'; }, previewValidator);
+            }, {}, nullptr, {}, [](std::wstring const& message) { std::cout << motion::wide_to_utf8(message) << '\n'; }, previewValidator,
+            {main10 || balancedSdr || forceFallback || compatibleSdr || rejectAutoColor, {main10, main10}, compatibleSdr});
         std::cout << "selected_backend=" << motion::wide_to_utf8(selectedBackend) << " validated_previews=" << previews << '\n';
         std::cout << "selected_gpu_scale=" << (selectedBackend.find(L"GPU") != std::wstring::npos) << '\n';
         std::cout << static_cast<int>(result) << " " << motion::wide_to_utf8(error) << '\n';
@@ -4749,6 +4835,7 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(motion::tests::media_probe_child_output_is_bounded(require));
         RUN_TEST(motion::tests::media_probe_timeout_and_cancel_reap_children(root, require));
         RUN_TEST(motion::tests::transcode_color_and_rate_contracts());
+        RUN_TEST(motion::tests::adaptive_color_profile_contracts());
         RUN_TEST(motion::tests::transcode_completion_priority_and_gpu_scaling());
         RUN_TEST(motion::tests::video_still_resolution_and_color(require));
         RUN_TEST(motion::tests::video_still_real_extraction_cache_and_leases(root, require));
@@ -4756,6 +4843,7 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(video_import_limits_allow_8k_and_240_fps());
         RUN_TEST(variant_requests_use_last_writer_wins(root));
         RUN_TEST(same_mode_variant_retry_rejects_stale_worker(root));
+        RUN_TEST(motion::tests::color_compatibility_requests_are_atomic(root, require));
         RUN_TEST(video_transcoder_fails_closed_without_backend(root));
         RUN_TEST(media_foundation_candidate_probe_decodes_a_real_first_frame(root));
         RUN_TEST(video_transcoder_orders_vendor_backends_and_bounds_software_fallback());
@@ -4763,10 +4851,19 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(real_frame_deadlines_keep_processing_inside_the_frame_budget());
         RUN_TEST(adapter_policy_preserves_heavy_video_throughput());
         RUN_TEST(renderer_ack_channels_are_isolated());
+        RUN_TEST(motion::tests::renderer_coverage_command_tests());
+        RUN_TEST(motion::tests::renderer_coverage_output_tests());
+        RUN_TEST(motion::tests::display_coverage_tracks_physical_bounds_and_fresh_snapshots(require));
+        RUN_TEST(motion::tests::coverage_masks_preserve_user_and_screensaver_policy(require));
         RUN_TEST(decode_modes_have_distinct_fallback_contracts());
         RUN_TEST(real_video_renderer_separates_cpu_decode_and_gpu_presentation(root));
+        RUN_TEST(motion::tests::real_renderer_partial_coverage_keeps_shared_decode_alive(root, require,
+            [](auto const& media, auto const& monitors) {
+                return launch_hidden_renderer(media, L"video", L"software", monitors, true);
+            }, read_protocol_line, stop_renderer));
         RUN_TEST(real_video_pause_releases_after_grace_and_screensaver_exit(root));
         RUN_TEST(motion::tests::builtin_video_clock_pixels_and_resume(root,require));
+        RUN_TEST(motion::tests::builtin_scRGB_preserves_highlights_and_gamut(root,require));
         RUN_TEST(selected_media_reaches_real_renderer_first_frame(root));
         RUN_TEST(renderer_crash_recovery_reaches_first_frame_again(root));
         RUN_TEST(renderer_display_change_exit_and_relaunch_is_cross_process(root));

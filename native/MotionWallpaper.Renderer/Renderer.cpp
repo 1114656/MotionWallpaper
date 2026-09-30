@@ -20,7 +20,10 @@
 #include "FrameTiming.h"
 #include "FrameScheduler.h"
 #include "OutputFramePolicy.h"
+#include "RendererCommand.h"
 #include "BuiltinVideo.h"
+#include "BuiltinVideoProbe.h"
+#include "../MotionWallpaper.Common/MediaProbe.h"
 #include "TransitionPolicy.h"
 #include "../MotionWallpaper.Common/DisplayAwareness.h"
 #include "../MotionWallpaper.Common/DisplayTopology.h"
@@ -112,6 +115,7 @@ namespace
     motion::renderer::FrameScheduler frameScheduler{ wmFrameTick };
 
     std::mutex protocolOutputMutex;
+    motion::renderer::RendererCommandMailbox commandMailbox;
 
     void acknowledge(uint64_t revision, char const* channel, char const* state)
     {
@@ -254,10 +258,24 @@ namespace
             if (FAILED(composition_->CreateVisual(&rootVisual_))) return false;
             if (FAILED(target_->SetRoot(rootVisual_.Get()))) return false;
 
+            auto displays = motion::enumerate_displays();
+            // Layout regions are relative to the selected physical bounds,
+            // including hidden test windows whose non-client frame shifts the
+            // client origin. Do not use client coordinates to identify a panel.
+            POINT origin{displayLayout.bounds.left, displayLayout.bounds.top};
             outputs_.reserve(regions.size());
             for (auto const& region : regions) {
                 Output output;
                 output.region = region;
+                for (auto const& display : displays) {
+                    POINT center{origin.x + (region.left + region.right) / 2, origin.y + (region.top + region.bottom) / 2};
+                    if (!PtInRect(&display.bounds, center)) continue;
+                    output.deviceName = display.deviceName;
+                    output.advancedColor = display.advancedColorEnabled;
+                    output.hdr = display.hdrEnabled;
+                    output.sdrWhiteScale = display.sdrWhiteScale;
+                    break;
+                }
                 output.width = static_cast<UINT>(region.right - region.left);
                 output.height = static_cast<UINT>(region.bottom - region.top);
                 if (!output.width || !output.height ||
@@ -287,12 +305,26 @@ namespace
         LONGLONG LastTimestamp() const { return lastTimestamp_; }
         uint64_t PlaybackProgress() const
         {
-            if (outputs_.empty()) return 0;
             uint64_t serial = UINT64_MAX;
-            for (auto const& output : outputs_) serial = (std::min)(serial, output.progress.presentedSerial);
-            return serial;
+            for (auto const& output : outputs_) {
+                if (output.policy.ContributesProgress()) serial = (std::min)(serial, output.progress.presentedSerial);
+            }
+            return serial == UINT64_MAX ? 0 : serial;
         }
         void BeginTargetTransition() { freezeCaptureActive_ = false; }
+
+        void SetCoveredDisplays(std::vector<std::wstring> const& covered)
+        {
+            for (auto& output : outputs_) {
+                bool next = std::find(covered.begin(), covered.end(), output.deviceName) != covered.end();
+                if (next == output.policy.covered) continue;
+                output.policy.covered = next;
+                // A frame queued before the pause is stale on uncover. Preserve
+                // its acquired latency token so the latest frame can replace it.
+                output.pendingSerial = 0;
+                output.pendingCapture = false;
+            }
+        }
 
         void ResetVideoTimeline()
         {
@@ -340,6 +372,7 @@ namespace
             bool waitForFrozenHandoff{};
             bool presented{};
             for (auto& output : outputs_) {
+                if (!output.policy.ShouldPresent(captureForFreeze)) continue;
                 if (captureForFreeze) {
                     if (!output.progress.NeedsFrame(decodedSerial_, true)) continue;
                     // Freezing must also work when a powered-off or occluded
@@ -390,7 +423,7 @@ namespace
                     if (FAILED(result)) { lastError_ = result; return FrameResult::Fatal; }
                     auto source = CoverSource(sourceWidth, sourceHeight, output.width, output.height);
                     RECT destination{ 0, 0, static_cast<LONG>(output.width), static_cast<LONG>(output.height) };
-                    result = TransferVideoFrameToBuffer(mediaEngine, buffer.Get(), source, destination, black);
+                    result = TransferVideoFrameToBuffer(mediaEngine, buffer.Get(), source, destination, black, output.sdrWhiteScale, output.hdr);
                     if (FAILED(result)) { lastError_ = result; return FrameResult::Fatal; }
                     output.pendingSerial = decodedSerial_;
                     output.pendingCapture = captureForFreeze;
@@ -424,11 +457,13 @@ namespace
                 // Freeze attaches the captured surface directly; retain it
                 // until normal playback has completed its resume handoff.
                 if (!captureForFreeze) {
-                    for (auto& output : outputs_) output.frozenSurface.Reset();
+                    for (auto& output : outputs_) {
+                        if (output.content == Content::SwapChain) output.frozenSurface.Reset();
+                    }
                 }
             }
             bool allReady = std::all_of(outputs_.begin(), outputs_.end(), [&](auto const& output) {
-                return output.progress.Ready(captureForFreeze);
+                return !output.policy.ShouldPresent(captureForFreeze) || output.progress.Ready(captureForFreeze);
             });
             return presented && allReady ? FrameResult::Presented : FrameResult::NoFrame;
         }
@@ -468,7 +503,7 @@ namespace
             uint64_t total{};
             for (auto const& output : outputs_) {
                 uint64_t frame = static_cast<uint64_t>(output.width) * output.height * 4;
-                total += frame * (output.swapChain ? 2 : output.frozenSurface ? 1 : 0);
+                total += frame * (output.swapChain ? (output.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 4 : 2) : output.frozenSurface ? 1 : 0);
             }
             return total;
         }
@@ -547,8 +582,13 @@ namespace
         struct Output
         {
             RECT region{};
+            std::wstring deviceName;
+            motion::renderer::DesktopOutputPolicy policy;
             UINT width{};
             UINT height{};
+            bool advancedColor{}, hdr{}, floatUnavailable{};
+            float sdrWhiteScale{1.f};
+            DXGI_FORMAT format{DXGI_FORMAT_B8G8R8A8_UNORM};
             ComPtr<IDXGISwapChain2> swapChain;
             motion::unique_handle frameLatency;
             motion::renderer::OutputFrameProgress progress;
@@ -595,7 +635,14 @@ namespace
 
         bool EnsureSwapChain(Output& output)
         {
-            if (output.swapChain) return true;
+            auto desired = builtinVideo && output.advancedColor && !output.floatUnavailable
+                ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+            if (output.swapChain && output.format == desired) return true;
+            if (output.swapChain) {
+                output.frameLatency.reset(); output.swapChain.Reset();
+                output.pendingSerial = 0; output.content = Content::None;
+            }
+            output.format = desired;
             ComPtr<IDXGIDevice> dxgiDevice;
             ComPtr<IDXGIAdapter> adapter;
             ComPtr<IDXGIFactory2> factory;
@@ -609,7 +656,7 @@ namespace
             DXGI_SWAP_CHAIN_DESC1 description{};
             description.Width = output.width;
             description.Height = output.height;
-            description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            description.Format = output.format;
             description.SampleDesc.Count = 1;
             description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
             description.BufferCount = 2;
@@ -619,7 +666,23 @@ namespace
             description.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
             ComPtr<IDXGISwapChain1> swapChain;
             lastError_ = factory->CreateSwapChainForComposition(device_.Get(), &description, nullptr, &swapChain);
-            if (FAILED(lastError_)) return false;
+            if (SUCCEEDED(lastError_) && output.format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                ComPtr<IDXGISwapChain3> modern;
+                UINT support{};
+                lastError_ = swapChain.As(&modern);
+                if (SUCCEEDED(lastError_)) lastError_ = modern->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support);
+                if (SUCCEEDED(lastError_) && !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) lastError_ = E_FAIL;
+                if (SUCCEEDED(lastError_)) lastError_ = modern->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+            }
+            if (FAILED(lastError_)) {
+                if (output.format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                    output.floatUnavailable = true;
+                    std::cerr << "color scRGB unavailable; using managed SDR conversion\n" << std::flush;
+                    return EnsureSwapChain(output);
+                }
+                return false;
+            }
+            std::cerr << "color output " << (output.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? "scRGB FP16" : "SDR BGRA8") << '\n';
             lastError_ = swapChain.As(&output.swapChain);
             if (FAILED(lastError_)) return false;
             lastError_ = output.swapChain->SetMaximumFrameLatency(1);
@@ -696,9 +759,10 @@ namespace
         }
 
         HRESULT TransferVideoFrameToBuffer(IMFMediaEngine* mediaEngine, ID3D11Texture2D* buffer,
-            MFVideoNormalizedRect const& source, RECT const& destination, MFARGB const& border)
+            MFVideoNormalizedRect const& source, RECT const& destination, MFARGB const& border,
+            float sdrWhiteScale = 1.f, bool hdrOutput = false)
         {
-            if (builtinVideo) return builtinVideo->Draw(buffer, source);
+            if (builtinVideo) return builtinVideo->Draw(buffer, source, sdrWhiteScale, hdrOutput);
             if (!useSoftwareVideoFrames_) return mediaEngine->TransferVideoFrame(buffer, &source, &destination, &border);
             D3D11_TEXTURE2D_DESC description{};
             buffer->GetDesc(&description);
@@ -1065,8 +1129,10 @@ namespace
         }
     }
 
-    void apply_command(Command command, uint64_t revision)
+    void apply_command(motion::renderer::RendererCommand const& request)
     {
+        auto command = request.command;
+        auto revision = request.revision;
         if (revision < latestRevision) return;
         latestRevision = revision;
         if (command == Command::Stop) {
@@ -1074,6 +1140,8 @@ namespace
             PostMessageW(videoWindow, WM_CLOSE, 0, 0);
             return;
         }
+        presenter.SetCoveredDisplays(command == Command::DesktopPlay
+            ? request.coveredDisplays : std::vector<std::wstring>{});
         pendingTargetRevision = revision;
         frameDeadline.Reset();
         // The captured desktop already satisfies another freeze request. In
@@ -1230,7 +1298,7 @@ namespace
             handle_media_event(static_cast<DWORD>(wParam), static_cast<DWORD>(lParam));
             return 0;
         case wmRendererCommand:
-            apply_command(static_cast<Command>(wParam), static_cast<uint64_t>(lParam));
+            if (auto command = commandMailbox.Take()) apply_command(*command);
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
@@ -1359,6 +1427,21 @@ namespace
     bool create_engine(std::wstring const& source)
     {
         if (builtinSelected || forceBuiltinTest) return create_builtin(source);
+        std::wstring module(32768, L'\0');
+        auto length = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
+        if (length && length < module.size()) {
+            module.resize(length);
+            auto ffmpeg = std::filesystem::path(module).parent_path() / L"Tools" / L"ffmpeg" / L"ffmpeg.exe";
+            auto info = motion::probe_video(ffmpeg, source, 5000);
+            // Balanced copies may retain an SDR transfer even at 8 bits. Route
+            // these through the shader that honors it instead of relying on
+            // Media Foundation's conversion into an untagged BGRA surface.
+            if (info && (info->codecName == "hevc" || info->codecName == "h264") &&
+                (info->bitDepth > 8 || (!info->colorPrimaries.empty() && info->colorPrimaries != "bt709" &&
+                    info->colorPrimaries != "unknown") || info->colorTransfer == "smpte2084" ||
+                    info->colorTransfer == "arib-std-b67" || info->colorTransfer == "iec61966-2-1" ||
+                    info->colorTransfer == "bt470m" || info->colorTransfer == "bt2020-10")) return create_builtin(source);
+        }
         ComPtr<IMFAttributes> attributes;
         if (FAILED(MFCreateAttributes(&attributes, 4))) return false;
         mediaNotify = Make<MediaNotify>(videoWindow);
@@ -1403,16 +1486,6 @@ namespace
         return true;
     }
 
-    Command parse_command(std::string const& name)
-    {
-        if (name == "desktop-play") return Command::DesktopPlay;
-        if (name == "desktop-freeze") return Command::DesktopFreeze;
-        if (name == "screensaver-play") return Command::ScreensaverPlay;
-        if (name == "pause") return Command::Pause;
-        if (name == "stop") return Command::Stop;
-        return Command::Unknown;
-    }
-
     bool apply_protocol_test_command(Command command, uint64_t revision)
     {
         if (revision < latestRevision) return false;
@@ -1431,26 +1504,29 @@ namespace
     {
         std::string line;
         while (std::getline(std::cin, line)) {
-            std::istringstream input(line);
-            std::string name;
-            uint64_t revision{};
-            input >> name >> revision;
-            if (name.empty()) continue;
-            if (!revision) {
-                report_error(0, "missing-revision", E_INVALIDARG);
+            if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+            motion::renderer::RendererCommand request;
+            auto error = motion::renderer::parse_renderer_command(line, request);
+            if (error != motion::renderer::CommandParseError::None) {
+                report_error(request.revision,
+                    error == motion::renderer::CommandParseError::MissingRevision ? "missing-revision" :
+                    error == motion::renderer::CommandParseError::InvalidCommand ? "invalid-command" : "invalid-payload",
+                    E_INVALIDARG);
                 continue;
             }
-            Command command = parse_command(name);
-            if (command == Command::Unknown) {
-                report_error(revision, "invalid-command", E_INVALIDARG);
-                continue;
-            }
+            auto command = request.command;
             if (protocolTest) {
-                if (apply_protocol_test_command(command, revision)) return;
+                if (apply_protocol_test_command(command, request.revision)) return;
                 continue;
             }
-            if (videoWindow) PostMessageW(videoWindow, wmRendererCommand, static_cast<WPARAM>(command), static_cast<LPARAM>(revision));
-            if (command == Command::Stop) return;
+            bool notify{};
+            bool accepted = videoWindow && commandMailbox.Put(std::move(request), &notify);
+            if (accepted && notify && !PostMessageW(videoWindow, wmRendererCommand, 0, 0)) {
+                report_error(0, "command-dispatch", HRESULT_FROM_WIN32(GetLastError()));
+                if (videoWindow) PostMessageW(videoWindow, WM_CLOSE, 0, 0);
+                return;
+            }
+            if (accepted && command == Command::Stop) return;
         }
         if (videoWindow) PostMessageW(videoWindow, WM_CLOSE, 0, 0);
     }
@@ -1458,6 +1534,13 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 4 && std::wstring_view(argv[1]) == L"--probe-builtin-playback") {
+        auto fps = wcstoul(argv[3], nullptr, 10);
+        if (!fps || fps > 240) return 2;
+        if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 3;
+        auto result = motion::renderer::probe_builtin_playback(argv[2], static_cast<unsigned>(fps));
+        CoUninitialize(); return result;
+    }
     motion::enable_per_monitor_dpi_awareness();
     std::wstring video;
     bool desktop = false;

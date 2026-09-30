@@ -2,6 +2,7 @@
 
 #include "../MotionWallpaper.Common/Common.h"
 #include "VideoGpuProbe.h"
+#include "VideoColorProfile.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -59,7 +60,7 @@ namespace motion::agent
             uint32_t targetWidth = 0, uint32_t targetHeight = 0,
             uint32_t targetRefreshRate = 0,
             bool softwarePlaybackTarget = false,
-            bool allowGenerationRequest = true);
+            bool allowGenerationRequest = true, VideoColorCapabilities colorCapabilities = {});
         [[nodiscard]] VideoPlaybackLease AcquirePlaybackLease(
             std::filesystem::path const& path);
         // Nonblocking: returns a cached sRGB PNG (up to 4K), or queues one
@@ -68,7 +69,7 @@ namespace motion::agent
             std::filesystem::path const& source);
         void Prepare(std::filesystem::path const& source, std::string const& performanceMode,
             uint32_t targetWidth = 0, uint32_t targetHeight = 0,
-            uint32_t targetRefreshRate = 0);
+            uint32_t targetRefreshRate = 0, VideoColorCapabilities colorCapabilities = {});
         [[nodiscard]] std::wstring SourceHardwareDecodeAdapter(
             std::filesystem::path const& source,
             std::wstring const& preferredAdapter = {},

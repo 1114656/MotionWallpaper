@@ -2,7 +2,8 @@
 
 namespace motion::renderer {
     // YUV conversion, transfer and gamut conversion occur on the presentation
-    // GPU, after the clock has selected a frame. Desktop output is sRGB SDR.
+    // GPU, after the shared clock selects a frame. Each output independently
+    // chooses sRGB SDR or linear scRGB with Windows color management.
     inline constexpr char builtin_video_shader[] = R"hlsl(
 Texture2D<float> Y : register(t0);
 Texture2D<float2> UV : register(t1);
@@ -16,6 +17,7 @@ cbuffer Params : register(b0) {
     float4 gamut2;
     float4 options; // transfer, clockwise rotation, texture width ratio, height ratio
     float4 sampling; // chroma offset x/y, source linear-light luma R/B weights
+    float4 output; // scRGB, SDR white/80 nits, HDR enabled, reserved
 };
 struct Vertex { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
 Vertex vs(uint id : SV_VertexID) {
@@ -53,10 +55,15 @@ float4 ps(Vertex v) : SV_TARGET {
     float3 rgb = float3(y+matrixYuv.x*c.y, y+matrixYuv.y*c.x+matrixYuv.z*c.y, y+matrixYuv.w*c.x);
     rgb = linearize(rgb);
     rgb = float3(dot(gamut0.xyz,rgb),dot(gamut1.xyz,rgb),dot(gamut2.xyz,rgb));
-    if (options.x == 16 || options.x == 18) {
+    bool hdr = options.x == 16 || options.x == 18;
+    if (output.x != 0 && hdr && output.z != 0) return float4(rgb * 1.25, 1);
+    if (hdr) {
         float peak = max(gamut0.w,1);
         rgb *= (1+1/peak) / (1+max(max(rgb.r,rgb.g),rgb.b));
     }
+    // scRGB needs negative and >1 channels to represent P3/BT.2020.
+    // Clipping here would destroy the gamut even with a 10-bit decoder.
+    if (output.x != 0) return float4(rgb * output.y, 1);
     rgb = saturate(rgb);
     rgb = lerp(1.055*pow(rgb,1.0/2.4)-.055,12.92*rgb,step(rgb,.0031308));
     return float4(rgb,1);
