@@ -8,8 +8,8 @@ in Tools/ffmpeg; retain the required ABI and dependent DLLs.
 
 Build distribution: BtbN/FFmpeg-Builds, Windows x64 LGPL shared build 8.1
 Project: https://github.com/BtbN/FFmpeg-Builds
-Pinned build: autobuild-2026-09-16-19-44 / ffmpeg-n8.1.2-53-g1005b294ff-win64-lgpl-shared-8.1.zip
-SHA-256: a654407793b1caef118550de3b99e46299dcabc6649ccf9a3a325f41ff4ea414
+Pinned build: autobuild-2026-09-30-13-08 / ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-shared-8.1.zip
+SHA-256: 3e47bda1607740550141e37c0e49d1e5182b34699f15adfd137ee266d346811a
 FFmpeg source and license information: https://ffmpeg.org/
 
 The accompanying FFmpeg libraries are dynamically linked and distributed

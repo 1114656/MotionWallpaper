@@ -8,10 +8,12 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $workspaceRoot = Split-Path -Parent $projectRoot
 $cacheRoot = Join-Path $workspaceRoot 'Codex\MotionWallpaper-ffmpeg'
-$assetName = 'ffmpeg-n8.1.2-53-g1005b294ff-win64-lgpl-shared-8.1.zip'
+$assetName = 'ffmpeg-n8.1.3-9-g29e619e767-win64-lgpl-shared-8.1.zip'
 $headers = @{ 'User-Agent' = 'MotionWallpaper-build' }
-$expectedHash = 'a654407793b1caef118550de3b99e46299dcabc6649ccf9a3a325f41ff4ea414'
-$downloadUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-16-19-44/' + $assetName
+$expectedHash = '3e47bda1607740550141e37c0e49d1e5182b34699f15adfd137ee266d346811a'
+# Upstream removes daily builds after 14 days. Pin a month-end build (retained
+# for two years), never the moving latest tag, and verify its exact digest.
+$downloadUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/' + $assetName
 $notice = Join-Path $projectRoot 'third_party\FFmpeg-NOTICE.txt'
 $openH264License = Join-Path $projectRoot 'third_party\OpenH264-LICENSE.txt'
 $expectedOpenH264LicenseHash = 'e7e7f1b027867f49b2a4731f2c317fe6572ff66fd0909d1469b0a7a328e8a293'
