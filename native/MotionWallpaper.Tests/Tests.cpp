@@ -887,27 +887,42 @@ namespace
 
     void paused_decoder_residency_has_a_bounded_resume_window()
     {
+        using motion::renderer::IdleResidencyReason;
         motion::renderer::IdleResidencyPolicy policy;
         require(!policy.Active() && !policy.Due(0), "idle residency was armed before a pause");
-        policy.Begin(1000, false, false);
+        policy.Begin(1000, IdleResidencyReason::Covered, false);
         require(!policy.Due(30'999) && policy.Due(31'000),
             "ordinary pause no longer has a bounded 30-second resume window");
-        policy.Begin(20'000, false, false);
+        policy.Begin(20'000, IdleResidencyReason::Covered, false);
         require(policy.Due(31'000), "repeated pause postponed resource release indefinitely");
         policy.Cancel();
-        require(!policy.Due(60'000), "a stale pause deadline survived playback resume");
-        policy.Begin(70'000, false, false);
+        require(!policy.Active() && !policy.Due(60'000), "a stale pause deadline survived playback resume");
+        policy.Begin(70'000, IdleResidencyReason::Covered, false);
         require(!policy.Due(99'999), "a new pause inherited an earlier deadline");
-        policy.Begin(71'000, true, false);
-        require(!policy.Due(71'249) && policy.Due(71'250),
-            "explicit static desktop did not shorten the decoder residency window");
-        policy.Retry(72'000);
-        require(!policy.Due(101'999) && policy.Due(102'000),
+        policy.Begin(71'000, IdleResidencyReason::DesktopFrozen, false);
+        require(policy.Delay(71'000) == 5000 && !policy.Due(75'999) && policy.Due(76'000),
+            "activity pause no longer allows a bounded five-second quick resume");
+        policy.Begin(73'000, IdleResidencyReason::DesktopFrozen, false);
+        policy.Begin(74'000, IdleResidencyReason::Covered, false);
+        require(policy.Due(76'000), "repeated freeze or coverage extended the desktop resume window");
+        policy.Begin(74'000, IdleResidencyReason::ReleasePromptly, false);
+        require(!policy.Due(74'249) && policy.Due(74'250),
+            "urgent release failed to shorten the quick-resume window");
+        policy.Retry(75'000);
+        require(!policy.Due(104'999) && policy.Due(105'000),
             "failed surface compaction no longer has a bounded retry delay");
         policy.Cancel();
-        policy.Begin(200'000, false, true);
-        require(policy.Delay(200'000) == 250 && policy.Due(200'250),
+        policy.Begin(200'000, IdleResidencyReason::DesktopFrozen, false);
+        policy.Begin(201'000, IdleResidencyReason::DesktopFrozen, true);
+        require(policy.Delay(201'000) == 250 && !policy.Due(201'249) && policy.Due(201'250),
             "memory pressure no longer releases paused resources promptly");
+        policy.Cancel();
+        policy.Begin(210'000, IdleResidencyReason::Covered, true);
+        require(policy.Delay(210'000) == 250 && policy.Due(210'250),
+            "memory pressure no longer overrides a coverage-pause grace period");
+        policy.Cancel();
+        require(!policy.Active() && !policy.Due(220'000),
+            "resuming retained a pending low-memory release");
     }
 
     void stable_agent_states_do_not_poll_at_twenty_hertz()
@@ -3069,18 +3084,22 @@ namespace
             "renderer integration process did not stop");
     }
 
-    void wait_for_renderer_compaction(RendererProcess& renderer, std::chrono::seconds timeout,
+    double wait_for_renderer_compaction(RendererProcess& renderer, std::chrono::seconds timeout,
         uint64_t pendingPauseRevision = 0)
     {
         auto deadline = std::chrono::steady_clock::now() + timeout;
         bool released{};
         bool compacted{};
         bool acknowledged = !pendingPauseRevision;
+        double releasedPosition{};
         std::string diagnostic;
         while (std::chrono::steady_clock::now() < deadline) {
             auto line = read_protocol_line(renderer.output.get(), std::chrono::milliseconds(500));
             diagnostic += line + "\n";
-            if (line.starts_with("decoder released ")) released = true;
+            if (line.starts_with("decoder released ")) {
+                released = true;
+                releasedPosition = std::stod(line.substr(std::string_view("decoder released ").size()));
+            }
             if (line.starts_with("residency compact ")) {
                 require(released, "presenter compacted without releasing its video decoder");
                 compacted = true;
@@ -3088,7 +3107,7 @@ namespace
             auto ack = motion::protocol::parse_ack(line);
             if (ack.channel == motion::protocol::AckChannel::Target &&
                 ack.revision == pendingPauseRevision && ack.state == "paused") acknowledged = true;
-            if (compacted && acknowledged) return;
+            if (compacted && acknowledged) return releasedPosition;
             if (line.starts_with("error ")) break;
         }
         std::cerr << diagnostic;
@@ -3131,12 +3150,18 @@ namespace
             require(playing, "real video Renderer did not present its first frame on both outputs");
             require(decode != L"software" || cpuPipeline,
                 "software video Renderer did not use the CPU-to-presentation upload pipeline");
-            auto nextHeartbeat = [&]() {
+            auto requireWarmDecoder = [](std::string const& line) {
+                require(!line.starts_with("decoder released ") && !line.starts_with("pipeline decode ") &&
+                    !line.starts_with("residency ") && !line.starts_with("error "),
+                    "quick activity pause/resume released, reopened, or failed its decoder");
+            };
+            auto nextHeartbeat = [&](uint64_t revision = 1, bool warmResume = false) {
                 auto heartbeatDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
                 while (std::chrono::steady_clock::now() < heartbeatDeadline) {
-                    auto value = motion::protocol::parse_playback_heartbeat(
-                        read_protocol_line(renderer.output.get(), std::chrono::milliseconds(500)));
-                    if (value && value->revision == 1) return *value;
+                    auto line = read_protocol_line(renderer.output.get(), std::chrono::milliseconds(500));
+                    if (warmResume) requireWarmDecoder(line);
+                    auto value = motion::protocol::parse_playback_heartbeat(line);
+                    if (value && value->revision == revision) return *value;
                 }
                 throw std::runtime_error("real Renderer stopped reporting playback progress after first frame");
             };
@@ -3152,24 +3177,96 @@ namespace
                 "swap-chain readiness polling counted the same decoded frame more than once");
             std::cout << "    video pipeline " << (decode == L"software" ? "software" : "auto") << ": " << diagnostic;
             renderer.Send("desktop-freeze 2\n");
-            auto frozen = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
-            require(frozen.channel == motion::protocol::AckChannel::Target && frozen.revision == 2 && frozen.state == "frozen",
-                "video Renderer did not capture both outputs for freeze");
-            wait_for_renderer_compaction(renderer, std::chrono::seconds(5));
+            auto warmTarget = [&](uint64_t revision, std::string_view state) {
+                auto targetDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (std::chrono::steady_clock::now() < targetDeadline) {
+                    auto line = read_protocol_line(renderer.output.get(), std::chrono::milliseconds(200));
+                    requireWarmDecoder(line);
+                    auto ack = motion::protocol::parse_ack(line);
+                    if (ack.channel == motion::protocol::AckChannel::Target && ack.revision == revision &&
+                        ack.state == state) return;
+                }
+                throw std::runtime_error("quick activity pause/resume did not acknowledge its target");
+            };
+            warmTarget(2, "frozen");
+            uint64_t frozenSerial{};
+            unsigned frozenHeartbeats{};
+            auto frozenDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2200);
+            while (std::chrono::steady_clock::now() < frozenDeadline) {
+                auto line = read_protocol_line(renderer.output.get(), std::chrono::milliseconds(100));
+                requireWarmDecoder(line);
+                auto heartbeat = motion::protocol::parse_playback_heartbeat(line);
+                if (!heartbeat || heartbeat->revision != 2) continue;
+                if (frozenHeartbeats++) {
+                    require(heartbeat->serial == frozenSerial,
+                        "activity-paused Renderer continued advancing its presented video frames");
+                }
+                frozenSerial = heartbeat->serial;
+            }
+            require(frozenHeartbeats >= 2 && frozenSerial > 0,
+                "activity-paused Renderer did not report a stable captured frame");
+            auto warmResumeStarted = std::chrono::steady_clock::now();
             renderer.Send("desktop-play 3\n");
-            auto resumed = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
-            require(resumed.channel == motion::protocol::AckChannel::Target && resumed.revision == 3 && resumed.state == "playing",
-                "video Renderer did not resume after the frozen-surface handoff");
+            warmTarget(3, "playing");
+            auto warmResumeMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - warmResumeStarted).count();
+            std::cout << "    quick resume " << (builtin ? "builtin" : "media-foundation") << ' '
+                << (decode == L"software" ? "software" : "auto") << ": "
+                << warmResumeMilliseconds << " ms, decoder retained\n";
+            auto warmProgress = nextHeartbeat(3, true);
+            auto warmProgressLater = nextHeartbeat(3, true);
+            require(warmProgress.serial > frozenSerial && warmProgressLater.serial > warmProgress.serial,
+                "quick activity resume failed to advance without reopening the decoder");
+
             renderer.Send("desktop-freeze 4\n");
-            auto frozenAgain = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
-            require(frozenAgain.channel == motion::protocol::AckChannel::Target && frozenAgain.revision == 4 && frozenAgain.state == "frozen",
-                "video Renderer reused a stale first-freeze acknowledgement");
-            renderer.Send("desktop-freeze 5\n");
-            auto repeatedFreeze = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
-            require(repeatedFreeze.channel == motion::protocol::AckChannel::Target && repeatedFreeze.revision == 5 && repeatedFreeze.state == "frozen",
-                "consecutive freeze commands stalled the video Renderer");
-            wait_for_renderer_compaction(renderer, std::chrono::seconds(5));
+            auto frozen = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
+            require(frozen.channel == motion::protocol::AckChannel::Target && frozen.revision == 4 && frozen.state == "frozen",
+                "video Renderer did not capture both outputs for a long freeze");
+            auto releasedPosition = wait_for_renderer_compaction(renderer, std::chrono::seconds(8));
+            renderer.Send("desktop-play 5\n");
+            motion::protocol::Ack resumed;
+            bool seekStarted{}, seekCompleted{};
+            double seekTarget{}, seekPosition{};
+            auto resumeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < resumeDeadline) {
+                auto line = read_protocol_line(renderer.output.get(), std::chrono::milliseconds(200));
+                require(!line.starts_with("error "), "cold video resume reported a decoder error");
+                if (line.starts_with("resume seek started ")) {
+                    seekStarted = true;
+                    seekTarget = std::stod(line.substr(std::string_view("resume seek started ").size()));
+                }
+                if (line.starts_with("resume seek completed ")) {
+                    require(seekStarted, "Media Foundation reported a resume seek completion without starting it");
+                    seekCompleted = true;
+                    seekPosition = std::stod(line.substr(std::string_view("resume seek completed ").size()));
+                }
+                auto ack = motion::protocol::parse_ack(line);
+                if (ack.channel == motion::protocol::AckChannel::Target && ack.revision == 5) {
+                    resumed = ack;
+                    break;
+                }
+            }
+            require(resumed.channel == motion::protocol::AckChannel::Target && resumed.revision == 5 && resumed.state == "playing",
+                "video Renderer did not resume after the frozen-surface handoff");
+            require(builtin || releasedPosition <= 0 || (seekStarted && seekCompleted),
+                "Media Foundation exposed a cold-resume frame before seeking to the paused position");
+            require(builtin || releasedPosition <= 0 ||
+                (std::abs(seekTarget - releasedPosition) < 0.05 && std::abs(seekPosition - releasedPosition) < 0.15),
+                "Media Foundation resumed away from the paused position after decoder release");
+            auto coldProgress = nextHeartbeat(5);
+            auto coldProgressLater = nextHeartbeat(5);
+            require(coldProgressLater.serial > coldProgress.serial,
+                "video Renderer acknowledged a cold resume without advancing playback");
             renderer.Send("desktop-freeze 6\n");
+            auto frozenAgain = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
+            require(frozenAgain.channel == motion::protocol::AckChannel::Target && frozenAgain.revision == 6 && frozenAgain.state == "frozen",
+                "video Renderer reused a stale first-freeze acknowledgement");
+            renderer.Send("desktop-freeze 7\n");
+            auto repeatedFreeze = read_typed_ack(renderer.output.get(), std::chrono::seconds(5));
+            require(repeatedFreeze.channel == motion::protocol::AckChannel::Target && repeatedFreeze.revision == 7 && repeatedFreeze.state == "frozen",
+                "consecutive freeze commands stalled the video Renderer");
+            wait_for_renderer_compaction(renderer, std::chrono::seconds(8));
+            renderer.Send("desktop-freeze 8\n");
             bool acknowledged{};
             auto repeatDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             while (std::chrono::steady_clock::now() < repeatDeadline) {
@@ -3178,10 +3275,10 @@ namespace
                     !line.starts_with("error "), "repeated freeze reopened or disturbed a released decoder");
                 auto ack = motion::protocol::parse_ack(line);
                 acknowledged = acknowledged || (ack.channel == motion::protocol::AckChannel::Target &&
-                    ack.revision == 6 && ack.state == "frozen");
+                    ack.revision == 8 && ack.state == "frozen");
             }
             require(acknowledged, "compacted desktop did not acknowledge another freeze");
-            stop_renderer(renderer, 7);
+            stop_renderer(renderer, 9);
         }
     }
 
@@ -4062,6 +4159,92 @@ namespace
             "an interrupted stable-path recycle transaction was not restored");
     }
 
+    void whole_wallpaper_deletion_removes_all_versions_and_tasks(fs::path const& root)
+    {
+        // Use a disposable library and permanent deletion so the regression
+        // never modifies a user's library or populates the Windows recycle bin.
+        // Leave room for atomic task-file suffixes on legacy Win32 paths.
+        motion::app::MediaLibrary library(root / L"wdel",
+            motion::app::DeleteMode::Permanent);
+        library.EnsureDirectories();
+        auto group = library.CreateGroup(L"Deletion fixtures", {});
+        auto externalSource = root / L"whole-wallpaper-original.mov";
+        std::ofstream(externalSource, std::ios::binary) << "original outside the managed library";
+        auto createMedia = [&](std::wstring const& name) {
+            motion::MediaMetadata media;
+            media.id = motion::new_id();
+            media.groupId = group.id;
+            media.name = name;
+            media.originalName = L"original.mov";
+            media.fileName = L"source.mov";
+            media.coverFileName = L"poster.png";
+            media.kind = "video";
+            media.revision = 1;
+            media.importedAt = media.updatedAt = motion::timestamp_utc();
+            auto directory = library.MediaDirectory(media);
+            fs::create_directories(directory);
+            fs::copy_file(externalSource, directory / media.fileName);
+            std::ofstream(directory / media.coverFileName, std::ios::binary) << "poster";
+            motion::save_media(directory / L"metadata.json", media);
+            return media;
+        };
+        auto sourceOnly = createMedia(L"No performance copy");
+        auto allVersions = createMedia(L"All performance copies");
+        auto keep = createMedia(L"Unrelated wallpaper");
+        auto versionsDirectory = library.MediaDirectory(allVersions);
+        auto keepDirectory = library.MediaDirectory(keep);
+        fs::create_directories(versionsDirectory / L"Variants");
+        for (auto const* file : { L"balanced-60-1920x1080-v8.mp4",
+            L"balanced-60-3840x2160-v8.mp4", L"balanced-60-1920x1080-compatible-v9.mp4",
+            L"power-saver-60-1920x1080-v8.mp4" }) {
+            std::ofstream(versionsDirectory / L"Variants" / file, std::ios::binary) << "copy";
+        }
+        require(library.RequestOptimization(allVersions, "balanced"),
+            "whole-wallpaper deletion could not prepare its queued-task fixture");
+        library.PauseOptimization(allVersions);
+        std::ofstream(versionsDirectory / L"Variants" / L"balanced-pending.part.mp4",
+            std::ios::binary) << "partial";
+        require(motion::set_variant_compatibility_color(versionsDirectory, true),
+            "whole-wallpaper deletion could not prepare its color preference fixture");
+        library.SuppressOptimization(allVersions, "power-saver");
+        require(library.VariantStatus(allVersions).paused,
+            "whole-wallpaper deletion fixture did not retain its paused task");
+        fs::create_directories(keepDirectory / L"Variants");
+        std::ofstream(keepDirectory / L"Variants" / L"balanced-60-1920x1080-v8.mp4",
+            std::ios::binary) << "unrelated copy";
+        require(library.RequestOptimization(keep, "power-saver"),
+            "whole-wallpaper deletion could not prepare the unrelated task");
+        auto readBytes = [](fs::path const& path) {
+            std::ifstream input(path, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(input), {});
+        };
+        std::vector<std::pair<fs::path, std::string>> retainedFiles;
+        for (auto const& entry : fs::recursive_directory_iterator(keepDirectory)) {
+            if (entry.is_regular_file()) {
+                retainedFiles.emplace_back(entry.path(), readBytes(entry.path()));
+            }
+        }
+        retainedFiles.emplace_back(externalSource, readBytes(externalSource));
+        require(library.VariantStatus(sourceOnly).files == 0,
+            "source-only deletion fixture unexpectedly contained a performance copy");
+        for (auto const& media : { sourceOnly, allVersions }) {
+            auto directory = library.MediaDirectory(media);
+            // Match the UI sequence after the Agent has acknowledged quiescence.
+            library.CancelOptimization(media);
+            library.Delete(media);
+            require(!fs::exists(directory),
+                "whole-wallpaper deletion retained a source, copy, poster, or task marker");
+            for (auto const& [path, contents] : retainedFiles) {
+                require(fs::is_regular_file(path) && readBytes(path) == contents,
+                    "whole-wallpaper deletion changed an unrelated file or queued task");
+            }
+        }
+        auto remaining = library.LoadMedia(group.id);
+        require(remaining.size() == 1 && remaining.front().id == keep.id &&
+            library.VariantStatus(keep).queued,
+            "whole-wallpaper deletion left a catalog entry or removed another wallpaper's task");
+    }
+
     void media_library_operations_are_safe(fs::path const& root)
     {
         char const* phase = "initialize";
@@ -4407,7 +4590,7 @@ namespace
         std::string cpp((std::istreambuf_iterator<char>(cppFile)), {});
         std::string header((std::istreambuf_iterator<char>(headerFile)), {});
         std::string agent((std::istreambuf_iterator<char>(agentFile)), {});
-        std::regex event(R"event((?:Click|SelectionChanged|TextChanged|RightTapped|DragItemsStarting|DragItemsCompleted)="([A-Za-z0-9_]+)")event");
+        std::regex event(R"event((?:Click|SelectionChanged|TextChanged|RightTapped|ContextRequested|ContextCanceled|DragItemsStarting|DragItemsCompleted)="([A-Za-z0-9_]+)")event");
         for (std::sregex_iterator found(xaml.begin(), xaml.end(), event), end; found != end; ++found) {
             auto handler = (*found)[1].str();
             require(cpp.find("MainWindow::" + handler + "(") != std::string::npos, "XAML event references a missing handler");
@@ -4421,7 +4604,7 @@ namespace
             "wallpaper card selection no longer updates the persisted selection");
         require(cpp.find("profileContext + L\"，保留选择\"") != std::string::npos &&
             cpp.find("profileContext + L\"，\" + actionLabel") != std::string::npos &&
-            cpp.find("item.media.name + L\"，源文件，保留选择\"") != std::string::npos,
+            cpp.find("item.media.name + L\"，源文件，删除整张壁纸\"") != std::string::npos,
             "performance-copy controls no longer expose per-media accessible names");
         require(cpp.find("motion::try_load_runtime(path, runtime)") != std::string::npos,
             "wallpaper UI no longer consumes the Agent's acknowledged runtime selection");
@@ -4459,8 +4642,7 @@ namespace
             return window.substr(first, last - first);
         };
         auto group = slice("MainWindow::DeleteGroup(", "MainWindow::ImportVideo_Click(");
-        auto variants = slice("MainWindow::DeleteVariantProfiles(", "MainWindow::DeleteSource(");
-        auto source = slice("MainWindow::DeleteSource(", "MainWindow::DeleteMedia_Click(");
+        auto variants = slice("MainWindow::DeleteVariantProfiles(", "MainWindow::DeleteMedia_Click(");
         auto media = slice("MainWindow::DeleteMedia(", "MainWindow::OpenLibrary_Click(");
         auto move = slice("MainWindow::MoveMedia(", "MainWindow::RandomInterval_Changed(");
         auto coordinated = [](std::string const& body, char const* destructiveCall) {
@@ -4472,7 +4654,6 @@ namespace
         };
         require(coordinated(group, "library->DeleteGroup(group)") &&
             coordinated(variants, "library->DeleteVariantProfiles(media, modes)") &&
-            coordinated(source, "library->DeleteSource(media)") &&
             coordinated(media, "library->Delete(media)") &&
             coordinated(move, "library->Move(media, targetId)"),
             "a destructive or path-changing UI flow can mutate before the Agent acknowledges quiescence");
@@ -4888,6 +5069,7 @@ int wmain(int argc, wchar_t** argv)
         RUN_TEST(media_library_mutations_revalidate_persistent_identity(root));
         RUN_TEST(interrupted_variant_deletion_is_recovered(root));
         RUN_TEST(interrupted_library_transactions_recover_without_overwrite(root));
+        RUN_TEST(whole_wallpaper_deletion_removes_all_versions_and_tasks(root));
         RUN_TEST(media_library_operations_are_safe(root));
         RUN_TEST(media_catalog_and_optimization_storage_are_manageable(root));
         RUN_TEST(optimization_eta_round_trips(root));

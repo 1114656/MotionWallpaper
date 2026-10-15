@@ -28,6 +28,8 @@ namespace winrt::MotionWallpaper::implementation
         void DisplaysNav_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void StorageNav_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void IdentifyDisplays_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
+        void AllDisplays_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
+        void MediaKind_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void Quality_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void ApplyWallpaper_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void Settings_Changed(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
@@ -35,7 +37,8 @@ namespace winrt::MotionWallpaper::implementation
         void SystemSettings_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void Variants_Click(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void GroupPicker_SelectionChanged(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const&);
-        void GroupPicker_RightTapped(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::Input::RightTappedRoutedEventArgs const&);
+        void GroupPicker_ContextRequested(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::Input::ContextRequestedEventArgs const&);
+        void GroupPicker_ContextCanceled(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::RoutedEventArgs const&);
         void GroupPicker_DragItemsStarting(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::Controls::DragItemsStartingEventArgs const&);
         void GroupPicker_DragItemsCompleted(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::Controls::DragItemsCompletedEventArgs const&);
         void Media_SelectionChanged(Windows::Foundation::IInspectable const&, Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const&);
@@ -93,6 +96,7 @@ namespace winrt::MotionWallpaper::implementation
         std::optional<motion::MediaMetadata> optimizationSummaryMedia;
         std::string appliedGroupId;
         std::string appliedMediaId;
+        std::string overviewGroupId;
         std::string actualDecodePath;
         std::string actualDecodeReason;
         std::string pendingRuntimeCommandId;
@@ -113,6 +117,9 @@ namespace winrt::MotionWallpaper::implementation
         int previewPollsRemaining{};
         int displayRefreshTicks{};
         void RefreshWorkspace();
+        void UpdateWorkspaceLayout();
+        void UpdateDisplaysPageLayout();
+        void UpdateStoragePageLayout();
         void RefreshDraftImage();
         Microsoft::UI::Dispatching::DispatcherQueueTimer settingsSaveTimer{ nullptr };
         Microsoft::UI::Dispatching::DispatcherQueueTimer catalogSearchTimer{ nullptr };
@@ -188,12 +195,12 @@ namespace winrt::MotionWallpaper::implementation
         void SetVariantPaused(motion::MediaMetadata const& media, bool paused);
         void CancelVariant(motion::MediaMetadata const& media);
         void ConfirmDeleteVariantSelection(motion::MediaMetadata const& media, uint8_t selection);
+        void ConfirmDeleteMedia(motion::MediaMetadata const& media);
         winrt::fire_and_forget ImportFiles(std::string kind, std::wstring title, std::wstring pattern);
         winrt::fire_and_forget RefreshMissingCovers(std::string groupId, std::vector<motion::MediaMetadata> media);
         winrt::fire_and_forget MoveMedia(motion::MediaMetadata media, std::string targetGroupId);
         winrt::fire_and_forget DeleteGroup(motion::GroupMetadata group);
         winrt::fire_and_forget DeleteVariantProfiles(motion::MediaMetadata media, uint8_t selection);
-        winrt::fire_and_forget DeleteSource(motion::MediaMetadata media);
         winrt::fire_and_forget DeleteMedia(motion::MediaMetadata media);
         winrt::fire_and_forget RepairDuplicates(std::vector<motion::app::DuplicateMediaSet> duplicates);
         winrt::fire_and_forget TrimOptimizationStorage(uint64_t quotaBytes, bool releaseAll);

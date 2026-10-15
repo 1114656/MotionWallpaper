@@ -57,6 +57,7 @@ namespace
 
     using motion::renderer::Command;
     using motion::renderer::PresentationMode;
+    using motion::renderer::IdleResidencyReason;
     enum class PlaybackState { Starting, Playing, Freezing, Frozen, Pausing, Paused };
     enum class FrameResult { NoFrame, Presented, Fatal };
 
@@ -72,9 +73,12 @@ namespace
     ComPtr<IMFMediaEngine> engine;
     std::unique_ptr<motion::renderer::BuiltinVideo> builtinVideo;
     bool builtinSelected{}, builtinStatusPending{}, forceBuiltinTest{};
+    uint32_t mediaEngineGeneration{};
+    bool mediaResumeSeeking{};
+    uint64_t mediaResumeDeadline{};
     motion::renderer::DecodePath requestedDecodePath{motion::renderer::DecodePath::Automatic};
     bool has_decoder() { return engine || builtinVideo; }
-    void play_decoder() { if (builtinVideo) builtinVideo->Play(); else if (engine) engine->Play(); }
+    void play_decoder();
     void pause_decoder() { if (builtinVideo) builtinVideo->Pause(); else if (engine) engine->Pause(); }
     bool staticMedia{};
     UINT frameIntervalMs{ 4 };
@@ -86,6 +90,15 @@ namespace
     std::wstring sourcePath;
     double resumeTime{};
     bool resumePending{};
+    bool media_resume_blocked() { return engine && (resumePending || mediaResumeSeeking); }
+    void play_decoder()
+    {
+        if (builtinVideo) builtinVideo->Play();
+        // MF may only finish an asynchronous seek once its session is running.
+        // Start it after SetCurrentTime succeeds; presentation stays blocked
+        // separately until SEEKED, so no pre-seek frame replaces the still.
+        else if (engine && !resumePending) engine->Play();
+    }
     bool returnToDesktopAfterFreeze{};
     bool visualShown{};
     bool automaticDecodeStatusPending{};
@@ -140,15 +153,20 @@ namespace
     class MediaNotify final : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IMFMediaEngineNotify>
     {
     public:
-        explicit MediaNotify(HWND target) : target_(target) {}
+        MediaNotify(HWND target, uint32_t generation) : target_(target), generation_(generation) {}
         IFACEMETHODIMP EventNotify(DWORD event, DWORD_PTR param1, DWORD param2) override
         {
             UNREFERENCED_PARAMETER(param1);
-            PostMessageW(target_, wmMediaEvent, static_cast<WPARAM>(event), static_cast<LPARAM>(param2));
+            // A released Media Engine may still have callbacks in the window
+            // queue. Keep them distinct from the next engine's seek barrier.
+            static_assert(sizeof(WPARAM) >= sizeof(uint64_t));
+            auto message = static_cast<uint64_t>(generation_) << 32 | event;
+            PostMessageW(target_, wmMediaEvent, static_cast<WPARAM>(message), static_cast<LPARAM>(param2));
             return S_OK;
         }
     private:
         HWND target_{};
+        uint32_t generation_{};
     };
 
     ComPtr<MediaNotify> mediaNotify;
@@ -375,13 +393,14 @@ namespace
                 if (!output.policy.ShouldPresent(captureForFreeze)) continue;
                 if (captureForFreeze) {
                     if (!output.progress.NeedsFrame(decodedSerial_, true)) continue;
+                    if (!EnsureSwapChain(output)) return FrameResult::Fatal;
                     // Freezing must also work when a powered-off or occluded
                     // display stops granting swap-chain readiness tokens.
                     D3D11_TEXTURE2D_DESC description{};
                     description.Width = output.width;
                     description.Height = output.height;
                     description.MipLevels = description.ArraySize = 1;
-                    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    description.Format = output.format;
                     description.SampleDesc.Count = 1;
                     description.Usage = D3D11_USAGE_DEFAULT;
                     description.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -390,7 +409,8 @@ namespace
                     if (FAILED(result)) { lastError_ = result; return FrameResult::Fatal; }
                     auto source = CoverSource(sourceWidth, sourceHeight, output.width, output.height);
                     RECT destination{ 0, 0, static_cast<LONG>(output.width), static_cast<LONG>(output.height) };
-                    result = TransferVideoFrameToBuffer(mediaEngine, frame.Get(), source, destination, black);
+                    result = TransferVideoFrameToBuffer(mediaEngine, frame.Get(), source, destination, black,
+                        output.sdrWhiteScale, output.hdr);
                     if (FAILED(result)) { lastError_ = result; return FrameResult::Fatal; }
                     if (!CaptureFrame(output, frame.Get()) ||
                         FAILED(output.visual->SetContent(output.frozenSurface.Get()))) {
@@ -502,8 +522,9 @@ namespace
         {
             uint64_t total{};
             for (auto const& output : outputs_) {
-                uint64_t frame = static_cast<uint64_t>(output.width) * output.height * 4;
-                total += frame * (output.swapChain ? (output.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 4 : 2) : output.frozenSurface ? 1 : 0);
+                uint64_t pixels = static_cast<uint64_t>(output.width) * output.height;
+                if (output.swapChain) total += pixels * (output.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4) * 2;
+                if (output.frozenSurface) total += pixels * (output.frozenFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4);
             }
             return total;
         }
@@ -598,6 +619,7 @@ namespace
             bool frameSlotReady{};
             ComPtr<IDCompositionVisual> visual;
             ComPtr<IDCompositionSurface> frozenSurface;
+            DXGI_FORMAT frozenFormat{DXGI_FORMAT_B8G8R8A8_UNORM};
             Content content{ Content::None };
         };
 
@@ -640,7 +662,10 @@ namespace
             if (output.swapChain && output.format == desired) return true;
             if (output.swapChain) {
                 output.frameLatency.reset(); output.swapChain.Reset();
-                output.pendingSerial = 0; output.content = Content::None;
+                output.pendingSerial = 0;
+                // A format change must still wait for the frozen-to-video
+                // composition commit before releasing the visible still.
+                if (output.content != Content::FrozenSurface) output.content = Content::None;
             }
             output.format = desired;
             ComPtr<IDXGIDevice> dxgiDevice;
@@ -710,8 +735,10 @@ namespace
         bool CaptureFrame(Output& output, ID3D11Texture2D* source)
         {
             if (!source) return false;
+            D3D11_TEXTURE2D_DESC description{};
+            source->GetDesc(&description);
             ComPtr<IDCompositionSurface> captured;
-            if (FAILED(composition_->CreateSurface(output.width, output.height, DXGI_FORMAT_B8G8R8A8_UNORM,
+            if (FAILED(composition_->CreateSurface(output.width, output.height, description.Format,
                 DXGI_ALPHA_MODE_IGNORE, &captured))) return false;
 
             ComPtr<IDXGISurface> update;
@@ -729,6 +756,7 @@ namespace
             HRESULT endResult = captured->EndDraw();
             if (FAILED(result) || FAILED(endResult)) return false;
             output.frozenSurface = std::move(captured);
+            output.frozenFormat = description.Format;
             return true;
         }
 
@@ -922,11 +950,11 @@ namespace
     void start_frame_timer() { frameScheduler.Start(videoWindow, frameIntervalMs); }
     void stop_frame_timer() { frameScheduler.Stop(); frameDeadline.Reset(); }
     void cancel_residency_timer() { KillTimer(videoWindow, residencyTimer); }
-    void enter_idle_residency(bool releasePromptly = false)
+    void enter_idle_residency(IdleResidencyReason reason)
     {
         if (staticMedia || idleResourcesCompacted) return;
         auto now = GetTickCount64();
-        idleResidency.Begin(now, releasePromptly, low_memory_pressure());
+        idleResidency.Begin(now, reason, low_memory_pressure());
         SetTimer(videoWindow, residencyTimer,
             idleResidency.Delay(now), nullptr);
     }
@@ -943,6 +971,9 @@ namespace
         resumeTime = builtinVideo ? builtinVideo->CurrentTime() : engine->GetCurrentTime();
         pause_decoder();
         builtinVideo.reset();
+        ++mediaEngineGeneration;
+        mediaResumeSeeking = false;
+        mediaResumeDeadline = 0;
         if (engine) engine->Shutdown();
         engine.Reset();
         deviceManager.Reset();
@@ -1060,6 +1091,22 @@ namespace
     void render_tick()
     {
         if (!has_decoder()) return;
+        if (media_resume_blocked()) {
+            if (mediaResumeSeeking) {
+                // Frame-server seeks need their ticks serviced to complete.
+                // Discard these frames instead of transferring/presenting
+                // them, keeping the previous frozen surface visible.
+                LONGLONG discardedTimestamp{};
+                auto result = engine->OnVideoStreamTick(&discardedTimestamp);
+                if (FAILED(result)) {
+                    report_error(pendingTargetRevision, "decoder-resume-tick", result);
+                    PostMessageW(videoWindow, WM_CLOSE, 0, 0);
+                    return;
+                }
+                if (frame_rendering_active()) frameScheduler.Start(videoWindow, 16);
+            }
+            return;
+        }
         auto frameStarted = motion::renderer::FrameScheduler::Now100ns();
         auto started = std::chrono::steady_clock::now();
         bool captureForFreeze = playbackState == PlaybackState::Freezing || playbackState == PlaybackState::Pausing;
@@ -1101,7 +1148,8 @@ namespace
         show_renderer_window();
         if (playbackState == PlaybackState::Freezing || playbackState == PlaybackState::Pausing) {
             bool pausing = playbackState == PlaybackState::Pausing;
-            bool releasePromptly = !pausing || returnToDesktopAfterFreeze;
+            auto residencyReason = returnToDesktopAfterFreeze ? IdleResidencyReason::ReleasePromptly :
+                pausing ? IdleResidencyReason::Covered : IdleResidencyReason::DesktopFrozen;
             pause_decoder();
             playbackState = pausing ? PlaybackState::Paused : PlaybackState::Frozen;
             stop_frame_timer();
@@ -1113,7 +1161,7 @@ namespace
                     return;
                 }
             }
-            enter_idle_residency(releasePromptly);
+            enter_idle_residency(residencyReason);
             acknowledge(pendingTargetRevision, "target", pausing ? "paused" : "frozen");
         } else if (playbackState == PlaybackState::Starting) {
             playbackState = PlaybackState::Playing;
@@ -1151,7 +1199,7 @@ namespace
             playbackState = PlaybackState::Frozen;
             stop_frame_timer();
             pause_decoder();
-            enter_idle_residency(true);
+            enter_idle_residency(IdleResidencyReason::DesktopFrozen);
             acknowledge(revision, "target", "frozen");
             return;
         }
@@ -1159,7 +1207,8 @@ namespace
         if (command == Command::Pause) {
             bool returnToDesktop = motion::renderer::leaves_screensaver(presentationMode, command);
             if (staticMedia || !has_decoder() || playbackState == PlaybackState::Frozen || playbackState == PlaybackState::Paused) {
-                bool releasePromptly = returnToDesktop || playbackState == PlaybackState::Frozen;
+                auto residencyReason = returnToDesktop ? IdleResidencyReason::ReleasePromptly :
+                    playbackState == PlaybackState::Frozen ? IdleResidencyReason::DesktopFrozen : IdleResidencyReason::Covered;
                 playbackState = PlaybackState::Paused;
                 stop_frame_timer();
                 pause_decoder();
@@ -1169,7 +1218,7 @@ namespace
                     return;
                 }
                 returnToDesktopAfterFreeze = false;
-                enter_idle_residency(releasePromptly);
+                enter_idle_residency(residencyReason);
                 acknowledge(revision, "target", "paused");
             } else {
                 returnToDesktopAfterFreeze = returnToDesktop;
@@ -1225,11 +1274,11 @@ namespace
         start_frame_timer();
     }
 
-    void handle_media_event(DWORD event, DWORD status)
+    void handle_media_event(DWORD event, DWORD status, uint32_t generation)
     {
         // Shutdown may leave MF callbacks queued. They must never terminate
         // or restart the independently running built-in decoder.
-        if (builtinSelected || !engine) return;
+        if (generation != mediaEngineGeneration || builtinSelected || !engine) return;
         if (FAILED(static_cast<HRESULT>(status))) {
             if (static_cast<HRESULT>(status) == MF_E_TOPO_CODEC_NOT_FOUND && !visualShown &&
                 create_builtin(sourcePath)) return;
@@ -1244,18 +1293,38 @@ namespace
         switch (event) {
         case MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY:
         case MF_MEDIA_ENGINE_EVENT_PLAYING:
-            if (frame_rendering_active()) {
+            if (frame_rendering_active() && !media_resume_blocked()) {
                 start_frame_timer();
                 render_tick();
             }
             break;
         case MF_MEDIA_ENGINE_EVENT_CANPLAY:
             if (engine && resumePending) {
-                engine->SetCurrentTime(resumeTime);
+                // The old still stays attached while the newly opened engine
+                // seeks. Its initial time-zero frame is never presented.
+                mediaResumeSeeking = true;
+                auto result = engine->SetCurrentTime(resumeTime);
+                if (FAILED(result)) {
+                    report_error(pendingTargetRevision, "decoder-resume-seek", result);
+                    PostMessageW(videoWindow, WM_CLOSE, 0, 0);
+                    return;
+                }
                 resumePending = false;
+                std::cerr << "resume seek started " << resumeTime << '\n' << std::flush;
             }
             if (engine && (playbackState == PlaybackState::Starting || playbackState == PlaybackState::Freezing ||
-                playbackState == PlaybackState::Pausing)) engine->Play();
+                playbackState == PlaybackState::Pausing)) play_decoder();
+            if (mediaResumeSeeking && frame_rendering_active()) start_frame_timer();
+            break;
+        case MF_MEDIA_ENGINE_EVENT_SEEKED:
+            if (!mediaResumeSeeking) break;
+            mediaResumeSeeking = false;
+            mediaResumeDeadline = 0;
+            std::cerr << "resume seek completed " << engine->GetCurrentTime() << '\n' << std::flush;
+            if (frame_rendering_active()) {
+                play_decoder();
+                start_frame_timer();
+            }
             break;
         }
     }
@@ -1276,6 +1345,12 @@ namespace
             return 0;
         case WM_TIMER:
             if (wParam == healthTimer) {
+                if (mediaResumeDeadline && media_resume_blocked() && GetTickCount64() >= mediaResumeDeadline) {
+                    mediaResumeDeadline = 0;
+                    report_error(pendingTargetRevision, "decoder-resume-timeout", HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+                    PostMessageW(videoWindow, WM_CLOSE, 0, 0);
+                    return 0;
+                }
                 if (latestRevision && !staticMedia) {
                     std::cout << "status playback " << latestRevision << ' ' << presenter.PlaybackProgress()
                         << ' ' << sourceFramePeriod100ns << '\n' << std::flush;
@@ -1295,7 +1370,8 @@ namespace
             }
             break;
         case wmMediaEvent:
-            handle_media_event(static_cast<DWORD>(wParam), static_cast<DWORD>(lParam));
+            handle_media_event(static_cast<DWORD>(wParam), static_cast<DWORD>(lParam),
+                static_cast<uint32_t>(static_cast<uint64_t>(wParam) >> 32));
             return 0;
         case wmRendererCommand:
             if (auto command = commandMailbox.Take()) apply_command(*command);
@@ -1396,6 +1472,9 @@ namespace
 
     bool create_builtin(std::wstring const& source)
     {
+        ++mediaEngineGeneration;
+        mediaResumeSeeking = false;
+        mediaResumeDeadline = 0;
         if (engine) engine->Shutdown();
         engine.Reset(); deviceManager.Reset(); mediaNotify.Reset();
         auto candidate = std::make_unique<motion::renderer::BuiltinVideo>();
@@ -1444,7 +1523,11 @@ namespace
         }
         ComPtr<IMFAttributes> attributes;
         if (FAILED(MFCreateAttributes(&attributes, 4))) return false;
-        mediaNotify = Make<MediaNotify>(videoWindow);
+        mediaResumeSeeking = false;
+        // The one-second health timer must report a seek failure before the
+        // Agent's six-second target-acknowledgement deadline restarts us.
+        mediaResumeDeadline = resumePending ? GetTickCount64() + 4'000 : 0;
+        mediaNotify = Make<MediaNotify>(videoWindow, ++mediaEngineGeneration);
         if (!mediaNotify) return false;
         if (FAILED(attributes->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, mediaNotify.Get()))) return false;
         presenter.SetSoftwareVideoTransfer(!mediaEngineUsesDxgiManager);

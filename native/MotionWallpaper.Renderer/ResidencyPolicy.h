@@ -5,18 +5,23 @@
 namespace motion::renderer
 {
     inline constexpr uint32_t residency_pause_grace_ms = 30'000;
+    inline constexpr uint32_t residency_desktop_grace_ms = 5'000;
     inline constexpr uint32_t residency_release_delay_ms = 250;
     inline constexpr uint32_t residency_retry_ms = 30'000;
 
-    // A frozen desktop needs only its captured image. Brief coverage pauses
-    // retain the decoder for a bounded resume window, even with ample RAM.
+    enum class IdleResidencyReason { Covered, DesktopFrozen, ReleasePromptly };
+
+    // Pausing stops decoding immediately. Retaining those idle resources for
+    // a bounded window lets quick toggles resume without opening/seeking again.
     class IdleResidencyPolicy
     {
     public:
-        void Begin(uint64_t now, bool staticDesktop, bool lowMemory) noexcept
+        void Begin(uint64_t now, IdleResidencyReason reason, bool lowMemory) noexcept
         {
-            auto deadline = now + (staticDesktop || lowMemory
-                ? residency_release_delay_ms : residency_pause_grace_ms);
+            auto delay = lowMemory || reason == IdleResidencyReason::ReleasePromptly
+                ? residency_release_delay_ms : reason == IdleResidencyReason::DesktopFrozen
+                ? residency_desktop_grace_ms : residency_pause_grace_ms;
+            auto deadline = now + delay;
             if (!active_ || deadline < deadline_) deadline_ = deadline;
             active_ = true; // Repeated pause commands cannot extend the window.
         }

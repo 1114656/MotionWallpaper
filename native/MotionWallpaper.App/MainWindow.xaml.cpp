@@ -15,6 +15,8 @@
 #pragma pop_macro("min")
 #include "../MotionWallpaper.Common/StartupEnvironment.h"
 #include <winrt/Microsoft.UI.Windowing.h>
+#include <cmath>
+#include <limits>
 
 #if __has_include("MainWindow.g.cpp")
 #include "MainWindow.g.cpp"
@@ -323,7 +325,7 @@ namespace
         setChecked(controls->powerSaver, selection & variant_power_saver);
         if (auto remove = controls->remove.get()) {
             auto label = selection & variant_source
-                ? std::wstring(L"删除源文件")
+                ? std::wstring(L"删除壁纸")
                 : selection ? std::wstring(L"删除所选") : std::wstring(L"先选择");
             remove.Content(box_value(label));
             Automation::AutomationProperties::SetName(
@@ -332,14 +334,20 @@ namespace
         }
     }
 
-    void set_media_card_selected(ListViewItem const& card, bool selected)
+    void set_media_card_selected(GridViewItem const& card, bool selected)
     {
         auto border = card.Content().try_as<Border>();
         if (!border) return;
-        border.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
-            selected ? winrt::Windows::UI::ColorHelper::FromArgb(255, 232, 243, 255) : winrt::Windows::UI::Colors::Transparent() });
-        border.BorderThickness(ThicknessHelper::FromLengths(selected ? 3 : 0, 0, 0, 0));
-        border.BorderBrush(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ winrt::Windows::UI::ColorHelper::FromArgb(255, 0, 112, 235) });
+        auto content = border.Child().try_as<StackPanel>();
+        if (!content || content.Children().Size() == 0) return;
+        auto preview = content.Children().GetAt(0).try_as<Border>();
+        if (!preview) return;
+        // Reserve the same outline in either state so selection never changes
+        // the cover size or moves the text beneath it.
+        preview.BorderThickness(ThicknessHelper::FromUniformLength(2));
+        preview.BorderBrush(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+            selected ? winrt::Windows::UI::ColorHelper::FromArgb(255, 85, 112, 255)
+                     : winrt::Windows::UI::Colors::Transparent() });
     }
 
     std::vector<fs::path> select_files(HWND owner, wchar_t const* title, wchar_t const* pattern)
@@ -400,11 +408,17 @@ namespace winrt::MotionWallpaper::implementation
         Title(L"Motion");
         ExtendsContentIntoTitleBar(true);
         SetTitleBar(AppTitleBar());
-        AppRoot().SizeChanged([this](auto const&, auto const& args) {
-            auto width = args.NewSize().Width;
-            CatalogColumn().Width(GridLengthHelper::FromPixels(width < 1150 ? 260 : 348));
-            auto available = width - 112 - (width < 1150 ? 260 : 348) - 64;
-            DraftPreviewFrame().Height((std::clamp)(available * 0.44, 220.0, 440.0));
+        AppRoot().SizeChanged([this](auto const&, auto const&) { UpdateWorkspaceLayout(); });
+        MediaList().Loaded([this](auto const&, auto const&) { UpdateWorkspaceLayout(); });
+        MediaList().SizeChanged([this](auto const&, auto const&) { UpdateWorkspaceLayout(); });
+        DisplaysPage().SizeChanged([this](auto const&, auto const&) { UpdateDisplaysPageLayout(); });
+        StoragePage().SizeChanged([this](auto const&, auto const&) { UpdateStoragePageLayout(); });
+        DisplayMapViewport().SizeChanged([this](auto const&, auto const& args) {
+            auto width = (std::clamp)(static_cast<double>(args.NewSize().Width) - 24.0, 120.0, 680.0);
+            if (std::abs(DisplayLayoutMap().Width() - width) > 0.5) {
+                DisplayLayoutMap().Width(width);
+                RefreshDisplayLayout();
+            }
         });
         SettingsPage().SizeChanged([this](auto const&, auto const& args) {
             // ActualWidth bindings can retain the initial width after a native window resize.
@@ -438,7 +452,7 @@ namespace winrt::MotionWallpaper::implementation
             presenter.PreferredMinimumHeight(box_value(MulDiv(640, static_cast<int>(dpi), 96)).as<winrt::Windows::Foundation::IReference<int32_t>>());
         } catch (...) {} // Older Windows App SDK presenters still use scrollable content.
         int width = MulDiv(1440, static_cast<int>(dpi), 96);
-        int height = MulDiv(1024, static_cast<int>(dpi), 96);
+        int height = MulDiv(900, static_cast<int>(dpi), 96);
         MONITORINFO monitor{ sizeof(monitor) };
         GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor);
         width = (std::min)(width, static_cast<int>(monitor.rcWork.right - monitor.rcWork.left));
@@ -911,19 +925,60 @@ namespace winrt::MotionWallpaper::implementation
         initializing = wasInitializing;
     }
 
+    void MainWindow::UpdateStoragePageLayout()
+    {
+        auto width = StoragePage().ActualWidth();
+        if (width <= 0) return;
+        StorageContent().Width((std::min)(1440.0, width));
+        bool twoColumns = width >= 960;
+        StorageColumns().RowSpacing(twoColumns ? 0 : 18);
+        StorageColumnGap().Width(GridLengthHelper::FromPixels(twoColumns ? 18 : 0));
+        StorageSecondColumn().Width(GridLengthHelper::FromPixels(twoColumns ? 350 : 0));
+        Grid::SetColumn(StorageRightColumn(), twoColumns ? 2 : 0);
+        Grid::SetRow(StorageRightColumn(), twoColumns ? 0 : 1);
+    }
+
+    void MainWindow::UpdateDisplaysPageLayout()
+    {
+        auto width = DisplaysPage().ActualWidth();
+        if (width <= 0) return;
+        DisplaysContent().Width((std::min)(1440.0, width));
+        bool twoColumns = width >= 960;
+        DisplayOverviewGrid().RowSpacing(twoColumns ? 0 : 16);
+        DisplayOverviewGap().Width(GridLengthHelper::FromPixels(twoColumns ? 18 : 0));
+        DisplayOverviewColumn().Width(GridLengthHelper::FromPixels(twoColumns ? 310 : 0));
+        Grid::SetColumn(DisplayPlaybackOverview(), twoColumns ? 2 : 0);
+        Grid::SetRow(DisplayPlaybackOverview(), twoColumns ? 0 : 1);
+        DisplayOverviewDetails().RowSpacing(twoColumns ? 10 : 0);
+        DisplayOverviewDetails().ColumnSpacing(twoColumns ? 0 : 16);
+        OverviewImageColumn().Width(twoColumns
+            ? GridLengthHelper::FromValueAndType(1, GridUnitType::Star)
+            : GridLengthHelper::FromPixels(200));
+        OverviewMetadataColumn().Width(twoColumns
+            ? GridLengthHelper::FromPixels(0)
+            : GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
+        Grid::SetColumn(DisplayOverviewMetadata(), twoColumns ? 0 : 1);
+        Grid::SetRow(DisplayOverviewMetadata(), twoColumns ? 1 : 0);
+        CurrentWallpaperPreviewFrame().Height(twoColumns ? 138 : 112);
+        if (DisplayRuntimeCards().ColumnDefinitions().Size() != (twoColumns ? 2u : 1u)) {
+            UpdateRuntimeStatus();
+        }
+    }
+
     void MainWindow::RefreshDisplayLayout()
     {
         auto canvas = DisplayLayoutMap();
         if (!canvas) return;
         canvas.Children().Clear();
         auto model = motion::build_display_layout_model(displays, settings.displayAssignments);
+        DisplayPageSummary().Text(std::to_wstring(model.displays.size()) + L" 块屏幕 · 独立选择壁纸，集中查看状态");
         if (model.displays.empty()) {
             DisplayLayoutHint().Text(L"当前没有检测到可用显示器。");
             return;
         }
-        constexpr double canvasWidth = 500.0;
-        constexpr double canvasHeight = 150.0;
-        constexpr double margin = 10.0;
+        auto canvasWidth = canvas.Width();
+        auto canvasHeight = canvas.Height();
+        constexpr double margin = 14.0;
         auto virtualWidth = (std::max)(1L,
             model.virtualBounds.right - model.virtualBounds.left);
         auto virtualHeight = (std::max)(1L,
@@ -938,31 +993,45 @@ namespace winrt::MotionWallpaper::implementation
         for (size_t index = 0; index < model.displays.size(); ++index) {
             auto const& display = model.displays[index];
             Button screen;
-            auto width = (std::max)(64.0,
-                static_cast<double>(display.bounds.right - display.bounds.left) * scale - 5.0);
-            auto height = (std::max)(42.0,
-                static_cast<double>(display.bounds.bottom - display.bounds.top) * scale - 5.0);
+            auto width = (std::max)(4.0,
+                static_cast<double>(display.bounds.right - display.bounds.left) * scale - 8.0);
+            auto height = (std::max)(4.0,
+                static_cast<double>(display.bounds.bottom - display.bounds.top) * scale - 8.0);
             screen.Width(width);
             screen.Height(height);
-            screen.Padding(ThicknessHelper::FromLengths(8, 5, 8, 5));
+            screen.Padding(ThicknessHelper::FromUniformLength(2));
+            screen.MinWidth(0);
+            screen.MinHeight(0);
+            screen.CornerRadius(CornerRadiusHelper::FromUniformRadius(12));
+            screen.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+                winrt::Windows::UI::ColorHelper::FromArgb(255, 255, 255, 255) });
+            screen.BorderBrush(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+                winrt::Windows::UI::ColorHelper::FromArgb(255, 216, 221, 235) });
+            screen.BorderThickness(ThicknessHelper::FromUniformLength(1));
             screen.HorizontalContentAlignment(HorizontalAlignment::Center);
             screen.VerticalContentAlignment(VerticalAlignment::Center);
             screen.Tag(box_value(motion::utf8_to_wide(display.displayId)));
             if (display.displayId == selectedDisplayId) {
                 screen.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
-                    winrt::Windows::UI::ColorHelper::FromArgb(255, 234, 242, 255) });
+                    winrt::Windows::UI::ColorHelper::FromArgb(255, 232, 236, 255) });
                 screen.BorderBrush(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
-                    winrt::Windows::UI::ColorHelper::FromArgb(255, 10, 115, 232) });
+                    winrt::Windows::UI::ColorHelper::FromArgb(255, 82, 103, 248) });
                 screen.BorderThickness(ThicknessHelper::FromUniformLength(2));
             }
             StackPanel label;
-            label.Spacing(1);
+            label.Spacing(4);
+            TextBlock number;
+            number.Text(std::to_wstring(index + 1));
+            number.FontSize((std::clamp)(height * 0.25, 12.0, 32.0));
+            number.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            number.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+                winrt::Windows::UI::ColorHelper::FromArgb(255, 65, 79, 134) });
+            number.TextAlignment(TextAlignment::Center);
+            label.Children().Append(number);
             TextBlock title;
-            title.Text(L"显示器 " + std::to_wstring(index + 1) +
-                (display.primary ? L" · 主屏" : L""));
-            title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            title.Text(display.primary ? L"主显示器" : L"扩展显示器");
+            title.FontSize(11);
             title.TextAlignment(TextAlignment::Center);
-            TextBlock assignment;
             std::wstring assignmentText = L"继承当前壁纸";
             if (display.assignment) {
                 auto group = std::find_if(groups.begin(), groups.end(), [&](auto const& value) {
@@ -970,14 +1039,8 @@ namespace winrt::MotionWallpaper::implementation
                 });
                 assignmentText = group == groups.end() ? L"已独立分配" : group->name;
             }
-            assignment.Text(assignmentText);
-            assignment.FontSize(11);
-            assignment.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
-                winrt::Windows::UI::ColorHelper::FromArgb(255, 114, 120, 129) });
-            assignment.TextTrimming(TextTrimming::CharacterEllipsis);
-            assignment.TextAlignment(TextAlignment::Center);
-            label.Children().Append(title);
-            label.Children().Append(assignment);
+            if (height >= 70 && width >= 90) label.Children().Append(title);
+            ToolTipService::SetToolTip(screen, box_value(L"显示器 " + std::to_wstring(index + 1) + L" · " + assignmentText));
             screen.Content(label);
             Automation::AutomationProperties::SetName(screen,
                 hstring(L"选择显示器 " + std::to_wstring(index + 1) + L" 分配壁纸"));
@@ -992,8 +1055,8 @@ namespace winrt::MotionWallpaper::implementation
             canvas.Children().Append(screen);
         }
         DisplayLayoutHint().Text(selectedDisplayId.empty()
-            ? L"点击一块屏幕，选择壁纸预览后再应用。"
-            : L"已选择屏幕。可在壁纸页预览并确认应用。");
+            ? L"点击屏幕选择壁纸，确认应用后才会更换。"
+            : L"高亮为已选屏幕；点击可前往壁纸库更换。");
     }
 
     void MainWindow::SelectDisplayFromLayout(std::string const& displayId)
@@ -1114,6 +1177,16 @@ namespace winrt::MotionWallpaper::implementation
     void MainWindow::UpdateRuntimeStatus()
     {
         DisplayRuntimeCards().Children().Clear();
+        DisplayRuntimeCards().RowDefinitions().Clear();
+        DisplayRuntimeCards().ColumnDefinitions().Clear();
+        DisplayRuntimeCards().RowSpacing(16);
+        DisplayRuntimeCards().ColumnSpacing(16);
+        auto columnCount = DisplaysPage().ActualWidth() >= 960 ? 2 : 1;
+        for (int column = 0; column < columnCount; ++column) {
+            ColumnDefinition definition;
+            definition.Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
+            DisplayRuntimeCards().ColumnDefinitions().Append(definition);
+        }
         auto states = runtimeState.displayStates;
         if (states.empty()) {
             for (auto const& display : displays) {
@@ -1184,59 +1257,101 @@ namespace winrt::MotionWallpaper::implementation
             canRestart = canRestart || state.canRestartRenderer;
 
             Border card;
-            card.Padding(ThicknessHelper::FromLengths(12, 10, 12, 10));
-            card.CornerRadius(CornerRadiusHelper::FromUniformRadius(9));
+            card.Padding(ThicknessHelper::FromUniformLength(18));
+            card.CornerRadius(CornerRadiusHelper::FromUniformRadius(20));
+            card.BorderThickness(ThicknessHelper::FromUniformLength(1));
+            card.BorderBrush(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+                winrt::Windows::UI::ColorHelper::FromArgb(255, 233, 235, 245) });
             card.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
-                winrt::Windows::UI::ColorHelper::FromArgb(255, 246, 248, 251) });
+                winrt::Windows::UI::Colors::White() });
+            card.VerticalAlignment(VerticalAlignment::Stretch);
 
-            Grid layout;
-            layout.ColumnSpacing(10);
-            ColumnDefinition dotColumn;
-            dotColumn.Width(GridLengthHelper::FromPixels(10));
-            layout.ColumnDefinitions().Append(dotColumn);
+            StackPanel layout;
+            layout.Spacing(12);
+            Grid heading;
+            heading.ColumnSpacing(10);
+            ColumnDefinition badgeColumn;
+            badgeColumn.Width(GridLengthHelper::FromPixels(40));
+            heading.ColumnDefinitions().Append(badgeColumn);
             ColumnDefinition displayColumn;
             displayColumn.Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
-            layout.ColumnDefinitions().Append(displayColumn);
+            heading.ColumnDefinitions().Append(displayColumn);
             ColumnDefinition stateColumn;
             stateColumn.Width(GridLengthHelper::Auto());
-            layout.ColumnDefinitions().Append(stateColumn);
-            ColumnDefinition actionColumn;
-            actionColumn.Width(GridLengthHelper::Auto());
-            layout.ColumnDefinitions().Append(actionColumn);
-
-            Border dot;
-            dot.Width(9);
-            dot.Height(9);
-            dot.CornerRadius(CornerRadiusHelper::FromUniformRadius(5));
-            dot.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
-                runtime_state_color(state.state) });
-            dot.VerticalAlignment(VerticalAlignment::Center);
-            layout.Children().Append(dot);
+            heading.ColumnDefinitions().Append(stateColumn);
 
             StackPanel identity;
-            identity.Spacing(2);
+            identity.Spacing(4);
             auto connectedDisplay = std::find_if(displays.begin(), displays.end(), [&](auto const& value) { return value.id == state.displayId; });
             auto number = connectedDisplay == displays.end() ? index + 1 : static_cast<size_t>(std::distance(displays.begin(), connectedDisplay)) + 1;
             auto displayName = L"显示器 " + std::to_wstring(number) +
-                (connectedDisplay != displays.end() && connectedDisplay->primary ? L" · 主屏" : L"") +
-                (state.displayName.empty() ? L"" : L" · " + state.displayName);
+                (connectedDisplay != displays.end() && connectedDisplay->primary ? L" · 主屏" : L"");
+            Border badge;
+            badge.Width(40);
+            badge.Height(40);
+            badge.VerticalAlignment(VerticalAlignment::Top);
+            badge.CornerRadius(CornerRadiusHelper::FromUniformRadius(12));
+            badge.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+                winrt::Windows::UI::ColorHelper::FromArgb(255, 239, 241, 255) });
+            TextBlock badgeNumber;
+            badgeNumber.Text(std::to_wstring(number));
+            badgeNumber.FontSize(18);
+            badgeNumber.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            badgeNumber.HorizontalAlignment(HorizontalAlignment::Center);
+            badgeNumber.VerticalAlignment(VerticalAlignment::Center);
+            badgeNumber.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+                winrt::Windows::UI::ColorHelper::FromArgb(255, 85, 112, 255) });
+            badge.Child(badgeNumber);
+            heading.Children().Append(badge);
             TextBlock name;
             name.Text(displayName);
+            name.FontSize(15);
             name.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            name.TextTrimming(TextTrimming::CharacterEllipsis);
             identity.Children().Append(name);
+            TextBlock specifications;
+            std::wstring specificationText = L"显示参数暂不可用";
+            if (connectedDisplay != displays.end()) {
+                auto rate = motion::effective_display_refresh_rate(*connectedDisplay);
+                wchar_t refreshText[32]{};
+                if (rate.numerator % rate.denominator == 0) {
+                    swprintf_s(refreshText, L"%u Hz", rate.numerator / rate.denominator);
+                } else {
+                    swprintf_s(refreshText, L"%.2f Hz", static_cast<double>(rate.numerator) / rate.denominator);
+                }
+                specificationText = std::to_wstring(connectedDisplay->bounds.right - connectedDisplay->bounds.left) +
+                    L" × " + std::to_wstring(connectedDisplay->bounds.bottom - connectedDisplay->bounds.top) +
+                    L" · " + refreshText;
+            }
+            specifications.Text(specificationText);
+            specifications.FontSize(12);
+            specifications.Opacity(0.62);
+            specifications.TextTrimming(TextTrimming::CharacterEllipsis);
+            identity.Children().Append(specifications);
+            Grid::SetColumn(identity, 1);
+            heading.Children().Append(identity);
+
+            TextBlock friendlyName;
+            auto friendlyText = connectedDisplay != displays.end() && !connectedDisplay->friendlyName.empty()
+                ? connectedDisplay->friendlyName : state.displayName;
+            if (friendlyText.empty()) friendlyText = state.deviceName;
+            friendlyName.Text(friendlyText);
+            friendlyName.FontSize(12);
+            friendlyName.Opacity(0.55);
+            friendlyName.TextTrimming(TextTrimming::CharacterEllipsis);
+            ToolTipService::SetToolTip(friendlyName, box_value(friendlyText));
+
             TextBlock reason;
             auto reasonText = runtime_reason_label(state.reason);
             reason.Text(reasonText.empty() ? L"运行正常" : reasonText);
             reason.FontSize(12);
             reason.Opacity(0.62);
             reason.TextWrapping(TextWrapping::Wrap);
-            identity.Children().Append(reason);
-            Grid::SetColumn(identity, 1);
-            layout.Children().Append(identity);
 
             Border statusChip;
             statusChip.Padding(ThicknessHelper::FromLengths(9, 4, 9, 4));
             statusChip.CornerRadius(CornerRadiusHelper::FromUniformRadius(10));
+            statusChip.VerticalAlignment(VerticalAlignment::Top);
             auto stateColor = runtime_state_color(state.state);
             statusChip.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
                 winrt::Windows::UI::ColorHelper::FromArgb(24, stateColor.R, stateColor.G, stateColor.B) });
@@ -1247,9 +1362,12 @@ namespace winrt::MotionWallpaper::implementation
             status.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ stateColor });
             statusChip.Child(status);
             Grid::SetColumn(statusChip, 2);
-            layout.Children().Append(statusChip);
+            heading.Children().Append(statusChip);
+            layout.Children().Append(heading);
+            layout.Children().Append(friendlyName);
+            layout.Children().Append(reason);
 
-            if (state.canRetry || state.canRestartRenderer || missingCopy || state.reason == "manual-pause") {
+            {
                 StackPanel actions;
                 actions.Orientation(Orientation::Horizontal);
                 actions.Spacing(6);
@@ -1300,14 +1418,29 @@ namespace winrt::MotionWallpaper::implementation
                     });
                     actions.Children().Append(restart);
                 }
-                Grid::SetColumn(actions, 3);
+                Button change;
+                change.Content(box_value(L"更换壁纸"));
+                change.Padding(ThicknessHelper::FromLengths(9, 4, 9, 4));
+                Automation::AutomationProperties::SetName(change, hstring(displayName + L"，更换壁纸"));
+                change.Click([weak = get_weak(), displayId = state.displayId](auto const&, auto const&) {
+                    if (auto self = weak.get()) self->SelectDisplayFromLayout(displayId);
+                });
+                actions.Children().Append(change);
                 layout.Children().Append(actions);
             }
 
             Automation::AutomationProperties::SetName(card,
-                hstring(displayName + L"，" + runtime_state_label(state.state) +
+                hstring(displayName + (friendlyText.empty() ? std::wstring{} : L"，" + friendlyText) +
+                    L"，" + specificationText + L"，" + runtime_state_label(state.state) +
                     (reasonText.empty() ? std::wstring{} : L"，" + reasonText)));
             card.Child(layout);
+            if (index % columnCount == 0) {
+                RowDefinition row;
+                row.Height(GridLengthHelper::Auto());
+                DisplayRuntimeCards().RowDefinitions().Append(row);
+            }
+            Grid::SetColumn(card, static_cast<int32_t>(index % columnCount));
+            Grid::SetRow(card, static_cast<int32_t>(index / columnCount));
             DisplayRuntimeCards().Children().Append(card);
         }
 
@@ -1496,8 +1629,11 @@ namespace winrt::MotionWallpaper::implementation
         auto writeLease = TryAcquireLibraryWrite(false);
         if (!writeLease) return;
         CurrentWallpaperName().Text(L"尚未选择壁纸");
+        overviewGroupId.clear();
         CurrentWallpaperDetails().Text(L"从壁纸分组中选择即可应用");
         CurrentWallpaperPreview().Source(nullptr);
+        CurrentWallpaperPreviewFrame().Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+            winrt::Windows::UI::ColorHelper::FromArgb(255, 243, 244, 249) });
         CurrentWallpaperThumb1().Source(nullptr);
         CurrentWallpaperThumb2().Source(nullptr);
         CurrentWallpaperThumb3().Source(nullptr);
@@ -1572,6 +1708,7 @@ namespace winrt::MotionWallpaper::implementation
                 currentIsVideo = selected->kind == "video";
                 if (currentIsVideo) currentVideo = *selected;
                 CurrentWallpaperName().Text(selected->name);
+                overviewGroupId = summaryGroupId;
                 bool sourceAvailable = mediaLibrary->SourceAvailable(*selected);
                 CurrentWallpaperDetails().Text(selected->kind == "image"
                     ? L"静态图片 · " + format_size(selected->sizeBytes)
@@ -1579,7 +1716,14 @@ namespace winrt::MotionWallpaper::implementation
                     : L"视频 · 仅保留优化版本");
                 auto cover = mediaLibrary->MediaDirectory(*selected) / selected->coverFileName;
                 if (!selected->coverFileName.empty() && fs::is_regular_file(cover)) {
-                    CurrentWallpaperPreview().Source(winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage{ winrt::Windows::Foundation::Uri(file_uri(cover)) });
+                    winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage bitmap;
+                    bitmap.DecodePixelWidth(640);
+                    bitmap.UriSource(winrt::Windows::Foundation::Uri(file_uri(cover)));
+                    CurrentWallpaperPreview().Source(bitmap);
+                    winrt::Microsoft::UI::Xaml::Media::ImageBrush brush;
+                    brush.ImageSource(bitmap);
+                    brush.Stretch(winrt::Microsoft::UI::Xaml::Media::Stretch::UniformToFill);
+                    CurrentWallpaperPreviewFrame().Background(brush);
                 }
             }
 
@@ -1588,7 +1732,9 @@ namespace winrt::MotionWallpaper::implementation
                 if (thumbnailIndex >= 4) break;
                 auto cover = mediaLibrary->MediaDirectory(item) / item.coverFileName;
                 if (item.coverFileName.empty() || !fs::is_regular_file(cover)) continue;
-                auto source = winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage{ winrt::Windows::Foundation::Uri(file_uri(cover)) };
+                winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage source;
+                source.DecodePixelWidth(240);
+                source.UriSource(winrt::Windows::Foundation::Uri(file_uri(cover)));
                 switch (thumbnailIndex++) {
                 case 0: CurrentWallpaperThumb1().Source(source); break;
                 case 1: CurrentWallpaperThumb2().Source(source); break;
@@ -1867,36 +2013,45 @@ namespace winrt::MotionWallpaper::implementation
         for (size_t index = 0; index < filteredMedia.size(); ++index) {
             auto const& media = filteredMedia[index];
             bool isSelected = media.id == selectedWallpaper.second && media.groupId == selectedWallpaper.first;
-            ListViewItem card;
-            Grid content;
-            content.ColumnSpacing(12);
-            ColumnDefinition thumbColumn; thumbColumn.Width(GridLengthHelper::FromPixels(110));
-            ColumnDefinition labelColumn; labelColumn.Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
-            content.ColumnDefinitions().Append(thumbColumn); content.ColumnDefinitions().Append(labelColumn);
-            Border preview; preview.Width(110); preview.Height(76);
-            preview.CornerRadius(CornerRadiusHelper::FromUniformRadius(6));
+            GridViewItem card;
+            card.HorizontalAlignment(HorizontalAlignment::Stretch);
+            card.HorizontalContentAlignment(HorizontalAlignment::Stretch);
+            card.VerticalContentAlignment(VerticalAlignment::Top);
+            StackPanel content;
+            content.Spacing(8);
+            content.HorizontalAlignment(HorizontalAlignment::Stretch);
+            Border preview; preview.Height(135);
+            preview.HorizontalAlignment(HorizontalAlignment::Stretch);
+            preview.CornerRadius(CornerRadiusHelper::FromUniformRadius(14));
             preview.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ winrt::Windows::UI::ColorHelper::FromArgb(255, 232, 237, 244) });
             auto coverPath = mediaLibrary->MediaDirectory(media) / media.coverFileName;
             if (!media.coverFileName.empty() && fs::is_regular_file(coverPath)) {
-                Image image; image.Stretch(winrt::Microsoft::UI::Xaml::Media::Stretch::UniformToFill);
                 winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage bitmap;
-                bitmap.DecodePixelWidth(240); bitmap.UriSource(winrt::Windows::Foundation::Uri(file_uri(coverPath)));
-                image.Source(bitmap); preview.Child(image);
-            } else { FontIcon icon; icon.Glyph(L"\xE8B9"); icon.Opacity(0.4); preview.Child(icon); }
+                bitmap.DecodePixelWidth(480); bitmap.UriSource(winrt::Windows::Foundation::Uri(file_uri(coverPath)));
+                // Painting the bitmap as the Border background makes its
+                // rounded geometry clip the cover without a square child.
+                winrt::Microsoft::UI::Xaml::Media::ImageBrush cover;
+                cover.ImageSource(bitmap);
+                cover.Stretch(winrt::Microsoft::UI::Xaml::Media::Stretch::UniformToFill);
+                preview.Background(cover);
+            } else { FontIcon icon; icon.Glyph(L"\xE8B9"); icon.FontSize(28); icon.Opacity(0.4); preview.Child(icon); }
             content.Children().Append(preview);
-            StackPanel labels; labels.Spacing(5); labels.VerticalAlignment(VerticalAlignment::Center);
-            Grid::SetColumn(labels, 1);
-            TextBlock title; title.Text(media.name); title.FontSize(16); title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+            StackPanel labels; labels.Spacing(4);
+            labels.Margin(ThicknessHelper::FromLengths(4, 0, 4, 0));
+            TextBlock title; title.Text(media.name); title.FontSize(15); title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
             title.TextTrimming(TextTrimming::CharacterEllipsis);
             TextBlock detail; detail.Text((media.favorite ? L"★ · " : L"") +
                 std::wstring(media.kind == "video" ? L"视频 · " : L"图片 · ") + format_size(media.sizeBytes));
-            detail.FontSize(13); detail.Opacity(0.7); detail.TextTrimming(TextTrimming::CharacterEllipsis);
+            detail.FontSize(13); detail.Opacity(0.68); detail.TextTrimming(TextTrimming::CharacterEllipsis);
             labels.Children().Append(title); labels.Children().Append(detail); content.Children().Append(labels);
-            Border selection; selection.Padding(ThicknessHelper::FromUniformLength(8)); selection.CornerRadius(CornerRadiusHelper::FromUniformRadius(6)); selection.Child(content);
+            Border selection; selection.Padding(ThicknessHelper::FromUniformLength(0));
+            selection.HorizontalAlignment(HorizontalAlignment::Stretch);
+            selection.CornerRadius(CornerRadiusHelper::FromUniformRadius(18)); selection.Child(content);
             card.Padding(ThicknessHelper::FromUniformLength(0));
+            card.Margin(ThicknessHelper::FromLengths(0, 0, 16, 20));
             card.Content(selection); ToolTipService::SetToolTip(card, box_value(media.name));
             Automation::AutomationProperties::SetName(card, media.name);
-            set_media_card_selected(card, isSelected); MediaList().Items().Append(card);
+            set_media_card_selected(card, isSelected && !batchSelectionMode); MediaList().Items().Append(card);
             if (isSelected) selected = static_cast<int>(index);
         }
         MediaCount().Text((catalogQuery ? std::wstring(L"全库 ") : std::wstring{}) +
@@ -1912,8 +2067,9 @@ namespace winrt::MotionWallpaper::implementation
     {
         auto count = MediaList().Items().Size();
         for (uint32_t index = 0; index < count; ++index) {
-            auto card = MediaList().Items().GetAt(index).try_as<ListViewItem>();
-            if (card) set_media_card_selected(card, static_cast<int32_t>(index) == selectedIndex);
+            auto card = MediaList().Items().GetAt(index).try_as<GridViewItem>();
+            if (card) set_media_card_selected(card, batchSelectionMode ? card.IsSelected()
+                : static_cast<int32_t>(index) == selectedIndex);
         }
     }
 
@@ -1962,7 +2118,11 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::MediaFilter_Changed(IInspectable const&, SelectionChangedEventArgs const&)
     {
-        if (!initializing) RefreshMedia();
+        if (initializing) return;
+        AllMediaFilter().IsChecked(MediaKindFilter().SelectedIndex() == 0);
+        VideoMediaFilter().IsChecked(MediaKindFilter().SelectedIndex() == 1);
+        ImageMediaFilter().IsChecked(MediaKindFilter().SelectedIndex() == 2);
+        RefreshMedia();
     }
 
     void MainWindow::MediaFilter_Click(IInspectable const&, RoutedEventArgs const&)
@@ -2034,11 +2194,11 @@ namespace winrt::MotionWallpaper::implementation
     void MainWindow::WallpaperNav_Click(IInspectable const&, RoutedEventArgs const&) { ShowWallpaperPage(); }
     void MainWindow::DisplaysNav_Click(IInspectable const&, RoutedEventArgs const&)
     {
-        LoadDisplayTargets(); UpdateRuntimeStatus(); Navigate(AppPage::Displays);
+        LoadDisplayTargets(); UpdateStatusSummary(); Navigate(AppPage::Displays); UpdateDisplaysPageLayout();
     }
     void MainWindow::StorageNav_Click(IInspectable const&, RoutedEventArgs const&)
     {
-        RefreshVariants(); Navigate(AppPage::Storage);
+        RefreshVariants(); Navigate(AppPage::Storage); UpdateStoragePageLayout();
     }
     void MainWindow::IdentifyDisplays_Click(IInspectable const&, RoutedEventArgs const&)
     {
@@ -2056,8 +2216,15 @@ namespace winrt::MotionWallpaper::implementation
 
     void MainWindow::RefreshDraftImage()
     {
+        auto clearPreview = [&] {
+            DraftPreview().Source(nullptr);
+            DraftPreviewFrame().Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+                winrt::Windows::UI::ColorHelper::FromArgb(255, 239, 241, 247) });
+            DraftPlaceholder().Visibility(Visibility::Visible);
+            previewImagePath.clear();
+        };
         if (!draftMedia || !mediaLibraryAvailable || closing.load()) {
-            DraftPreview().Source(nullptr); DraftPlaceholder().Visibility(Visibility::Visible);
+            clearPreview();
             previewSource.clear(); previewImagePath.clear(); previewFileLease.reset();
             previewPollsRemaining = 0; return;
         }
@@ -2088,25 +2255,29 @@ namespace winrt::MotionWallpaper::implementation
             } else if (previewFileLease && !changed) path = previewImagePath;
             std::error_code error;
             if (path.empty() || !fs::is_regular_file(path, error)) {
-                DraftPreview().Source(nullptr); DraftPlaceholder().Visibility(Visibility::Visible); return;
+                clearPreview(); return;
             }
             if (path != previewImagePath) {
                 winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage bitmap;
                 // Only one decoded large still lives in the UI. Gallery and
                 // display selectors keep independently bounded thumbnails.
-                bitmap.DecodePixelWidth(1920);
+                bitmap.DecodePixelWidth(960);
                 bitmap.UriSource(winrt::Windows::Foundation::Uri(file_uri(path)));
                 DraftPreview().Source(bitmap); previewImagePath = path;
+                winrt::Microsoft::UI::Xaml::Media::ImageBrush still;
+                still.ImageSource(bitmap); still.Stretch(winrt::Microsoft::UI::Xaml::Media::Stretch::UniformToFill);
+                DraftPreviewFrame().Background(still);
             }
             DraftPlaceholder().Visibility(Visibility::Collapsed);
         } catch (...) {
             previewPollsRemaining = 0;
-            DraftPreview().Source(nullptr); DraftPlaceholder().Visibility(Visibility::Visible);
+            clearPreview();
         }
     }
 
     void MainWindow::RefreshWorkspace()
     {
+        AllDisplaysButton().IsChecked(selectedDisplayId.empty());
         OriginalQuality().IsChecked(settings.performanceMode == "original");
         BalancedQuality().IsChecked(settings.performanceMode == "balanced");
         PowerSaverQuality().IsChecked(settings.performanceMode == "power-saver");
@@ -2166,41 +2337,41 @@ namespace winrt::MotionWallpaper::implementation
         if (fingerprint != displayCardsFingerprint || DisplayTargetCards().Children().Size() == 0) {
             displayCardsFingerprint = fingerprint; DisplayTargetCards().Children().Clear();
             auto addTarget = [&](std::string id, std::wstring label, std::optional<motion::MediaMetadata> const& media, size_t number) {
-                Button button; button.Width(188); button.Padding(ThicknessHelper::FromUniformLength(7));
-                button.CornerRadius(CornerRadiusHelper::FromUniformRadius(8));
+                Button button; button.Width(132); button.Padding(ThicknessHelper::FromUniformLength(4));
+                button.CornerRadius(CornerRadiusHelper::FromUniformRadius(14));
                 bool selected = id == selectedDisplayId;
-                button.BorderThickness(ThicknessHelper::FromUniformLength(selected ? 2 : 1));
+                button.BorderThickness(ThicknessHelper::FromUniformLength(2));
                 button.BorderBrush(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ selected
-                    ? winrt::Windows::UI::ColorHelper::FromArgb(255, 0, 112, 235) : winrt::Windows::UI::ColorHelper::FromArgb(255, 222, 229, 237) });
+                    ? winrt::Windows::UI::ColorHelper::FromArgb(255, 85, 112, 255) : winrt::Windows::UI::Colors::Transparent() });
                 button.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ selected
-                    ? winrt::Windows::UI::ColorHelper::FromArgb(255, 232, 243, 255) : winrt::Windows::UI::Colors::Transparent() });
-                StackPanel content; content.Spacing(10); content.Width(170);
-                Border frame; frame.Height(104); frame.CornerRadius(CornerRadiusHelper::FromUniformRadius(5));
+                    ? winrt::Windows::UI::ColorHelper::FromArgb(255, 238, 240, 255) : winrt::Windows::UI::Colors::Transparent() });
+                StackPanel content; content.Spacing(7); content.Width(120);
+                Border frame; frame.Height(72); frame.CornerRadius(CornerRadiusHelper::FromUniformRadius(10));
                 frame.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ winrt::Windows::UI::ColorHelper::FromArgb(255, 227, 234, 242) });
                 Grid visual;
                 if (media && !media->coverFileName.empty()) {
                     auto cover = mediaLibrary->MediaDirectory(*media) / media->coverFileName;
                     std::error_code ignored;
                     if (fs::is_regular_file(cover, ignored)) {
-                        Image image; image.Stretch(winrt::Microsoft::UI::Xaml::Media::Stretch::UniformToFill);
                         winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage bitmap; bitmap.DecodePixelWidth(300);
-                        bitmap.UriSource(winrt::Windows::Foundation::Uri(file_uri(cover))); image.Source(bitmap); visual.Children().Append(image);
+                        bitmap.UriSource(winrt::Windows::Foundation::Uri(file_uri(cover)));
+                        winrt::Microsoft::UI::Xaml::Media::ImageBrush coverBrush; coverBrush.ImageSource(bitmap);
+                        coverBrush.Stretch(winrt::Microsoft::UI::Xaml::Media::Stretch::UniformToFill); frame.Background(coverBrush);
                     }
                 }
                 if (number) {
                     Border badge; badge.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ winrt::Windows::UI::ColorHelper::FromArgb(155, 12, 25, 40) });
                     badge.CornerRadius(CornerRadiusHelper::FromUniformRadius(6)); badge.Padding(ThicknessHelper::FromLengths(10, 2, 10, 2));
                     badge.HorizontalAlignment(HorizontalAlignment::Center); badge.VerticalAlignment(VerticalAlignment::Center);
-                    TextBlock text; text.Text(std::to_wstring(number)); text.FontSize(25); text.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+                    TextBlock text; text.Text(std::to_wstring(number)); text.FontSize(22); text.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
                     text.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ winrt::Windows::UI::Colors::White() }); badge.Child(text); visual.Children().Append(badge);
                 } else { FontIcon icon; icon.Glyph(L"\xE7F4"); icon.FontSize(28); icon.Opacity(0.65); visual.Children().Append(icon); }
                 frame.Child(visual); content.Children().Append(frame);
-                TextBlock name; name.Text(label); name.FontSize(14); name.TextAlignment(TextAlignment::Center); content.Children().Append(name);
+                TextBlock name; name.Text(label); name.FontSize(13); name.TextAlignment(TextAlignment::Center); content.Children().Append(name);
                 button.Content(content); Automation::AutomationProperties::SetName(button, label + (selected ? L"，已选择" : L""));
                 button.Click([weak = get_weak(), id](auto const&, auto const&) { if (auto self = weak.get()) self->SelectDisplayFromLayout(id); });
                 DisplayTargetCards().Children().Append(button);
             };
-            addTarget({}, L"全部显示器", {}, 0);
             for (size_t i = 0; i < displays.size(); ++i) {
                 auto const& display = displays[i];
                 addTarget(display.id, L"显示器 " + std::to_wstring(i + 1) + (display.primary ? L" · 主屏" : L""), findMedia(assignmentFor(display.id)), i + 1);
@@ -2224,7 +2395,9 @@ namespace winrt::MotionWallpaper::implementation
                 state = failed ? L"应用失败" : optimizing ? L"正在优化" : confirmed ? (paused ? L"已暂停" : L"已应用") : L"正在应用";
             }
         }
-        DraftTitle().Text(draftMedia ? L"预览：" + draftMedia->name : L"选择一张壁纸预览");
+        DraftTitle().Text(draftMedia ? draftMedia->name : L"选择一张壁纸");
+        DraftDetailsText().Text(draftMedia ? (draftMedia->kind == "video" ? L"视频 · " : L"图片 · ") +
+            format_size(draftMedia->sizeBytes) : L"选择后可预览和应用");
         if (draftMedia) ToolTipService::SetToolTip(DraftTitle(), box_value(draftMedia->name));
         if (state == L"正在应用" && !settings.desktopPlayback) state = L"桌面播放未开启";
         DraftState().Text(state);
@@ -2234,17 +2407,60 @@ namespace winrt::MotionWallpaper::implementation
         ApplyWallpaperButton().Content(box_value(L"应用到" + targetLabel));
         ApplyWallpaperButton().IsEnabled(draftMedia.has_value() && connected && !batchSelectionMode && writeLease != nullptr);
         RefreshDraftImage();
+        UpdateWorkspaceLayout();
+    }
+
+    void MainWindow::UpdateWorkspaceLayout()
+    {
+        auto width = AppRoot().ActualWidth();
+        NavigationColumn().Width(GridLengthHelper::FromPixels(176));
+        InspectorColumn().Width(GridLengthHelper::FromPixels(width >= 1250 ? 380 : 330));
+        DraftPreviewFrame().Height(width >= 1250 ? 184 : 156);
+        auto panel = MediaList().ItemsPanelRoot().try_as<ItemsWrapGrid>();
+        auto available = MediaList().ActualWidth() - 12;
+        if (!panel || available <= 0) return;
+        // Keep covers at 240x135 DIP (+16 DIP gutter). The panel wraps to
+        // additional columns as space grows, even with only one or two items.
+        // Shrink only when the viewport cannot fit a single normal-size card.
+        auto itemWidth = (std::min)(256.0, available);
+        if (std::abs(panel.ItemWidth() - itemWidth) > 0.5) panel.ItemWidth(itemWidth);
+        auto imageHeight = (std::max)(1.0, itemWidth - 16) * 9.0 / 16.0;
+        for (auto const& item : MediaList().Items()) {
+            auto container = item.try_as<GridViewItem>();
+            auto border = container ? container.Content().try_as<Border>() : nullptr;
+            auto content = border ? border.Child().try_as<StackPanel>() : nullptr;
+            if (content && content.Children().Size()) {
+                if (auto cover = content.Children().GetAt(0).try_as<Border>()) cover.Height(imageHeight);
+            }
+        }
+    }
+
+    void MainWindow::AllDisplays_Click(IInspectable const&, RoutedEventArgs const&)
+    {
+        SelectDisplayFromLayout({});
+    }
+
+    void MainWindow::MediaKind_Click(IInspectable const& sender, RoutedEventArgs const&)
+    {
+        if (initializing) return;
+        auto chip = sender.as<winrt::Microsoft::UI::Xaml::Controls::Primitives::ToggleButton>();
+        auto tag = unbox_value_or<hstring>(chip.Tag(), L"0");
+        MediaKindFilter().SelectedIndex(tag == L"1" ? 1 : tag == L"2" ? 2 : 0);
+        AllMediaFilter().IsChecked(MediaKindFilter().SelectedIndex() == 0);
+        VideoMediaFilter().IsChecked(MediaKindFilter().SelectedIndex() == 1);
+        ImageMediaFilter().IsChecked(MediaKindFilter().SelectedIndex() == 2);
     }
 
     void MainWindow::CurrentWallpaper_Click(IInspectable const&, RoutedEventArgs const&)
     {
-        if (!motion::valid_id(settings.selectedGroupId)) return;
+        auto groupId = overviewGroupId;
+        if (!motion::valid_id(groupId)) return;
         for (size_t index = 0; index < groups.size(); ++index) {
-            if (groups[index].id != settings.selectedGroupId) continue;
+            if (groups[index].id != groupId) continue;
             bool wasInitializing = initializing;
             initializing = true;
             GroupPicker().SelectedIndex(static_cast<int32_t>(index));
-            browsingGroupId = settings.selectedGroupId;
+            browsingGroupId = groupId;
             initializing = wasInitializing;
             LoadMedia();
             ShowWallpaperPage();
@@ -2488,9 +2704,9 @@ namespace winrt::MotionWallpaper::implementation
         StorageNavIndicator().Visibility(active(AppPage::Storage));
         auto style = [&](Button const& button, AppPage expected) {
             button.Background(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ page == expected
-                ? winrt::Windows::UI::ColorHelper::FromArgb(255, 231, 242, 255) : winrt::Windows::UI::Colors::Transparent() });
+                ? winrt::Windows::UI::ColorHelper::FromArgb(255, 223, 228, 255) : winrt::Windows::UI::Colors::Transparent() });
             button.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{ page == expected
-                ? winrt::Windows::UI::ColorHelper::FromArgb(255, 0, 103, 192) : winrt::Windows::UI::ColorHelper::FromArgb(255, 100, 111, 129) });
+                ? winrt::Windows::UI::ColorHelper::FromArgb(255, 48, 74, 200) : winrt::Windows::UI::ColorHelper::FromArgb(255, 91, 100, 124) });
         };
         style(SettingsNavButton(), AppPage::Settings); style(VariantsNavButton(), AppPage::Variants);
         style(WallpaperNavButton(), AppPage::WallpaperGroup); style(DisplaysNavButton(), AppPage::Displays);
@@ -2533,9 +2749,21 @@ namespace winrt::MotionWallpaper::implementation
             if (item.status.queued || item.status.failed) ++taskCount;
         }
         auto storage = mediaLibrary->InspectOptimizationStorage();
-        OptimizationStorageText().Text(format_size(storage.bytes) + L" 已使用 · " +
-            format_size(storage.reclaimableBytes) + L" 可安全释放 · " +
-            std::to_wstring(storage.queuedTasks) + L" 个等待任务");
+        StorageUsageValue().Text(format_size(storage.bytes));
+        StorageUsageCaption().Text(storage.files
+            ? std::to_wstring(storage.files) + L" 个性能副本" : L"尚未生成性能副本");
+        auto storageQuota = settings.optimizationStorageQuotaBytes;
+        StorageQuotaCaption().Text(storageQuota
+            ? L"已保存上限 · " + format_size(storageQuota) : L"不限制容量");
+        StorageUsageBar().Minimum(0);
+        StorageUsageBar().Maximum(100);
+        StorageUsageBar().Value(storageQuota
+            ? (std::min)(100.0, static_cast<double>(storage.bytes) / static_cast<double>(storageQuota) * 100.0)
+            : 0.0);
+        StorageUsageBar().Visibility(storageQuota ? Visibility::Visible : Visibility::Collapsed);
+        StorageReclaimableValue().Text(format_size(storage.reclaimableBytes));
+        StorageQueueValue().Text(std::to_wstring(taskCount));
+        OptimizationStorageText().Text(L"整理会保留使用中的壁纸，以及仅剩副本的项目。");
 
         SYSTEM_POWER_STATUS powerStatus{};
         bool waitingForPower = GetSystemPowerStatus(&powerStatus) && powerStatus.ACLineStatus == 0;
@@ -2827,7 +3055,9 @@ namespace winrt::MotionWallpaper::implementation
             CheckBox sourceTitle;
             sourceTitle.Content(box_value(L"源文件"));
             Automation::AutomationProperties::SetName(
-                sourceTitle, hstring(item.media.name + L"，源文件，保留选择"));
+                sourceTitle, hstring(item.media.name + L"，源文件，删除整张壁纸"));
+            ToolTipService::SetToolTip(sourceTitle,
+                box_value(L"选择后删除整张壁纸，源文件、全部副本和封面一起移入回收站"));
             sourceTitle.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
             sourceTitle.IsEnabled(item.sourceAvailable);
             if (selection & variant_source) {
@@ -2846,7 +3076,7 @@ namespace winrt::MotionWallpaper::implementation
             sourceDetail.Opacity(0.62);
             TextBlock sourceState;
             sourceState.Text(item.sourceAvailable
-                ? L"可单独移入回收站"
+                ? L"删除时一并移除全部副本"
                 : L"无法选择原画或重新生成");
             sourceState.FontSize(12);
             sourceState.Opacity(0.62);
@@ -2875,25 +3105,43 @@ namespace winrt::MotionWallpaper::implementation
         ShowWallpaperPage();
     }
 
-    void MainWindow::GroupPicker_RightTapped(IInspectable const&,
-        winrt::Microsoft::UI::Xaml::Input::RightTappedRoutedEventArgs const& args)
+    void MainWindow::GroupPicker_ContextRequested(IInspectable const&,
+        winrt::Microsoft::UI::Xaml::Input::ContextRequestedEventArgs const& args)
     {
+        if (libraryAccessGate->MigrationInProgress()) return;
         auto source = args.OriginalSource().try_as<DependencyObject>();
         while (source && !source.try_as<ListViewItem>()) {
             source = winrt::Microsoft::UI::Xaml::Media::VisualTreeHelper::GetParent(source);
         }
         auto item = source.try_as<ListViewItem>();
+        Windows::Foundation::Point position{};
+        bool hasPosition = args.TryGetPosition(GroupPicker(), position);
+        // A keyboard context request can originate from the list rather than its item.
+        if (!item && !hasPosition && GroupPicker().SelectedIndex() >= 0) {
+            item = GroupPicker().ContainerFromIndex(GroupPicker().SelectedIndex()).try_as<ListViewItem>();
+        }
         if (!item) return;
         auto index = GroupPicker().IndexFromContainer(item);
         if (index < 0 || static_cast<size_t>(index) >= groups.size()) return;
 
-        bool wasInitializing = initializing;
-        initializing = true;
+        auto groupId = groups[static_cast<size_t>(index)].id;
         GroupPicker().SelectedIndex(index);
-        browsingGroupId = groups[static_cast<size_t>(index)].id;
-        initializing = wasInitializing;
+        if (browsingGroupId != groupId) {
+            browsingGroupId = groupId;
+            draftMedia.reset();
+            LoadMedia();
+            ShowWallpaperPage();
+        }
+        GroupMoveUpItem().IsEnabled(index > 0);
+        GroupMoveDownItem().IsEnabled(static_cast<size_t>(index + 1) < groups.size());
         args.Handled(true);
-        RenameActiveGroup();
+        if (hasPosition) GroupContextMenu().ShowAt(GroupPicker(), position);
+        else GroupContextMenu().ShowAt(item);
+    }
+
+    void MainWindow::GroupPicker_ContextCanceled(IInspectable const&, RoutedEventArgs const&)
+    {
+        GroupContextMenu().Hide();
     }
 
     void MainWindow::GroupPicker_DragItemsStarting(IInspectable const&, DragItemsStartingEventArgs const& args)
@@ -2953,9 +3201,9 @@ namespace winrt::MotionWallpaper::implementation
             auto index = MediaList().SelectedIndex();
             if (index >= 0 && static_cast<size_t>(index) < filteredMedia.size()) {
                 draftMedia = filteredMedia[static_cast<size_t>(index)];
-                UpdateMediaSelectionVisuals(index);
             }
         }
+        UpdateMediaSelectionVisuals(MediaList().SelectedIndex());
         UpdateMediaActionState();
     }
 
@@ -3844,26 +4092,7 @@ namespace winrt::MotionWallpaper::implementation
         auto writeLease = TryAcquireLibraryWrite();
         if (!writeLease) return;
         if (selection & variant_source) {
-            auto status = mediaLibrary->VariantStatus(media);
-            if (!mediaLibrary->SourceAvailable(media) || status.entries.empty()) {
-                ShowStatus(L"至少需要一个完整的优化版本，才能删除源文件。", true);
-                return;
-            }
-            ContentDialog dialog;
-            dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
-            dialog.Title(box_value(L"删除壁纸源文件？"));
-            dialog.Content(box_value(L"将把 " + format_size(media.sizeBytes) +
-                L" 的源媒体移入 Windows 回收站。优化版本、首帧和名称会保留；之后无法选择原画，也无法重新生成优化版本。"));
-            dialog.PrimaryButtonText(L"删除源文件");
-            dialog.CloseButtonText(L"取消");
-            dialog.DefaultButton(ContentDialogButton::Close);
-            auto operation = dialog.ShowAsync();
-            operation.Completed([weak = get_weak(), media](auto const& result,
-                winrt::Windows::Foundation::AsyncStatus state) {
-                if (state != winrt::Windows::Foundation::AsyncStatus::Completed ||
-                    result.GetResults() != ContentDialogResult::Primary) return;
-                if (auto self = weak.get()) self->DeleteSource(media);
-            });
+            ConfirmDeleteMedia(media);
             return;
         }
 
@@ -4039,112 +4268,6 @@ namespace winrt::MotionWallpaper::implementation
         });
     }
 
-    winrt::fire_and_forget MainWindow::DeleteSource(motion::MediaMetadata media)
-    {
-        if (activeLibraryMigrationPause) {
-            ShowStatus(L"媒体库操作正在等待后台服务，请稍后再试。", true);
-            co_return;
-        }
-        auto writeLease = TryAcquireLibraryWrite();
-        if (!writeLease) co_return;
-        auto weak = get_weak();
-        auto library = mediaLibrary;
-        auto dispatcher = DispatcherQueue();
-        auto previousSettings = settings;
-        bool settingsChanged{};
-        try {
-            auto status = library->VariantStatus(media);
-            bool balancedAvailable = std::any_of(status.entries.begin(), status.entries.end(),
-                [](auto const& entry) { return entry.mode == "balanced" && entry.bytes; });
-            bool powerSaverAvailable = std::any_of(status.entries.begin(), status.entries.end(),
-                [](auto const& entry) { return entry.mode == "power-saver" && entry.bytes; });
-            if (!balancedAvailable && !powerSaverAvailable) {
-                throw std::runtime_error("no playable performance copy exists");
-            }
-            bool selectedModeAvailable =
-                (settings.performanceMode == "balanced" && balancedAvailable) ||
-                (settings.performanceMode == "power-saver" && powerSaverAvailable);
-            if (!selectedModeAvailable) {
-                settings.performanceMode = balancedAvailable ? "balanced" : "power-saver";
-                bool wasInitializing = initializing;
-                initializing = true;
-                select_tag(PerformanceMode(), motion::utf8_to_wide(settings.performanceMode));
-                initializing = wasInitializing;
-                if (!TrySaveSettings()) throw std::runtime_error("cannot save fallback performance mode");
-                settingsChanged = true;
-            }
-        } catch (...) {
-            if (settingsChanged) {
-                settings = std::move(previousSettings);
-                ApplySettingsToControls();
-                try { SaveSettings(); } catch (...) {}
-            }
-            ShowStatus(L"无法删除源文件；请确认副本完整且文件未被占用。", true);
-            co_return;
-        }
-
-        std::shared_ptr<motion::app::AgentLibraryMigrationPause> agentPause;
-        try {
-            agentPause = std::make_shared<motion::app::AgentLibraryMigrationPause>();
-        } catch (...) {
-            if (settingsChanged) {
-                settings = std::move(previousSettings);
-                ApplySettingsToControls();
-                try { SaveSettings(); } catch (...) {}
-            }
-            ShowStatus(L"无法建立与后台服务的删除协调通道；未删除源文件。", true);
-            co_return;
-        }
-        activeLibraryMigrationPause = agentPause;
-        SetLibraryMigrationUi(true);
-        ShowStatus(L"正在暂停后台播放并安全删除源文件…", false);
-
-        co_await winrt::resume_background();
-        bool paused = agentPause->RequestAndWait(std::chrono::seconds(20));
-        bool deleted{};
-        if (paused && !closing.load(std::memory_order_acquire)) {
-            try {
-                if (!writeLease->RevalidateMediaLibraryTrust()) {
-                    throw std::runtime_error("media library identity changed before source deletion");
-                }
-                library->DeleteSource(media);
-                deleted = true;
-            } catch (...) {}
-        }
-        bool resumed{};
-        if (paused) resumed = agentPause->ResumeAndWait(std::chrono::seconds(20));
-        else agentPause->Cancel();
-
-        dispatcher.TryEnqueue([weak, agentPause = std::move(agentPause),
-            writeLease = std::move(writeLease), previousSettings = std::move(previousSettings),
-            settingsChanged, mediaId = media.id, paused, deleted, resumed]() mutable {
-            if (auto self = weak.get()) {
-                if (self->activeLibraryMigrationPause == agentPause) self->activeLibraryMigrationPause.reset();
-                writeLease.reset();
-                self->SetLibraryMigrationUi(false);
-                if (!deleted && settingsChanged) {
-                    self->settings = std::move(previousSettings);
-                    self->ApplySettingsToControls();
-                    try { self->SaveSettings(); } catch (...) {}
-                }
-                self->variantSelections.erase(mediaId);
-                self->variantViewFingerprint.clear();
-                self->RefreshVariants();
-                self->LoadMedia();
-                self->UpdateStatusSummary();
-                if (!paused) {
-                    self->ShowStatus(L"后台服务未确认暂停；为保护正在使用的文件，未删除源文件。", true);
-                } else if (!deleted) {
-                    self->ShowStatus(L"删除已安全中止；媒体库身份可能已变化，未继续按原路径操作。", true);
-                } else if (!resumed) {
-                    self->ShowStatus(L"源文件已删除，但后台服务未及时确认恢复；请重启应用。", true);
-                } else {
-                    self->ShowStatus(L"源文件已移入回收站；优化版本、首帧和名称已保留。");
-                }
-            }
-        });
-    }
-
     void MainWindow::DeleteMedia_Click(IInspectable const&, RoutedEventArgs const&)
     {
         if (libraryAccessGate->MigrationInProgress()) {
@@ -4153,16 +4276,25 @@ namespace winrt::MotionWallpaper::implementation
         }
         auto selected = MediaList().SelectedIndex();
         if (selected < 0 || static_cast<size_t>(selected) >= filteredMedia.size()) return;
-        auto media = filteredMedia[static_cast<size_t>(selected)];
+        ConfirmDeleteMedia(filteredMedia[static_cast<size_t>(selected)]);
+    }
+
+    void MainWindow::ConfirmDeleteMedia(motion::MediaMetadata const& media)
+    {
+        if (libraryAccessGate->MigrationInProgress()) {
+            ShowStatus(L"媒体库正在迁移，请稍后再删除壁纸。", true);
+            return;
+        }
         ContentDialog dialog;
         dialog.XamlRoot(Content().as<FrameworkElement>().XamlRoot());
-        dialog.Title(box_value(L"删除壁纸本体？"));
-        dialog.Content(box_value(L"源媒体、优化副本、封面和元数据会一起移入 Windows 回收站，可在回收站中恢复。"));
+        dialog.Title(box_value(L"删除整张壁纸？"));
+        dialog.Content(box_value(L"“" + media.name +
+            L"”的源文件、全部平衡和节能副本、封面及壁纸记录会一起移入 Windows 回收站。对应的播放分配和生成任务会一并清理，可在回收站中恢复文件。"));
         dialog.PrimaryButtonText(L"移到回收站");
         dialog.CloseButtonText(L"取消");
         dialog.DefaultButton(ContentDialogButton::Close);
         auto operation = dialog.ShowAsync();
-        operation.Completed([weak = get_weak(), media = std::move(media)](auto const& result, winrt::Windows::Foundation::AsyncStatus status) {
+        operation.Completed([weak = get_weak(), media](auto const& result, winrt::Windows::Foundation::AsyncStatus status) {
             if (status != winrt::Windows::Foundation::AsyncStatus::Completed || result.GetResults() != ContentDialogResult::Primary) return;
             if (auto self = weak.get()) self->DeleteMedia(media);
         });
